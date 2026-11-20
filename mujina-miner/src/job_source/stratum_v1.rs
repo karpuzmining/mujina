@@ -388,11 +388,25 @@ impl StratumV1Source {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No protocol state (not subscribed)"))?;
 
-        // Extract extranonce2 from share (if present)
-        let extranonce2 = share
-            .extranonce2
-            .map(Vec::from)
-            .unwrap_or_else(|| vec![0; state.extranonce2_size]);
+        // This connection's negotiated width. A share whose extranonce2
+        // was built for a different pool (4 bytes on an 8-byte Hydra
+        // session, or the reverse) must not be submitted: the pool
+        // inserts the bytes as-is, the merkle root changes, and the
+        // result is a low-difficulty reject.
+        let extranonce2 = match share.extranonce2 {
+            Some(en2) => {
+                let bytes = Vec::from(en2);
+                if bytes.len() != state.extranonce2_size {
+                    anyhow::bail!(
+                        "extranonce2 is {} bytes but this connection negotiated {}",
+                        bytes.len(),
+                        state.extranonce2_size
+                    );
+                }
+                bytes
+            }
+            None => vec![0; state.extranonce2_size],
+        };
 
         // Extract version bits if version rolling was authorized
         // Always include version_bits parameter when pool authorized rolling,
@@ -1045,6 +1059,55 @@ mod tests {
             params.version_bits, None,
             "version_bits should be None without version rolling"
         );
+    }
+
+    /// HydraPool negotiates an 8-byte extranonce2 and mask 0x1fffe000.
+    /// A second connection with a 4-byte extranonce2 must not accept the
+    /// first connection's share, and the version bits Hydra rebuilds must
+    /// equal the version this connection hashed.
+    #[test]
+    fn each_connection_keeps_its_own_extranonce_and_version_mask() {
+        let mask = 0x1fff_e000u32;
+        let base = 0x2000_0000u32;
+        let hydra_en2 = [
+            0x78u8, 0x56, 0x34, 0x12, 0xf0, 0xde, 0xbc, 0x9a,
+        ];
+        let hydra = source_with_state(vec![0xaa, 0xbb, 0xcc, 0xdd], 8, Some(34), Some(mask));
+        let atlas = source_with_state(vec![0x11, 0x22, 0x33, 0x44], 4, Some(2000), Some(mask));
+
+        let mut versions = [base; 8];
+        versions[1] = base | mask;
+        let mut idx = 2usize;
+        for bit in 15..=28u32 {
+            if idx >= 8 {
+                break;
+            }
+            if (mask >> bit) & 1 == 1 {
+                versions[idx] = base | (1u32 << bit);
+                idx += 1;
+            }
+        }
+
+        for version in versions {
+            let share = Share {
+                job_id: "hydra-job".to_string(),
+                nonce: 0x7552_034c,
+                time: 1_700_000_000,
+                version: Version::from_consensus(version as i32),
+                extranonce2: Some(extranonce2_from_bytes(&hydra_en2)),
+            };
+            let params = hydra
+                .share_to_submit_params(share.clone())
+                .expect("hydra width matches");
+            assert_eq!(params.extranonce2, hydra_en2);
+            let bits = params.version_bits.expect("hydra authorized rolling");
+            let rebuilt = (base & !mask) | (bits & mask);
+            assert_eq!(rebuilt, version);
+            assert!(
+                atlas.share_to_submit_params(share).is_err(),
+                "a 4-byte connection must not submit an 8-byte extranonce2"
+            );
+        }
     }
 
     /// Test share_to_submit_params uses default extranonce2 when not provided.

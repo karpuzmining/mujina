@@ -52,6 +52,52 @@ pub(crate) fn share_meets_pool_difficulty(pool: f64, share: f64) -> bool {
     pool.is_finite() && share.is_finite() && pool > 0.0 && share + 1e-9 >= pool
 }
 
+/// Session difficulty and a floor learned from "Low difficulty share"
+/// rejects. The learned floor wins when the pool's real bar (p2poolv2's
+/// share-commitment target) is above the advertised session difficulty.
+pub(crate) fn effective_pool_difficulty(advertised: Option<f64>, submit_floor: f64) -> Option<f64> {
+    match advertised {
+        Some(advertised) if submit_floor > advertised => Some(submit_floor),
+        Some(advertised) => Some(advertised),
+        None if submit_floor > 0.0 => Some(submit_floor),
+        None => None,
+    }
+}
+
+/// p2poolv2 answers a share that misses its share-commitment target with
+/// error 23, "Low difficulty share", even when the share meets the
+/// advertised `mining.set_difficulty`. A `result: false` session miss is
+/// a different string.
+pub(crate) fn is_low_difficulty_reject(reason: &str) -> bool {
+    reason.to_ascii_lowercase().contains("low difficulty")
+}
+
+/// Step the submit floor up after one low-difficulty reject.
+///
+/// Each reject multiplies the current floor by 1.5, starting from the
+/// advertised difficulty, and stops at 256× that advertisement. A
+/// connection whose headers match the pool settles just above the real
+/// bar. One whose headers do not match stops the reject flood at the cap
+/// instead of climbing without a bound.
+pub(crate) fn raise_submit_floor(advertised: f64, current: f64) -> f64 {
+    if !advertised.is_finite() || advertised <= 0.0 || !current.is_finite() || current <= 0.0 {
+        return current;
+    }
+    let cap = advertised * 256.0;
+    let base = current.max(advertised);
+    if base >= cap {
+        cap
+    } else {
+        (base * 1.5).min(cap)
+    }
+}
+
+/// p2poolv2 rebuilds the header version as `(base & !mask) | (bits & mask)`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn hydra_applied_version(base: u32, mask: u32, version_bits: u32) -> u32 {
+    (base & !mask) | (version_bits & mask)
+}
+
 /// Unique identifier for a job source, assigned by the scheduler.
 type SourceId = slotmap::DefaultKey;
 
@@ -174,6 +220,11 @@ struct SourceEntry {
     /// Latest `mining.set_difficulty` for this connection. `None` until the
     /// pool sends one. Shares below this are counted and not submitted.
     pool_difficulty: Option<f64>,
+
+    /// Submit floor learned from "Low difficulty share" rejects. Zero
+    /// until the first such reject. Not cleared by a later
+    /// `mining.set_difficulty`.
+    submit_floor: f64,
 
     /// Shares the chip found that were under `pool_difficulty`.
     low_diff: u64,
@@ -482,6 +533,7 @@ impl Scheduler {
             reject_reasons: Vec::new(),
             samples: VecDeque::new(),
             pool_difficulty: None,
+            submit_floor: 0.0,
             low_diff: 0,
             last_error: None,
         });
@@ -696,9 +748,15 @@ impl Scheduler {
             entry.hashrate.record(share.expected_work);
         }
 
-        // The job target can still be the old, easier one. The pool's latest
-        // mining.set_difficulty wins, per connection.
-        let need = self.sources.get(task_entry.source_id).and_then(|s| s.pool_difficulty);
+        // The job target can still be the old, easier one. This connection's
+        // advertised difficulty and any floor learned from its own
+        // low-difficulty rejects both apply. Another pool's numbers do not.
+        let (advertised, learned) = self
+            .sources
+            .get(task_entry.source_id)
+            .map(|s| (s.pool_difficulty, s.submit_floor))
+            .unwrap_or((None, 0.0));
+        let need = effective_pool_difficulty(advertised, learned);
         let share_d = share_difficulty.as_f64();
         if let Some(need) = need
             && !share_meets_pool_difficulty(need, share_d)
@@ -724,6 +782,7 @@ impl Scheduler {
             // Submit share to originating source
             if let Some(source) = self.sources.get(task_entry.source_id) {
                 let version = share.version.to_consensus() as u32;
+                let extranonce2_len = share.extranonce2.as_ref().map(|en2| en2.size()).unwrap_or(0);
                 let source_share = SourceShare::from((share, task_entry.template.id.clone()));
 
                 debug!(
@@ -734,6 +793,9 @@ impl Scheduler {
                     nonce = format!("{:08x}", nonce),
                     submitted_nonce = format!("{:08x}", nonce.swap_bytes()),
                     version = format!("{version:08x}"),
+                    extranonce2_len,
+                    advertised_difficulty = advertised,
+                    submit_floor = learned,
                     "Submitting share"
                 );
                 if let Err(e) = source
@@ -1207,6 +1269,26 @@ impl Scheduler {
                                 } else {
                                     source.rejected += 1;
                                     note_reject(&mut source.reject_reasons, reason.as_deref());
+                                    if reason.as_deref().is_some_and(is_low_difficulty_reject) {
+                                        if let Some(advertised) = source.pool_difficulty {
+                                            let current = if source.submit_floor > 0.0 {
+                                                source.submit_floor
+                                            } else {
+                                                advertised
+                                            };
+                                            let next = raise_submit_floor(advertised, current);
+                                            if next > current + 0.01 {
+                                                info!(
+                                                    source = %source.name,
+                                                    advertised,
+                                                    previous = current,
+                                                    submit_floor = next,
+                                                    "Low-difficulty reject; raising this connection's submit floor"
+                                                );
+                                            }
+                                            source.submit_floor = next;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1559,6 +1641,67 @@ mod tests {
         assert!(!share_meets_pool_difficulty(34.0, 33.9));
         assert!(share_meets_pool_difficulty(34.0, 34.0));
         assert!(share_meets_pool_difficulty(34.0, 2000.0));
+    }
+
+    /// Live HydraPool: session difficulty 34, 11 accepts and 254 rejects,
+    /// every reject the text "Low difficulty share". That string is
+    /// p2poolv2's share-commitment check, not the session-difficulty
+    /// `result: false`. 11/265 is the rate of a bar near 800, not of a
+    /// random header against 34. The floor steps from 34 toward that bar
+    /// and then holds shares under it.
+    #[test]
+    fn low_difficulty_reject_raises_the_submit_floor() {
+        assert!(is_low_difficulty_reject("Low difficulty share"));
+        assert!(is_low_difficulty_reject("LOW DIFFICULTY"));
+        assert!(!is_low_difficulty_reject("Pool returned false"));
+        assert!(!is_low_difficulty_reject("Job not found"));
+
+        let mut floor = 34.0;
+        for _ in 0..9 {
+            floor = raise_submit_floor(34.0, floor);
+        }
+        assert!(
+            floor > 800.0,
+            "nine rejects from diff 34 should clear a ~800 commitment, got {floor}"
+        );
+        assert!(floor <= 34.0 * 256.0 + 1e-6);
+
+        let capped = raise_submit_floor(34.0, 34.0 * 256.0);
+        assert!((capped - 34.0 * 256.0).abs() < 1e-6);
+
+        let need = effective_pool_difficulty(Some(34.0), floor).unwrap();
+        assert!(!share_meets_pool_difficulty(need, 34.0));
+        assert!(share_meets_pool_difficulty(need, floor));
+        // The other connection keeps the difficulty it was given.
+        assert_eq!(effective_pool_difficulty(Some(2000.0), 0.0), Some(2000.0));
+    }
+
+    /// Hydra's mask is 0x1fffe000. The eight versions this miner programs
+    /// (base, the full mask, then the next set bits) rebuild to themselves
+    /// when only `version & mask` is submitted.
+    #[test]
+    fn hydra_version_mask_round_trips_the_eight_candidates() {
+        let base = 0x2000_0000u32;
+        let mask = 0x1fff_e000u32;
+        let mut versions = [base; 8];
+        versions[1] = base | mask;
+        let mut idx = 2usize;
+        for bit in 15..=28u32 {
+            if idx >= 8 {
+                break;
+            }
+            if (mask >> bit) & 1 == 1 {
+                versions[idx] = base | (1u32 << bit);
+                idx += 1;
+            }
+        }
+        assert_eq!(idx, 8);
+        for version in versions {
+            let bits = version & mask;
+            assert_eq!(hydra_applied_version(base, mask, bits), version);
+        }
+        // Bits outside the mask do not survive the pool's rebuild.
+        assert_eq!(hydra_applied_version(base, mask, 0x0000_1fff), base);
     }
 
     #[test]
