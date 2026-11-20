@@ -33,7 +33,7 @@
 //!   this riscv64 target) `u32` words, no swap.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -44,6 +44,7 @@ use bitcoin::hashes::sha256d;
 use tokio::sync::{mpsc, watch};
 
 use super::a3197s::ChipClockPolicy;
+use super::nano3s_power::{estimate_input_watts, ina226_sdk_reading};
 use super::nano3s_auto_tune::ChipTuneStatus;
 use super::nano3s_auto_tune::{self as auto_tune, AutoTune, AutoTuneCmd, TuneChoice};
 use super::nano3s_chip_tuner::{ChipGoal, ChipMetrics, ChipPhase, ChipTuner, ChipTunerConfig};
@@ -1277,6 +1278,169 @@ fn read_power_estimate() -> (f64, f64, f64) {
     (bus_v, current_a, bus_v * current_a)
 }
 
+const POWER_CAL_PATH: &str = "/data/userconfig/power_cal.conf";
+
+fn load_power_cal() -> f64 {
+    let Ok(text) = std::fs::read_to_string(POWER_CAL_PATH) else {
+        return 1.0;
+    };
+    text.lines()
+        .find_map(|line| line.strip_prefix("factor="))
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|f| f.is_finite() && (0.5..=2.0).contains(f))
+        .unwrap_or(1.0)
+}
+
+pub(crate) fn set_power_cal(factor: f64) -> std::io::Result<()> {
+    if !factor.is_finite() || !(0.5..=2.0).contains(&factor) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "calibration factor must be 0.5 to 2.0",
+        ));
+    }
+    atomic_conf_write(
+        std::path::Path::new(POWER_CAL_PATH),
+        format!("factor={factor}\n").as_bytes(),
+    )
+}
+
+/// Input rail volts, amps, watts, and `measured` or `estimated`.
+fn board_power_reading(st: &Nano3sStatus) -> (f64, f64, f64, &'static str) {
+    let cal = load_power_cal();
+    let dies: Vec<f64> = st.chips.iter().take(12).map(|c| c.volt_mv as f64).collect();
+    let freqs: Vec<f64> = st.chips.iter().take(12).map(|c| c.pll_freq[0] as f64).collect();
+    let freq_fallback = st.pll_freq[0] as f64;
+    let freqs: Vec<f64> = if freqs.iter().any(|f| *f > 1.0) {
+        freqs
+    } else {
+        vec![freq_fallback; 12]
+    };
+    if let Some((v, i, p)) = read_ina226_sdk() {
+        // 8 V is Canaan's POWER_VALID_VOLT_MIN. Below that the adapter
+        // is treated as absent, not as a zero-watt success.
+        if v >= 8.0 {
+            note_power_sensor(true);
+            return (v, i * cal, p * cal, "measured");
+        }
+    }
+    note_power_sensor(false);
+    let watts = estimate_input_watts(&dies, &freqs, st.voltage_mv as f64) * cal;
+    let rail_v = if st.voltage_mv > 500 {
+        st.voltage_mv as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let amps = if rail_v > 0.5 { watts / rail_v } else { 0.0 };
+    (0.0, amps, watts, "estimated")
+}
+
+/// Canaan writes config `0x4727` and calibration `0x0AEC` before trusting
+/// the current register. Bus `/dev/i2c-2`, address `0x40`.
+const INA226_CFG: u16 = 0x4727;
+const INA226_CAL: u16 = 0x0AEC;
+const INA226_DEV: &str = "/dev/i2c-2";
+
+fn read_ina226_sdk() -> Option<(f64, f64, f64)> {
+    #[cfg(target_os = "linux")]
+    {
+        static READY: AtomicBool = AtomicBool::new(false);
+        if !READY.load(Ordering::Relaxed) {
+            let cfg_ok = i2c_write_reg_be(INA226_DEV, POWER_I2C_ADDR, 0x00, INA226_CFG);
+            let cal_ok = i2c_write_reg_be(INA226_DEV, POWER_I2C_ADDR, 0x05, INA226_CAL);
+            if cfg_ok && cal_ok {
+                READY.store(true, Ordering::Relaxed);
+            } else if !POWER_SENSOR_LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[nano3s] power sensor: could not program INA226 cfg/cal on {INA226_DEV} addr 0x40 (i2cget is not used)"
+                );
+            }
+        }
+        let bus = i2c_read_reg_be(INA226_DEV, POWER_I2C_ADDR, 0x02)?;
+        let cur = i2c_read_reg_be(INA226_DEV, POWER_I2C_ADDR, 0x04).unwrap_or(0);
+        Some(ina226_sdk_reading(bus, cur))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+static POWER_SENSOR_OK: AtomicBool = AtomicBool::new(false);
+static POWER_SENSOR_LOGGED: AtomicBool = AtomicBool::new(false);
+
+fn note_power_sensor(ok: bool) {
+    let was = POWER_SENSOR_OK.swap(ok, Ordering::Relaxed);
+    if ok {
+        POWER_SENSOR_LOGGED.store(false, Ordering::Relaxed);
+    } else if was || !POWER_SENSOR_LOGGED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "[nano3s] power sensor unavailable on {INA226_DEV} addr 0x40. Holding the voltage. The {POWER_TARGET_SAFETY_W:.0} W trip is not evaluated against 0 W."
+        );
+    }
+}
+
+pub(crate) fn power_sensor_ok() -> bool {
+    POWER_SENSOR_OK.load(Ordering::Relaxed)
+}
+
+#[cfg(target_os = "linux")]
+fn i2c_xfer(dev: &str, addr: u32, write: &mut [u8], read: Option<&mut [u8]>) -> bool {
+    use std::ffi::CString;
+    let Ok(c) = CString::new(dev) else { return false };
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDWR) };
+    if fd < 0 {
+        return false;
+    }
+    #[repr(C)]
+    struct Msg {
+        addr: u16,
+        flags: u16,
+        len: u16,
+        buf: *mut u8,
+    }
+    #[repr(C)]
+    struct Rdwr {
+        msgs: *mut Msg,
+        nmsgs: u32,
+    }
+    let mut n = 0u32;
+    let mut msgs = [
+        Msg { addr: addr as u16, flags: 0, len: 0, buf: std::ptr::null_mut() },
+        Msg { addr: addr as u16, flags: 0x0001, len: 0, buf: std::ptr::null_mut() },
+    ];
+    if !write.is_empty() {
+        msgs[0].len = write.len() as u16;
+        msgs[0].buf = write.as_mut_ptr();
+        n = 1;
+    }
+    if let Some(r) = read {
+        let i = n as usize;
+        msgs[i].addr = addr as u16;
+        msgs[i].flags = 0x0001;
+        msgs[i].len = r.len() as u16;
+        msgs[i].buf = r.as_mut_ptr();
+        n += 1;
+    }
+    let data = Rdwr { msgs: msgs.as_mut_ptr(), nmsgs: n };
+    let rc = unsafe { libc::ioctl(fd, 0x0707, &data) };
+    unsafe { libc::close(fd) };
+    rc >= 0
+}
+
+#[cfg(target_os = "linux")]
+fn i2c_write_reg_be(dev: &str, addr: u32, reg: u8, value: u16) -> bool {
+    let [hi, lo] = value.to_be_bytes();
+    let mut buf = [reg, hi, lo];
+    i2c_xfer(dev, addr, &mut buf, None)
+}
+
+#[cfg(target_os = "linux")]
+fn i2c_read_reg_be(dev: &str, addr: u32, reg: u8) -> Option<u16> {
+    let mut w = [reg];
+    let mut r = [0u8; 2];
+    i2c_xfer(dev, addr, &mut w, Some(&mut r)).then_some(u16::from_be_bytes(r))
+}
+
 fn i2c_read_byte(bus: u32, addr: u32, reg: u32) -> Option<u8> {
     let output = std::process::Command::new("i2cget")
         .args([
@@ -1398,8 +1562,8 @@ fn write_psu_override_w(override_max_w: Option<f64>) {
 /// infrequently by the dashboard and a fresh read costs one `i2cget`
 /// round-trip either way.
 pub(crate) fn read_psu_status() -> (Option<f64>, Option<bool>, Option<f64>, Option<f64>, f64) {
-    let (bus_v, _current_a, _power_w) = read_power_estimate();
-    let bus_v = if bus_v > 0.0 { Some(bus_v) } else { None };
+    let measured = read_ina226_sdk();
+    let bus_v = measured.and_then(|(v, _, _)| (v >= 8.0).then_some(v));
     let attached = read_pd_attached();
     let detected_ceiling_w = bus_v
         .map(pd_ceiling_w_for_voltage)
@@ -1577,6 +1741,9 @@ struct PersistedTuning {
     /// `clear` zeros chip offsets when the profile or board VF changes.
     /// `keep` leaves them. Absent in tuning.conf means `clear`.
     chip_clock_policy: ChipClockPolicy,
+    /// Live Tuning selector (`210,230,250,270` / `338,358,378,398` /
+    /// `420,440,460,480` / `custom`). Restored into the dashboard.
+    live_preset: Option<String>,
 }
 
 static TUNING_CONF_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1729,6 +1896,7 @@ fn load_tuning_from(path: &std::path::Path) -> PersistedTuning {
                     cfg.chip_clock_policy = p;
                 }
             }
+            "live_preset" => cfg.live_preset = Some(value.to_string()),
             _ => {}
         }
     }
@@ -1792,6 +1960,9 @@ fn write_tuning_conf_to(path: &std::path::Path, cfg: &PersistedTuning) {
     if let Some(o) = cfg.chip_offset_mhz.filter(|o| o.iter().any(|x| *x != 0)) {
         out.push_str(&format!("chip_offset_mhz={}\n", join_chip_offsets(&o)));
     }
+    if let Some(p) = &cfg.live_preset {
+        out.push_str(&format!("live_preset={p}\n"));
+    }
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -1849,7 +2020,70 @@ fn persist_tuning_set(
         if temp_target_c.is_some() {
             cfg.temp_target_c = temp_target_c;
         }
+        if let Some(f) = pll_freq_mhz {
+            cfg.live_preset = Some(live_preset_id(f).to_string());
+        }
     });
+}
+
+/// Option value of the Live Tuning selector for a four-domain clock.
+fn live_preset_id(freq: [u32; 4]) -> &'static str {
+    match freq {
+        [210, 230, 250, 270] => "210,230,250,270",
+        [338, 358, 378, 398] => "338,358,378,398",
+        [420, 440, 460, 480] => "420,440,460,480",
+        _ => "custom",
+    }
+}
+
+/// Saved Live Tuning and AutoTune choice, for GET and for the dashboard
+/// to refill its selectors after a reload.
+#[derive(Clone, Debug)]
+pub(crate) struct SavedTuning {
+    pub pll_freq_mhz: Option<[u32; 4]>,
+    pub voltage_mv: Option<u32>,
+    pub power_target_w: Option<f64>,
+    pub temp_target_c: Option<f64>,
+    pub live_preset: String,
+    pub auto_profile: Option<TuneProfile>,
+    pub auto_target: Option<TuneTarget>,
+    pub auto_enabled: bool,
+    pub continuous: bool,
+}
+
+pub(crate) fn saved_tuning() -> SavedTuning {
+    let cfg = load_tuning();
+    let (auto_profile, auto_target) = match cfg.auto_tune_profile {
+        Some(TuneChoice::Profile(p)) => (Some(p), None),
+        Some(TuneChoice::Target(t)) => (None, Some(t)),
+        None => (None, None),
+    };
+    let live_preset = cfg
+        .live_preset
+        .or_else(|| cfg.pll_freq_mhz.map(|f| live_preset_id(f).to_string()))
+        .unwrap_or_else(|| "338,358,378,398".to_string());
+    SavedTuning {
+        pll_freq_mhz: cfg.pll_freq_mhz,
+        voltage_mv: cfg.voltage_mv,
+        power_target_w: cfg.power_target_w,
+        temp_target_c: cfg.temp_target_c,
+        live_preset,
+        auto_profile,
+        auto_target,
+        auto_enabled: cfg.auto_tune_profile.is_some(),
+        continuous: cfg.continuous,
+    }
+}
+
+pub(crate) fn saved_auto_tune_status() -> auto_tune::AutoTuneStatus {
+    let s = saved_tuning();
+    auto_tune::AutoTuneStatus {
+        enabled: s.auto_enabled,
+        profile: s.auto_profile,
+        target: s.auto_target,
+        continuous: s.continuous,
+        ..auto_tune::AutoTuneStatus::default()
+    }
 }
 
 fn persist_tuning_clear_power_target() {
@@ -2201,6 +2435,11 @@ pub(crate) fn write_fan_control_command(cmd: &str) -> std::io::Result<()> {
     std::fs::write(HARNESS_CONTROL_FILE, cmd)?;
     if let Some(ov) = auto_tune::parse_fan_control_override(cmd) {
         *MANUAL_FAN_DUTY.lock().unwrap_or_else(|e| e.into_inner()) = ov;
+        let (mode, duty) = match ov {
+            Some(d) => ("manual", Some(d)),
+            None => ("auto", None),
+        };
+        store_fan_mode(mode, duty)?;
     }
     Ok(())
 }
@@ -2226,22 +2465,172 @@ fn sync_manual_fan_with_tuner(auto_tuner: &mut auto_tune::AutoTune) {
     }
 }
 
-/// Path the C harness persists the fan curve to (`fan_curve_save()` in
-/// `mujina_test_harness.c`) -- sole writer is the harness itself, not
-/// this process; [`read_fan_curve`] only reads it back for display.
+/// Path the C harness and this process persist the fan curve to.
+/// `reboot -f` does not flush the page cache, so the miner writes the
+/// file itself (fsync, then rename) before the live harness command.
 const FAN_CURVE_CONF_PATH: &str = "/data/userconfig/fan_curve.conf";
 
-/// Writes a `fancurve:t1:d1,t2:d2,...` directive to `HARNESS_CONTROL_FILE`.
-/// The harness validates, sorts by temp, applies live, and persists to
-/// [`FAN_CURVE_CONF_PATH`] -- this function itself does no validation
-/// beyond formatting; range/count checks happen in the API handler.
+/// Saves `temp,duty` lines to [`FAN_CURVE_CONF_PATH`], then writes a
+/// `fancurve:t1:d1,t2:d2,...` directive so the harness applies it live.
+/// Range and count checks happen in the API handler.
 pub(crate) fn write_fan_curve_command(points: &[(f64, f64)]) -> std::io::Result<()> {
-    let body = points
+    let mut pts = points.to_vec();
+    pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut file = String::new();
+    for (t, d) in &pts {
+        file.push_str(&format!("{t},{d}\n"));
+    }
+    atomic_conf_write(std::path::Path::new(FAN_CURVE_CONF_PATH), file.as_bytes())?;
+    let body = pts
         .iter()
         .map(|(t, d)| format!("{t}:{d}"))
         .collect::<Vec<_>>()
         .join(",");
     std::fs::write(HARNESS_CONTROL_FILE, format!("fancurve:{body}"))
+}
+
+const PSU_BYPASS_PATH: &str = "/data/userconfig/psu_bypass.conf";
+const IMMERSION_PATH: &str = "/data/userconfig/immersion.conf";
+const FAN_MODE_PATH: &str = "/data/userconfig/fan_mode.conf";
+
+fn flag_slot(path: &'static str, key: &'static str) -> &'static AtomicBool {
+    use std::sync::OnceLock;
+    static SLOTS: OnceLock<Mutex<std::collections::HashMap<&'static str, &'static AtomicBool>>> =
+        OnceLock::new();
+    // One atomic per path, leaked for the process lifetime.
+    let map = SLOTS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(f) = g.get(path) {
+        return f;
+    }
+    let flag: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(load_flag_file(
+        std::path::Path::new(path),
+        key,
+    ))));
+    g.insert(path, flag);
+    flag
+}
+
+fn load_flag_file(path: &std::path::Path, key: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        line.split_once('=')
+            .is_some_and(|(k, v)| k.trim() == key && v.trim() == "1")
+    })
+}
+
+fn store_flag_file(path: &std::path::Path, key: &str, on: bool) -> std::io::Result<()> {
+    let body = format!("{key}={}\n", if on { "1" } else { "0" });
+    atomic_conf_write(path, body.as_bytes())
+}
+
+pub(crate) fn psu_bypass_enabled() -> bool {
+    flag_slot(PSU_BYPASS_PATH, "psu_bypass").load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_psu_bypass(on: bool) -> std::io::Result<()> {
+    store_flag_file(std::path::Path::new(PSU_BYPASS_PATH), "psu_bypass", on)?;
+    flag_slot(PSU_BYPASS_PATH, "psu_bypass").store(on, Ordering::Relaxed);
+    Ok(())
+}
+
+pub(crate) fn immersion_enabled() -> bool {
+    flag_slot(IMMERSION_PATH, "immersion").load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_immersion(on: bool) -> std::io::Result<()> {
+    store_flag_file(std::path::Path::new(IMMERSION_PATH), "immersion", on)?;
+    flag_slot(IMMERSION_PATH, "immersion").store(on, Ordering::Relaxed);
+    let _ = std::fs::write("/tmp/immersion", if on { "1\n" } else { "0\n" });
+    if on {
+        write_fan_control_command("fan:manual,0")?;
+    } else {
+        write_fan_control_command("fan:auto,")?;
+    }
+    Ok(())
+}
+
+/// Tuner ceiling (W) and the wattage trip (W). Bypass lifts the PD tiers
+/// and the 137 W trip. Chip temperature limits and the 3912 mV rail max
+/// are applied elsewhere and are not changed here.
+pub(crate) fn power_limits(bypass: bool, override_w: Option<f64>, bus_v: f64) -> (f32, f64) {
+    // Bypass drops the USB-C PD tier. It does not remove the 137 W trip.
+    let hard = POWER_TARGET_SAFETY_W;
+    if bypass && override_w.is_none() {
+        let ceiling = auto_tune::auto_tune_power_ceiling(f64::INFINITY, hard);
+        return (ceiling, hard);
+    }
+    if let Some(override_w) = override_w {
+        let ceiling = (override_w as f32).clamp(40.0, 140.0);
+        let safety = (override_w * 1.03).clamp(40.0, 150.0);
+        (ceiling, safety)
+    } else {
+        let pd_contract = pd_ceiling_w_for_voltage(bus_v);
+        let safety = POWER_TARGET_SAFETY_W.min(pd_contract - PD_CEILING_MARGIN_W);
+        let ceiling = auto_tune::auto_tune_power_ceiling(pd_contract, safety);
+        (ceiling, safety)
+    }
+}
+
+fn load_fan_mode_from(path: &std::path::Path) -> (String, Option<u8>) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return ("auto".into(), None);
+    };
+    let mut mode = "auto".to_string();
+    let mut duty = None;
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once('=') else { continue };
+        match k.trim() {
+            "mode" => mode = v.trim().to_string(),
+            "duty" => duty = v.trim().parse().ok(),
+            _ => {}
+        }
+    }
+    if mode != "manual" {
+        mode = "auto".into();
+        duty = None;
+    }
+    (mode, duty)
+}
+
+fn store_fan_mode(mode: &str, duty: Option<u8>) -> std::io::Result<()> {
+    let body = match (mode, duty) {
+        ("manual", Some(d)) => format!("mode=manual\nduty={d}\n"),
+        _ => "mode=auto\n".to_string(),
+    };
+    atomic_conf_write(std::path::Path::new(FAN_MODE_PATH), body.as_bytes())
+}
+
+pub(crate) fn fan_mode_saved() -> (String, Option<u8>) {
+    if immersion_enabled() {
+        return ("manual".into(), Some(0));
+    }
+    load_fan_mode_from(std::path::Path::new(FAN_MODE_PATH))
+}
+
+fn atomic_conf_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("conf.tmp");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 /// Reads the currently persisted fan curve directly from
@@ -2502,11 +2891,11 @@ fn load_led_conf_from(path: &std::path::Path) -> LedOverrideState {
     state
 }
 
-fn write_led_conf(state: &LedOverrideState) {
-    write_led_conf_to(std::path::Path::new(LED_CONF_PATH), state);
+fn write_led_conf(state: &LedOverrideState) -> Result<(), String> {
+    write_led_conf_to(std::path::Path::new(LED_CONF_PATH), state)
 }
 
-fn write_led_conf_to(path: &std::path::Path, state: &LedOverrideState) {
+fn write_led_conf_to(path: &std::path::Path, state: &LedOverrideState) -> Result<(), String> {
     let out = format!(
         "effect={}\ncolor=#{:02x}{:02x}{:02x}\nbrightness={}\nspeed={}\n",
         state.effect.as_str(),
@@ -2516,20 +2905,29 @@ fn write_led_conf_to(path: &std::path::Path, state: &LedOverrideState) {
         state.brightness,
         state.speed
     );
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| format!("failed to save LED config: {e}"))?;
     }
-    let tmp_path = format!("{}.tmp", path.display());
-    if let Err(e) = std::fs::write(&tmp_path, &out) {
-        eprintln!("[nano3s] failed to write {tmp_path}: {e}");
-        return;
+    let tmp = path.with_extension("conf.tmp");
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp)
+            .map_err(|e| format!("failed to save LED config: {e}"))?;
+        file.write_all(out.as_bytes())
+            .map_err(|e| format!("failed to save LED config: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("failed to save LED config: {e}"))?;
     }
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        eprintln!(
-            "[nano3s] failed to rename {tmp_path} to {}: {e}",
-            path.display()
-        );
+    std::fs::rename(&tmp, path).map_err(|e| format!("failed to save LED config: {e}"))?;
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
     }
+    Ok(())
 }
 
 /// Global manual LED state, shared between the API handler (async, in the
@@ -2574,7 +2972,7 @@ pub(crate) fn write_led_command(
     if let Some(s) = speed {
         state.speed = s;
     }
-    write_led_conf(&state);
+    write_led_conf(&state)?;
     Ok(())
 }
 
@@ -3438,6 +3836,7 @@ fn run_worker(
     // arrives (~every 15s), not on every 200ms loop tick -- an i2cget
     // subprocess is too expensive to run that often.
     let mut last_power_w: f64 = 0.0;
+    let mut last_power_source: &'static str = "estimated";
     // Tracks whether GoIdle has been called without a subsequent task --
     // resuming from idle needs the harness to re-power the chain (and
     // settle) before rtos_core.elf can accept a fresh job.
@@ -3603,8 +4002,21 @@ fn run_worker(
         .then(|| new_chip_tuner(auto_tuner.choice(), chip_offset_mhz));
     let mut chip_base: Option<(u32, Option<i32>)> = None;
     let mut persisted_chip_offsets = chip_offset_mhz;
-    if let Some(d) = *MANUAL_FAN_DUTY.lock().unwrap_or_else(|e| e.into_inner()) {
-        let _ = auto_tuner.set_manual_fan(Some(d));
+    {
+        let mut slot = MANUAL_FAN_DUTY.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            let (mode, duty) = fan_mode_saved();
+            if mode == "manual" {
+                *slot = duty;
+            }
+        }
+        if let Some(d) = *slot {
+            drop(slot);
+            let _ = auto_tuner.set_manual_fan(Some(d));
+            if immersion_enabled() {
+                write_harness_control("fan:manual,0");
+            }
+        }
     }
     auto_tuner.publish(None);
 
@@ -4216,7 +4628,11 @@ fn run_worker(
         };
 
         if is_stale {
-            if !stale_fan_forced {
+            if immersion_enabled() {
+                if last_stale_warn.elapsed() >= Duration::from_secs(15) {
+                    write_harness_control("fan:manual,0");
+                }
+            } else if !stale_fan_forced {
                 stale_fan_forced = true;
                 eprintln!("[nano3s] Core 1 status absent or stale: forcing fan to 100%");
                 write_harness_control("fan:manual,100");
@@ -4297,8 +4713,10 @@ fn run_worker(
                 ..Default::default()
             }));
 
-            let (last_bus_v, last_current_a, power_w) = read_power_estimate();
+            let (last_bus_v, last_current_a, power_w, source) = board_power_reading(&st);
             last_power_w = power_w;
+            last_power_source = source;
+            let sensor_ok = source == "measured";
 
             // Power-target voltage loop -- see POWER_TARGET_STEP_MV's doc
             // comment. Safety check runs on every status refresh (~15s);
@@ -4310,21 +4728,13 @@ fn run_worker(
             // PSU_CONF_PATH when auto-detection is unavailable/wrong.
             // Only ever tightens the existing POWER_TARGET_SAFETY_W
             // trip, never loosens it.
+            let bypass = psu_bypass_enabled();
             let (tuner_power_ceiling_w, effective_safety_w) =
-                if let Some(override_w) = psu_override_max_w {
-                    // The override is the user's chosen board ceiling: the tuner may
-                    // use all of it (a power target holds its mean 1-3 % under).
-                    // Hard safety trip sits 3 % above the user setting (144.2 W at 140 W)
-                    // so normal instantaneous switching ripples don't trip an emergency backoff.
-                    let ceiling = (override_w as f32).clamp(40.0, 140.0);
-                    let safety = (override_w * 1.03).clamp(40.0, 150.0);
-                    (ceiling, safety)
-                } else {
-                    let pd_contract = pd_ceiling_w_for_voltage(last_bus_v);
-                    let safety = POWER_TARGET_SAFETY_W.min(pd_contract - PD_CEILING_MARGIN_W);
-                    let ceiling = auto_tune::auto_tune_power_ceiling(pd_contract, safety);
-                    (ceiling, safety)
-                };
+                power_limits(bypass, psu_override_max_w, last_bus_v);
+            if bypass {
+                // Drop a ceiling left over from before the toggle was turned on.
+                psu_ceiling_freq = temp_throttle_base_freq;
+            }
             let pd_ceiling_w =
                 psu_override_max_w.unwrap_or_else(|| pd_ceiling_w_for_voltage(last_bus_v));
             if pd_ceiling_w.is_finite()
@@ -4351,6 +4761,7 @@ fn run_worker(
             // that would otherwise race it.
             if power_target_w.is_none()
                 && autotune_hashrate_target_ths.is_none()
+                && sensor_ok
                 && power_w > effective_safety_w
             {
                 let cur_mv = st.voltage_mv as i32;
@@ -4402,9 +4813,12 @@ fn run_worker(
                 let cur_mv = st.voltage_mv as i32;
                 let now = std::time::Instant::now();
 
-                let step = if power_w > effective_safety_w {
+                let step = if !sensor_ok {
+                    // A missing meter used to look like 0 W and disable the trip.
+                    None
+                } else if power_w > effective_safety_w {
                     // Hard safety trip -- always allowed, ignores the
-                    // interval gate.
+                    // interval gate. PSU bypass does not skip this.
                     Some(-POWER_TARGET_STEP_MV)
                 } else if now >= next_power_check {
                     if power_w < target_w - POWER_TARGET_DEADBAND_W {
@@ -4513,8 +4927,8 @@ fn run_worker(
             // thrashing frequency instead of settling.
             let voltage_at_floor = (st.voltage_mv as i32) <= POWER_TARGET_MIN_MV;
             let psu_freq_now = std::time::Instant::now();
-            if psu_freq_now >= next_psu_freq_check {
-                if voltage_at_floor && power_w > effective_safety_w {
+            if !bypass && psu_freq_now >= next_psu_freq_check {
+                if sensor_ok && voltage_at_floor && power_w > effective_safety_w {
                     for i in 0..4 {
                         let candidate = psu_ceiling_freq[i] as i32 - TEMP_TARGET_STEP_MHZ;
                         psu_ceiling_freq[i] = candidate.clamp(
@@ -4523,7 +4937,7 @@ fn run_worker(
                         ) as u32;
                     }
                     next_psu_freq_check = psu_freq_now + PSU_FREQ_CHECK_INTERVAL;
-                } else if power_w < effective_safety_w - POWER_TARGET_DEADBAND_W {
+                } else if sensor_ok && power_w < effective_safety_w - POWER_TARGET_DEADBAND_W {
                     for i in 0..4 {
                         let candidate = psu_ceiling_freq[i] as i32 + TEMP_TARGET_STEP_MHZ;
                         psu_ceiling_freq[i] = candidate.clamp(
@@ -4566,7 +4980,7 @@ fn run_worker(
 
                 let forced_down = if now < next_autotune_forced_check {
                     false
-                } else if power_w > effective_safety_w {
+                } else if sensor_ok && power_w > effective_safety_w {
                     autotune_level = (autotune_level - AUTOTUNE_LEVEL_STEP).max(0.0);
                     eprintln!(
                         "[nano3s] autotune: power={power_w:.1}W exceeds {effective_safety_w:.1}W ceiling -- level -> {autotune_level:.2}"
@@ -4675,7 +5089,11 @@ fn run_worker(
             // instead of fighting it.
             if auto_tuner.is_enabled() {
                 auto_tuner.set_power_ceiling(tuner_power_ceiling_w);
-                auto_tuner.set_power_safety(psu_override_max_w.map(|_| effective_safety_w as f32));
+                auto_tuner.set_power_safety(if bypass {
+                    None
+                } else {
+                    psu_override_max_w.map(|_| effective_safety_w as f32)
+                });
                 if auto_tuner.tick_due(std::time::Instant::now()) && status_age_ms <= 60_000 {
                     if !is_idle && !manual_pause && current_task.is_some() && st.paused != 0 {
                         consecutive_paused_ticks += 1;
@@ -4734,9 +5152,14 @@ fn run_worker(
                     // tuner had no metrics (missing temp -> 100 %). It is the
                     // only source of fan writes, so at most one per tick.
                     let mut cmds = cmds;
-                    sync_manual_fan_with_tuner(&mut auto_tuner);
-                    let fan_temp = Some(st.temp_max).filter(|t| *t > 0.0);
-                    cmds.extend(auto_tuner.fan_tick(fan_temp));
+                    if immersion_enabled() {
+                        // Fans stay at 0. Temperature backstop above still runs.
+                        write_harness_control("fan:manual,0");
+                    } else {
+                        sync_manual_fan_with_tuner(&mut auto_tuner);
+                        let fan_temp = Some(st.temp_max).filter(|t| *t > 0.0);
+                        cmds.extend(auto_tuner.fan_tick(fan_temp));
+                    }
                     for cmd in cmds {
                         match cmd {
                             AutoTuneCmd::SetMode(f) => {
@@ -4920,7 +5343,7 @@ fn run_worker(
             telemetry_tx.send_modify(|t| {
                 t.threads = vec![ThreadTelemetry {
                     name: "chain".into(),
-                    hashrate: (st.ghsmm as u64).saturating_mul(1_000_000_000),
+                    hashrate: (st.ghsspd as u64).saturating_mul(1_000_000_000),
                     is_active: current_task.is_some() && st.paused == 0,
                 }];
                 t.temperatures = vec![
@@ -4952,6 +5375,7 @@ fn run_worker(
                         } else {
                             None
                         },
+                        source: Some(last_power_source.to_string()),
                     },
                     // Real USB-C PD input rail (INA226 bus voltage) --
                     // distinct from "core" above, whose voltage_v is the
@@ -4976,6 +5400,7 @@ fn run_worker(
                         } else {
                             None
                         },
+                        source: Some(last_power_source.to_string()),
                     },
                 ];
                 t.fans = read_fan_status().into_iter().collect();
@@ -5376,7 +5801,7 @@ mod tests {
             brightness: 200,
             speed: 42,
         };
-        write_led_conf_to(&path, &custom);
+        write_led_conf_to(&path, &custom).unwrap();
 
         let loaded = load_led_conf_from(&path);
         assert_eq!(loaded, custom);
@@ -5575,3 +6000,4 @@ mod tests {
         let _ = std::fs::remove_file(&path2);
     }
 }
+

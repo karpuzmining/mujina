@@ -57,6 +57,13 @@ pub(crate) struct SystemInfo {
     pub shared_rail: bool,
     pub ceiling_w: Option<f64>,
     pub psu_contract_w: Option<f64>,
+    pub psu_bypass: bool,
+    pub immersion: bool,
+    /// `ok` when the INA226 input meter answered, otherwise `unavailable`.
+    pub power_sensor: &'static str,
+    pub power_w: Option<f64>,
+    pub efficiency_jth: Option<f64>,
+    pub power_source: Option<&'static str>,
     pub boards: Vec<SystemBoard>,
 }
 
@@ -128,7 +135,15 @@ pub(crate) fn build_system(i: &SystemInfo) -> Value {
             "shared_rail": i.shared_rail,
             "ceiling_w": i.ceiling_w,
             "psu_contract_w": i.psu_contract_w,
+            "psu_bypass": i.psu_bypass,
+            "power_w": i.power_w,
+            "efficiency_jth": i.efficiency_jth,
+            "power_source": i.power_source,
+            "power_sensor": i.power_sensor,
         },
+        "psu_bypass": i.psu_bypass,
+        "immersion": i.immersion,
+        "fan": { "immersion": i.immersion },
         "rtos_core": {
             "embedded_sha256": embedded_rtos_sha256(),
             "running_sha256": running_rtos_sha256(),
@@ -167,6 +182,12 @@ mod tests {
             shared_rail: true,
             ceiling_w: Some(112.0),
             psu_contract_w: Some(140.0),
+            psu_bypass: false,
+            immersion: false,
+            power_sensor: "unavailable",
+            power_w: None,
+            efficiency_jth: None,
+            power_source: None,
             boards: vec![SystemBoard {
                 name: "nano3s-0".into(),
                 model: Some("Avalon Nano 3S".into()),
@@ -192,7 +213,14 @@ mod tests {
         assert_eq!(v["pool"], json!({ "endpoint": "/api/v0/pool", "pools": "/api/v0/pools", "apply": "live" }));
         assert!(v["rtos_core"]["embedded_sha256"].is_null());
         assert!(v["rtos_core"]["running_sha256"].is_null());
-        assert_eq!(v["power"], json!({ "shared_rail": true, "ceiling_w": 112.0, "psu_contract_w": 140.0 }));
+        assert_eq!(v["psu_bypass"], false);
+        assert_eq!(v["immersion"], false);
+        assert_eq!(v["fan"]["immersion"], false);
+        assert_eq!(v["power"]["power_sensor"], "unavailable");
+        assert_eq!(v["power"]["shared_rail"], true);
+        assert_eq!(v["power"]["ceiling_w"], 112.0);
+        assert_eq!(v["power"]["psu_contract_w"], 140.0);
+        assert_eq!(v["power"]["psu_bypass"], false);
         let b = &v["boards"][0];
         assert_eq!(b["name"], "nano3s-0");
         assert_eq!(b["caps"]["chip_grid"], "per_chip");

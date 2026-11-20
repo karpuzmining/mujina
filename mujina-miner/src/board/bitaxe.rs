@@ -410,12 +410,14 @@ impl Bitaxe {
                     voltage_v: vin_mv.map(|mv| mv as f32 / 1000.0),
                     current_a: None,
                     power_w: None,
+                    source: None,
                 },
                 PowerMeasurement {
                     name: "core".into(),
                     voltage_v: vout_mv.map(|mv| mv as f32 / 1000.0),
                     current_a: iout_ma.map(|ma| ma as f32 / 1000.0),
                     power_w: power_mw.map(|mw| mw as f32 / 1000.0),
+                    source: power_mw.map(|_| "measured".to_string()),
                 },
             ],
             threads: Vec::new(), // TODO: populate from hash thread telemetry

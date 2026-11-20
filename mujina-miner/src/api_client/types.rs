@@ -63,6 +63,9 @@ pub struct PowerMeasurement {
     pub voltage_v: Option<f32>,
     pub current_a: Option<f32>,
     pub power_w: Option<f32>,
+    /// `measured` (INA226 input rail), `derived`, or `estimated` (chip V²×f model).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Per-thread telemetry.
@@ -118,6 +121,21 @@ pub struct BoardTuningRequest {
     /// recovers back up to the last commanded frequency).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temp_target_c: Option<f64>,
+}
+
+/// Saved Live Tuning, from `tuning.conf`. `live_preset` is the selector
+/// value (`210,230,250,270`, `338,358,378,398`, `420,440,460,480`, or `custom`).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct BoardTuningState {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pll_freq_mhz: Option<[u32; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voltage_mv: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub power_target_w: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temp_target_c: Option<f64>,
+    pub live_preset: String,
 }
 
 /// Request body for `PATCH /api/v0/boards/{name}/chip-clocks`.
@@ -192,6 +210,19 @@ pub struct BoardFanRequest {
     /// can be set in the same request or on its own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chip_temp_target_c: Option<f64>,
+    /// Immersion: fans at 0 %, curve off, fan-missing faults suppressed.
+    /// Default off. Chip over-temperature shutdown stays on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub immersion: Option<bool>,
+}
+
+/// `GET /api/v0/boards/{name}/fan`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct BoardFanStatus {
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manual_duty_percent: Option<u8>,
+    pub immersion: bool,
 }
 
 /// One point on the fan curve: at `temp_c` outlet temperature, run the
@@ -237,6 +268,10 @@ pub struct FanCurveResponse {
 pub struct PsuOverrideRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub override_max_w: Option<f64>,
+    /// Lift PD wattage tiers and the 137 W trip. Default off.
+    /// Chip over-temperature shutdown and the 3912 mV rail maximum stay on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub psu_bypass: Option<bool>,
 }
 
 /// Response body for `GET /api/v0/boards/{name}/psu`.
@@ -260,7 +295,18 @@ pub struct PsuStatusResponse {
     pub override_max_w: Option<f64>,
     /// The ceiling actually enforced by the power-target safety trip:
     /// `min(POWER_TARGET_SAFETY_W, (override_max_w or detected_ceiling_w) - margin)`.
+    /// Not enforced while `psu_bypass` is true.
     pub effective_ceiling_w: f64,
+    /// PD tiers and the 137 W trip are not applied while this is true.
+    /// The 137 W measured-power trip stays on either way.
+    pub psu_bypass: bool,
+    /// `ok` when the INA226 answered with at least 8 V, otherwise `unavailable`.
+    #[serde(default = "sensor_unavailable")]
+    pub power_sensor: String,
+}
+
+fn sensor_unavailable() -> String {
+    "unavailable".into()
 }
 
 /// Request body for `PATCH /api/v0/boards/{name}/autotune-hashrate`.
@@ -410,6 +456,21 @@ pub struct PoolStatus {
     pub hashrate_10m: u64,
     /// Effective hashrate, hashes/s, over the last hour.
     pub hashrate_1h: u64,
+    /// `connected`, `connecting`, `standby`, or `down`.
+    #[serde(default)]
+    pub state: String,
+    /// Why the pool is not connected, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Rolling median stratum round-trip, milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u32>,
+    /// Best difficulty the pool has accepted this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub best_share: Option<f64>,
+    /// Best accepted difficulty kept across reboots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub best_share_alltime: Option<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]

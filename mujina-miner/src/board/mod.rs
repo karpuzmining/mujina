@@ -5,6 +5,7 @@ pub(crate) mod emberone00;
 #[cfg(feature = "nano3s")]
 pub(crate) mod nano3s;
 pub(crate) mod nano3s_auto_tune;
+pub(crate) mod nano3s_power;
 #[cfg(test)]
 pub(crate) mod nano3s_chain_sim;
 pub(crate) mod nano3s_chip_tuner;

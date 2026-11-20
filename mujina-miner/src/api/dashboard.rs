@@ -32,9 +32,12 @@ const LED_HTML: &str = include_str!("../../assets/led.html");
 /// rather than a telemetry view.
 const TUNING_HTML: &str = include_str!("../../assets/tuning.html");
 const POOL_HTML: &str = include_str!("../../assets/pool.html");
-const POWER_HTML: &str = include_str!("../../assets/power.html");
-const FAN_HTML: &str = include_str!("../../assets/fan.html");
-const DISPLAY_HTML: &str = include_str!("../../assets/display.html");
+const SHEET_REDIRECT_HTML: &str = r#"<!doctype html><meta charset="utf-8"><title>MUJINA</title>
+<script>
+var page = location.pathname.replace(/^\//, '');
+var key = location.hash === '#curve' ? 'curve' : page;
+location.replace('/dashboard#' + key);
+</script>"#;
 /// Network firmware updater (upload mujina-minerd or the harness binary,
 /// applied immediately with a reboot) -- separate from `/dashboard` for
 /// the same reason `/led`/`/pool` are.
@@ -184,15 +187,15 @@ async fn serve_tuning_page() -> impl IntoResponse {
 }
 
 async fn serve_power_page() -> impl IntoResponse {
-    Html(POWER_HTML)
+    Html(SHEET_REDIRECT_HTML)
 }
 
 async fn serve_fan_page() -> impl IntoResponse {
-    Html(FAN_HTML)
+    Html(SHEET_REDIRECT_HTML)
 }
 
 async fn serve_display_page() -> impl IntoResponse {
-    Html(DISPLAY_HTML)
+    Html(SHEET_REDIRECT_HTML)
 }
 
 async fn serve_firmware_page() -> impl IntoResponse {
@@ -255,6 +258,10 @@ async fn serve_data(axum::extract::State(state): axum::extract::State<SharedStat
     } else {
         Some(round1(fan_rpms.iter().sum::<f64>() / fan_rpms.len() as f64))
     };
+    #[cfg(feature = "nano3s")]
+    let power_sensor = if crate::board::nano3s::power_sensor_ok() { "ok" } else { "unavailable" };
+    #[cfg(not(feature = "nano3s"))]
+    let power_sensor = "unavailable";
 
     Json(json!({
         "ok": true,
@@ -274,6 +281,10 @@ async fn serve_data(axum::extract::State(state): axum::extract::State<SharedStat
             "avg_asic_c": avg_field(&boards, "asic_c"),
             "avg_outlet_c": avg_field(&boards, "outlet_c"),
             "avg_fan_rpm": avg_fan_rpm,
+            "power_source": m.boards.iter().find_map(|b| {
+                b.powers.iter().find_map(|p| p.source.clone())
+            }),
+            "power_sensor": power_sensor,
             "series": fleet_series,
         },
         "shares": m.shares_submitted,

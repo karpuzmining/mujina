@@ -24,7 +24,8 @@ use crate::api_client::types::{
     AutotuneHashrateRequest, AutotuneHashrateResponse, BoardFanRequest, BoardLedRequest,
     DisplayPatchRequest, DisplayState,
     BoardChipClocksRequest, BoardLedState, BoardPauseRequest, BoardPowerTargetRequest, BoardTelemetry,
-    BoardTempTargetRequest, BoardTuningRequest, FanCurvePoint, FanCurveRequest, FanCurveResponse,
+    BoardFanStatus, BoardTempTargetRequest, BoardTuningRequest, BoardTuningState, FanCurvePoint,
+    FanCurveRequest, FanCurveResponse,
     FirmwareBundleResponse, FirmwareUploadResponse, MinerPatchRequest, MinerTelemetry,
     PoolConfigRequest, PoolConfigResponse, PoolStatus, PoolsPutRequest, PoolsResponse,
     PsuOverrideRequest, PsuStatusResponse, SourceTelemetry,
@@ -52,7 +53,7 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(get_miner, patch_miner))
         .routes(routes!(get_boards))
         .routes(routes!(get_board))
-        .routes(routes!(patch_board_tuning))
+        .routes(routes!(get_board_tuning, patch_board_tuning))
         .routes(routes!(patch_board_chip_clocks))
         .routes(routes!(patch_board_power_target))
         .routes(routes!(patch_board_temp_target))
@@ -64,7 +65,7 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(get_board_auto_tune, patch_board_auto_tune))
         .routes(routes!(get_board_tuner, patch_board_tuner))
         .routes(routes!(get_system))
-        .routes(routes!(patch_board_fan))
+        .routes(routes!(get_board_fan, patch_board_fan))
         .routes(routes!(get_board_fan_curve, patch_board_fan_curve))
         .routes(routes!(patch_board_pause))
         .routes(routes!(get_board_led, patch_board_led))
@@ -217,7 +218,7 @@ fn validate_board_tuning(req: &BoardTuningRequest) -> Result<(), StatusCode> {
     }
     // Same range check as the dedicated power-target endpoint.
     if let Some(w) = req.power_target_w
-        && !(20.0..=137.0).contains(&w)
+        && !(20.0..=power_target_max_w()).contains(&w)
     {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -237,6 +238,48 @@ fn validate_board_tuning(req: &BoardTuningRequest) -> Result<(), StatusCode> {
 /// `nano3s` Cargo feature return 501). At least one of `pll_freq_mhz`/
 /// `voltage_mv`/`power_target_w`/`temp_target_c` must be set; values are
 /// range-checked before being applied.
+#[utoipa::path(
+    get,
+    path = "/boards/{name}/tuning",
+    tag = "boards",
+    params(("name" = String, Path, description = "Board name")),
+    responses(
+        (status = OK, description = "Saved live tuning", body = BoardTuningState),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = NOT_IMPLEMENTED, description = "This build has no saved tuning"),
+    ),
+)]
+async fn get_board_tuning(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+) -> Result<Json<BoardTuningState>, StatusCode> {
+    let known = state
+        .board_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .boards()
+        .into_iter()
+        .any(|b| b.name == name);
+    if !known {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    #[cfg(feature = "nano3s")]
+    {
+        let s = crate::board::nano3s::saved_tuning();
+        return Ok(Json(BoardTuningState {
+            pll_freq_mhz: s.pll_freq_mhz,
+            voltage_mv: s.voltage_mv,
+            power_target_w: s.power_target_w,
+            temp_target_c: s.temp_target_c,
+            live_preset: s.live_preset,
+        }));
+    }
+    #[cfg(not(feature = "nano3s"))]
+    {
+        Err(StatusCode::NOT_IMPLEMENTED)
+    }
+}
+
 #[utoipa::path(
     patch,
     path = "/boards/{name}/tuning",
@@ -407,7 +450,7 @@ async fn patch_board_power_target(
     }
     // Range check before the value reaches the power-target loop.
     if let Some(w) = req.target_w
-        && !(20.0..=137.0).contains(&w)
+        && !(20.0..=power_target_max_w()).contains(&w)
     {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -525,6 +568,12 @@ async fn get_board_psu(
             detected_ceiling_w,
             override_max_w,
             effective_ceiling_w,
+            psu_bypass: crate::board::nano3s::psu_bypass_enabled(),
+            power_sensor: if crate::board::nano3s::power_sensor_ok() {
+                "ok".into()
+            } else {
+                "unavailable".into()
+            },
         }))
     }
     #[cfg(not(feature = "nano3s"))]
@@ -566,16 +615,33 @@ async fn patch_board_psu(
     if !known {
         return Err(StatusCode::NOT_FOUND);
     }
+    #[cfg(feature = "nano3s")]
+    let bypass_after = req
+        .psu_bypass
+        .unwrap_or_else(crate::board::nano3s::psu_bypass_enabled);
+    #[cfg(not(feature = "nano3s"))]
+    let bypass_after = false;
+    let override_max = if bypass_after { 400.0 } else { 140.0 };
     if let Some(w) = req.override_max_w
-        && !(15.0..=140.0).contains(&w)
+        && !(15.0..=override_max).contains(&w)
     {
         return Err(StatusCode::BAD_REQUEST);
+    }
+    if req.psu_bypass.is_none() && req.override_max_w.is_none() {
+        // Stock path: `{override_max_w: null}` clears the override.
     }
 
     #[cfg(feature = "nano3s")]
     {
-        crate::board::nano3s::write_psu_override_command(req.override_max_w)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if let Some(on) = req.psu_bypass {
+            crate::board::nano3s::set_psu_bypass(on)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        }
+        // A bypass-only body must not clear a saved watt override.
+        if req.psu_bypass.is_none() || req.override_max_w.is_some() {
+            crate::board::nano3s::write_psu_override_command(req.override_max_w)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        }
         Ok(StatusCode::OK)
     }
     #[cfg(not(feature = "nano3s"))]
@@ -865,6 +931,12 @@ async fn get_system(State(state): State<SharedState>) -> Json<serde_json::Value>
             shared_rail: true,
             ceiling_w: ceiling,
             psu_contract_w: contract_w,
+            psu_bypass: crate::board::nano3s::psu_bypass_enabled(),
+            immersion: crate::board::nano3s::immersion_enabled(),
+            power_sensor: if crate::board::nano3s::power_sensor_ok() { "ok" } else { "unavailable" },
+            power_w: None,
+            efficiency_jth: None,
+            power_source: None,
             boards: names
                 .into_iter()
                 .map(|(name, model)| SystemBoard {
@@ -890,6 +962,12 @@ async fn get_system(State(state): State<SharedState>) -> Json<serde_json::Value>
         shared_rail: false,
         ceiling_w: None,
         psu_contract_w: None,
+        psu_bypass: false,
+        immersion: false,
+        power_sensor: "unavailable",
+        power_w: None,
+        efficiency_jth: None,
+        power_source: None,
         boards: names
             .into_iter()
             .map(|(name, model)| SystemBoard {
@@ -907,6 +985,46 @@ async fn get_system(State(state): State<SharedState>) -> Json<serde_json::Value>
 ///
 /// Fan commands never touch `power_en`, so they can be sent at any time
 /// without affecting the mining chain.
+#[utoipa::path(
+    get,
+    path = "/boards/{name}/fan",
+    tag = "boards",
+    params(("name" = String, Path, description = "Board name")),
+    responses(
+        (status = OK, description = "Saved fan mode", body = BoardFanStatus),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = NOT_IMPLEMENTED, description = "This build has no fan control"),
+    ),
+)]
+async fn get_board_fan(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+) -> Result<Json<BoardFanStatus>, StatusCode> {
+    let known = state
+        .board_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .boards()
+        .into_iter()
+        .any(|b| b.name == name);
+    if !known {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    #[cfg(feature = "nano3s")]
+    {
+        let (mode, duty) = crate::board::nano3s::fan_mode_saved();
+        return Ok(Json(BoardFanStatus {
+            mode,
+            manual_duty_percent: duty,
+            immersion: crate::board::nano3s::immersion_enabled(),
+        }));
+    }
+    #[cfg(not(feature = "nano3s"))]
+    {
+        Err(StatusCode::NOT_IMPLEMENTED)
+    }
+}
+
 #[utoipa::path(
     patch,
     path = "/boards/{name}/fan",
@@ -1068,6 +1186,11 @@ async fn patch_board_fan_curve(
             return Err(StatusCode::BAD_REQUEST);
         }
     }
+    let mut temps: Vec<f64> = req.points.iter().map(|p| p.temp_c).collect();
+    temps.sort_by(f64::total_cmp);
+    if temps.windows(2).any(|w| w[1] <= w[0]) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
     #[cfg(feature = "nano3s")]
     {
@@ -1211,7 +1334,13 @@ async fn patch_board_led(
     #[cfg(feature = "nano3s")]
     {
         crate::board::nano3s::write_led_command(req.effect, req.color, req.brightness, req.speed)
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+            .map_err(|e| {
+                if e.starts_with("failed to save") {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    StatusCode::BAD_REQUEST
+                }
+            })?;
         Ok(StatusCode::OK)
     }
     #[cfg(not(feature = "nano3s"))]
@@ -2071,6 +2200,31 @@ fn pool1_response() -> PoolConfigResponse {
     }
 }
 
+fn pool_link_state(weight: u16, connected: bool) -> &'static str {
+    if connected {
+        "connected"
+    } else if weight == 0 {
+        "standby"
+    } else {
+        "down"
+    }
+}
+
+fn power_target_max_w() -> f64 {
+    #[cfg(feature = "nano3s")]
+    {
+        if crate::board::nano3s::psu_bypass_enabled() {
+            400.0
+        } else {
+            137.0
+        }
+    }
+    #[cfg(not(feature = "nano3s"))]
+    {
+        137.0
+    }
+}
+
 /// Every configured pool, plus live status. Passwords are never returned;
 /// `password_set` says whether one is stored.
 #[utoipa::path(
@@ -2087,18 +2241,24 @@ async fn get_pools(State(state): State<SharedState>) -> Json<PoolsResponse> {
         .into_iter()
         .map(|pool| {
             let live = telemetry.sources.iter().find(|s| s.url.as_deref() == Some(pool.url.as_str()));
+            let connected = live.map(|s| s.connected).unwrap_or(false);
             PoolStatus {
                 url: pool.url,
                 user: pool.user,
                 password_set: !pool.pass.is_empty(),
                 weight: pool.weight,
-                connected: live.map(|s| s.connected).unwrap_or(false),
+                connected,
                 difficulty: live.and_then(|s| s.difficulty),
                 accepted: live.map(|s| s.accepted).unwrap_or(0),
                 rejected: live.map(|s| s.rejected).unwrap_or(0),
                 hashrate_10m: live.map(|s| s.hashrate_10m).unwrap_or(0),
                 hashrate_1h: live.map(|s| s.hashrate_1h).unwrap_or(0),
                 reject_reasons: live.map(|s| s.reject_reasons.clone()).unwrap_or_default(),
+                state: pool_link_state(pool.weight, connected).to_string(),
+                last_error: None,
+                latency_ms: None,
+                best_share: None,
+                best_share_alltime: None,
             }
         })
         .collect();
