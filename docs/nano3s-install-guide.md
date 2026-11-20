@@ -170,5 +170,10 @@ curl -X POST --data-binary @nano-mujina-v5-bundle.bin \
      * **Efficient**: Deep undervolting maximizing Joules per Terahash ($J/\text{TH}$).
      * **Balanced**: Factory medium wattage with dynamic voltage/frequency optimization.
      * **Max Hash**: Climbs to full continuous safety envelope (~5.0+ TH/s @ 105–112W).
-4. **Customize WS2812 LEDs:**
+4. **Per-chip clocks (optional):**
+   * Open `http://<MINER_IP>/tuning`. The per-chip table shows each die's PVT temperature, PVT millivolts, PLL0 frequency, speed-log error rate, and speed-log GH/s.
+   * Offsets are −150..+50 MHz on top of the board clock. Absolute MHz is saved as that same offset.
+   * **Clear chip clocks** (the default, including after an upgrade) still zeroes those offsets when you change profile or the board voltage/frequency. Choose **Keep chip clocks** to retain them. There is no per-chip voltage; the 12 dies share one rail, and 3600 mV is rejected.
+   * A hardware checklist for this build is in `docs/nano3s-per-chip-hardware-test.md`.
+5. **Customize WS2812 LEDs:**
    * Open `http://<MINER_IP>/led` to select dynamic Stratum Share effects (`SharePulse`, `ShareWave`, `Cylon Scanner`, `Halloween`, `Christmas`). Settings persist non-volatilely to `/data/userconfig/led.conf`.
