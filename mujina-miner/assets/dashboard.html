@@ -1091,6 +1091,8 @@
     </div>
     <div style="display:flex;align-items:center;gap:12px">
       <span class="modebadge" id="modeBadge" style="display:none"></span>
+      <span class="modebadge" id="psuBypassBadge" style="display:none;border-color:var(--amber);color:var(--amber)">PSU bypass</span>
+      <span class="modebadge" id="immersionBadge" style="display:none;border-color:var(--purple);color:var(--purple)">Immersion</span>
     </div>
   </div>
 
@@ -1165,6 +1167,7 @@
     <div class="sheet">
       <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
       <h2>Tuning</h2>
+      <p class="note"><a id="tuneHealth" href="/tuning#diagnostics">Board health</a></p>
       <div class="boardtabs" id="tuneBoardTabs" style="display:none;margin:10px 0 14px 0"></div>
       <div class="note" id="powerLine" style="display:none"></div>
       <div class="note" id="tuningNone" style="display:none">No tuning controls for this board.</div>
@@ -1254,6 +1257,14 @@
   </div>
   </div>
 
+    <div class="card" id="psuBypassCard" style="max-width:560px;margin-top:16px">
+      <label style="display:flex;gap:10px;align-items:center">
+        <input type="checkbox" id="psuBypassToggle">
+        <span>PSU bypass</span>
+      </label>
+      <p class="note">Lifts the USB-C PD wattage tiers. The 137 W trip, chip over-temperature shutdown and the 3912 mV rail limit stay on. The stock adapter can overheat.</p>
+      <div class="msg" id="psuBypassMsg"></div>
+    </div>
     <div style="margin-top:16px">
       <a class="btn pri" id="advancedTuning" href="/tuning" style="display:inline-flex;width:100%;justify-content:center">Advanced tuning</a>
       <p class="note" style="margin-top:8px">Opens the full tuning page: profiles, live clocks, and per-chip settings.</p>
@@ -1265,6 +1276,14 @@
     <div class="sheet">
       <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
       <h2>Fan</h2>
+      <div class="card" style="max-width:560px;margin-bottom:12px">
+        <label style="display:flex;gap:10px;align-items:center">
+          <input type="checkbox" id="immersionToggle">
+          <span>Immersion mode</span>
+        </label>
+        <p class="note">Fans stay at 0% and fan-missing faults are ignored. Only enable when the miner is submerged in dielectric fluid.</p>
+        <div class="msg" id="immersionMsg"></div>
+      </div>
       <div class="boardtabs" id="fanBoardTabs" style="display:none;margin:10px 0 14px 0"></div>
   <div id="fanSection" style="display:none">
   <!-- Fan Control -->
@@ -1781,6 +1800,10 @@ function applySystem() {
     const dev = SYS.device || {};
     badge.textContent = String(SYS.mode || '?').toUpperCase() + ' · ' + (dev.model || SYS.platform || '');
     show(badge, true);
+    show('psuBypassBadge', !!SYS.psu_bypass);
+    show('immersionBadge', !!SYS.immersion);
+    if ($('psuBypassToggle')) $('psuBypassToggle').checked = !!SYS.psu_bypass;
+    if ($('immersionToggle')) $('immersionToggle').checked = !!SYS.immersion;
     const fw = SYS.firmware || {};
     $('statuspath').textContent = (fw.name || 'mujina-minerd') + ' ' + (fw.version || '') + (fw.build ? ' (' + fw.build + ')' : '');
     show('rebootBtn', !!dev.can_reboot);
@@ -3001,6 +3024,15 @@ async function loadLiveTuning() {
       $('tunePreset').value = 'custom';
     }
     if (d.pll_freq_mhz && d.pll_freq_mhz.length) $('tuneFreq').value = d.pll_freq_mhz[0];
+    const health = $('tuneHealth');
+    if (health && LAST && LAST.boards && LAST.boards[0]) {
+      const b = LAST.boards[0];
+      const chips = b.chips || [];
+      const hot = chips.reduce((m, c) => Math.max(m, +c.temp_c || 0), 0);
+      const worst = chips.reduce((m, c) => Math.max(m, +c.spd_dh || 0), 0);
+      health.textContent = (chips.length || '—') + '/' + (chips.length || '—') + ' chips, worst fail rate '
+        + (worst ? worst.toFixed(1) + '%' : '—') + ', hottest chip ' + (hot ? hot.toFixed(1) + ' °C' : '—');
+    }
     if (d.voltage_mv != null) $('tuneVolt').value = d.voltage_mv;
     if (d.power_target_w != null && $('tunePowerTarget')) $('tunePowerTarget').value = d.power_target_w;
   } catch (e) { /* leave the form */ }
@@ -3067,6 +3099,46 @@ if ($('psuModeSelect')) $('psuModeSelect').addEventListener('change', syncPsuMod
 if ($('psuApplyBtn')) $('psuApplyBtn').addEventListener('click', applyPsuProfile);
 if ($('poolSave')) $('poolSave').addEventListener('click', savePool);
 if ($('poolReboot')) $('poolReboot').addEventListener('click', poolApplyNow);
+if ($('immersionToggle')) $('immersionToggle').addEventListener('change', async () => {
+  const on = $('immersionToggle').checked;
+  if (on && !confirm('Only enable when the miner is submerged in dielectric fluid; in air the chips will overheat')) {
+    $('immersionToggle').checked = false;
+    return;
+  }
+  const name = activeName();
+  if (!name) return;
+  try {
+    const r = await fetch('/api/v0/boards/' + encodeURIComponent(name) + '/fan', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ immersion: on })
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    setMsg('immersionMsg', on ? 'Immersion on' : 'Immersion off', true);
+    ['fanMode', 'fanDuty', 'fanApply', 'curveAddPoint', 'curveApply'].forEach(id => { const el = $(id); if (el) el.disabled = on; });
+  } catch (e) {
+    $('immersionToggle').checked = !on;
+    setMsg('immersionMsg', 'save failed: ' + e.message);
+  }
+});
+if ($('psuBypassToggle')) $('psuBypassToggle').addEventListener('change', async () => {
+  const on = $('psuBypassToggle').checked;
+  if (on && !confirm('PSU bypass lets the miner draw past the stock adapter limit. The stock adapter can overheat. The 137 W trip and over-temperature shutdown stay on. Enable PSU bypass?')) {
+    $('psuBypassToggle').checked = false;
+    return;
+  }
+  const name = activeName();
+  if (!name) return;
+  try {
+    const r = await fetch('/api/v0/boards/' + encodeURIComponent(name) + '/psu', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ psu_bypass: on })
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    setMsg('psuBypassMsg', on ? 'PSU bypass on' : 'PSU bypass off', true);
+    show('psuBypassBadge', on);
+  } catch (e) {
+    $('psuBypassToggle').checked = !on;
+    setMsg('psuBypassMsg', 'save failed: ' + e.message);
+  }
+});
 if ($('ownApply')) $('ownApply').addEventListener('click', applyOwner);
 if ($('ownProfile')) $('ownProfile').addEventListener('change', syncTargetMode);
 document.querySelectorAll('#ownTargetAxis .segbtn').forEach(b => b.addEventListener('click', () => setTargetAxis(b.dataset.axis)));
