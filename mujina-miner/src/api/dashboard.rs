@@ -10,6 +10,7 @@ use std::collections::{HashMap, VecDeque};
 
 use axum::{
     Json, Router,
+    extract::Query,
     http::StatusCode,
     response::{Html, IntoResponse},
     routing,
@@ -170,12 +171,20 @@ async fn launch_doom() -> Json<Value> {
     }
 }
 
-async fn serve_info_page() -> impl IntoResponse {
-    Html(INFO_HTML)
+fn embed_or_redirect(q: &HashMap<String, String>, page: &'static str) -> Html<&'static str> {
+    if q.get("embed").is_some_and(|v| v == "1") {
+        Html(page)
+    } else {
+        Html(SHEET_REDIRECT_HTML)
+    }
 }
 
-async fn serve_led_page() -> impl IntoResponse {
-    Html(LED_HTML)
+async fn serve_info_page(Query(q): Query<HashMap<String, String>>) -> impl IntoResponse {
+    embed_or_redirect(&q, INFO_HTML)
+}
+
+async fn serve_led_page(Query(q): Query<HashMap<String, String>>) -> impl IntoResponse {
+    embed_or_redirect(&q, LED_HTML)
 }
 
 async fn serve_pool_page() -> impl IntoResponse {
@@ -198,8 +207,8 @@ async fn serve_display_page() -> impl IntoResponse {
     Html(SHEET_REDIRECT_HTML)
 }
 
-async fn serve_firmware_page() -> impl IntoResponse {
-    Html(FIRMWARE_HTML)
+async fn serve_firmware_page(Query(q): Query<HashMap<String, String>>) -> impl IntoResponse {
+    embed_or_redirect(&q, FIRMWARE_HTML)
 }
 
 /// Per-chip and chain-wide detail from the latest `IPC_MSG_STATUS`.

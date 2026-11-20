@@ -536,6 +536,8 @@
     }
     .menubar .menubtn.on { border-color: var(--cyan); box-shadow: 0 0 10px rgba(0,240,255,.3); }
     .menusheet .sheet { width: min(640px, 96vw); position: relative; }
+    .menusheet .sheet.frame { width: min(960px, 96vw); height: min(88vh, 920px); display: flex; flex-direction: column; }
+    .menusheet .sheet.frame iframe { flex: 1; width: 100%; border: 0; background: #05070e; min-height: 240px; }
     .menusheet .sheetclose { position: sticky; top: 0; float: right; z-index: 2; margin: 0 0 8px 8px; }
     .menusheet .sheet .sec:first-of-type { margin-top: 4px; }
     #ownCur { font-size: 13px; color: var(--ink); line-height: 1.5; margin-bottom: 12px; overflow-wrap: anywhere; }
@@ -1103,10 +1105,10 @@
     <button type="button" class="menubtn" data-menu="fan" style="display:none">Fan</button>
     <button type="button" class="menubtn" data-menu="curve" style="display:none">Fan Curve</button>
     <a class="menubtn" data-menu="pool" href="/pool" style="display:none">Pool</a>
-    <a class="menubtn" data-menu="led" href="/led">LED</a>
-    <a class="menubtn" data-menu="firmware" href="/firmware" style="display:none">Firmware</a>
+    <button type="button" class="menubtn" data-menu="led">LED</button>
+    <button type="button" class="menubtn" data-menu="firmware" style="display:none">Firmware</button>
     <button type="button" class="menubtn" data-menu="display">Display</button>
-    <a class="menubtn" data-menu="info" href="/info">Info</a>
+    <button type="button" class="menubtn" data-menu="info">Info</button>
   </div>
   <div class="sysnotice" id="sysNotice" style="display:none"></div>
 
@@ -1330,6 +1332,7 @@
       <button class="btn" id="curveAddPoint" type="button">+ Add Point</button>
       <button class="btn pri wbtn" id="curveApply" type="button">Save Curve</button>
     </div>
+    <p class="note">Temperatures must increase. Fan duty is 0–100%. Two to eight points.</p>
     <div class="msg" id="curveMsg"></div>
   </div>
   </div>
@@ -1351,6 +1354,25 @@
           </select>
         </div>
       </div>
+    </div>
+  </div>
+
+  <div class="modal menusheet" id="menu-led">
+    <div class="sheet frame">
+      <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
+      <iframe title="LED" src="/led?embed=1"></iframe>
+    </div>
+  </div>
+  <div class="modal menusheet" id="menu-firmware">
+    <div class="sheet frame">
+      <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
+      <iframe title="Firmware" src="/firmware?embed=1"></iframe>
+    </div>
+  </div>
+  <div class="modal menusheet" id="menu-info">
+    <div class="sheet frame">
+      <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
+      <iframe title="Info" src="/info?embed=1"></iframe>
     </div>
   </div>
 
@@ -1424,77 +1446,6 @@
       <span><i style="background:var(--green)"></i>50&ndash;70&deg;C</span>
       <span><i style="background:var(--amber)"></i>70&ndash;85&deg;C</span>
       <span><i style="background:var(--mag)"></i>&gt; 85&deg;C</span>
-    </div>
-  </div>
-
-  <div class="sec">Board Diagnostics<span class="sec-sub" id="boardsub"></span></div>
-  <div class="boardtabs" id="boardTabs" style="display:none"></div>
-
-  <div class="grid">
-    <div class="card hero hr">
-      <div class="label" id="boardhrlabel">Hashrate</div>
-      <div class="herobody">
-        <div class="heromain"><div class="val" id="hr">—</div></div>
-        <div class="heroside" id="chipcard" style="display:none">
-          <div class="chip-toolbar">
-            <div class="chiplabel">ASIC Health Grid Matrix</div>
-            <div class="chipfilters" id="chipFilterBtns">
-              <button class="cfilterbtn active" data-filter="all">All</button>
-              <button class="cfilterbtn" data-filter="lazy">Lazy</button>
-            </div>
-          </div>
-          <div id="chips"></div>
-        </div>
-      </div>
-    </div>
-    <div class="card freq span2">
-      <div class="dual">
-        <div class="dcell"><div class="label">Frequency</div><div class="val" id="freq">—</div></div>
-        <div class="dcell"><div class="label">Core Voltage</div><div class="val" id="corev">—</div></div>
-      </div>
-    </div>
-    <div class="card temp span2">
-      <div class="dual">
-        <div class="dcell" id="tcAsic"><div class="label">ASIC Temp</div><div class="val" id="asic">—</div></div>
-        <div class="dcell" id="tcVr"><div class="label">VR Temp</div><div class="val" id="vrtemp">—</div></div>
-        <div class="dcell" id="tcOutlet"><div class="label">Outlet Temp</div><div class="val" id="outlet" title="External board NTC thermistor, positioned near the exhaust -- not on the ASIC chain itself. No inlet sensor exists on this hardware.">—</div></div>
-        <div class="dcell"><div class="label">Fail Rate</div><div class="val" id="vr">—</div></div>
-      </div>
-    </div>
-
-    <div class="card eff"><div class="label">Efficiency</div><div class="val" id="eff">—</div></div>
-    <div class="card"><div class="label">ASIC Core Power</div><div class="val" id="corew">—</div></div>
-    <div class="card"><div class="label">Core Current</div><div class="val" id="corea">—</div></div>
-    <div class="card"><div class="label">Input Voltage</div><div class="val" id="inputv">—</div></div>
-
-    <div class="card fan"><div class="label">Fan</div><div class="val" id="fan">—</div></div>
-    <div class="card span2">
-      <div class="label">Board</div>
-      <div class="val" id="boardmeta" style="font-size:15px">—</div>
-    </div>
-
-    <!-- Prominent Auto-Tuner Live Terminal Console -->
-    <div class="card span4" id="tunerCard" style="margin-top:4px;display:none">
-      <div class="label">// AUTO-TUNER LIVE ACTIVITY &amp; CALIBRATION LOG</div>
-      <div class="at-console">
-        <div class="at-console-header">
-          <span class="at-title">Status: <span id="at-phase-label">HOLDING</span></span>
-          <span class="at-best-badge" id="atbest">No calibration point established yet</span>
-        </div>
-        <div id="at-per-chip" style="font-size:11px;color:var(--dim);margin:4px 0;padding:2px 0"></div>
-        <div class="at-feed" id="atlist">—</div>
-      </div>
-    </div>
-  </div>
-
-  <div class="chartcard">
-    <div class="label">Board Hashrate History // GH/s (Hover to inspect)</div>
-    <div class="chartwrap">
-      <canvas id="chart"></canvas>
-    </div>
-    <div class="chartlegend">
-      <span class="lg"><i class="sw sw-solid"></i>Board Hashrate</span>
-      <span class="lg"><i class="sw sw-dash"></i>Moving Avg (10)</span>
     </div>
   </div>
 
@@ -1991,6 +1942,7 @@ function renderChips(chips, perChip) {
   let list = chips;
   if (CHIP_FILTER === 'lazy') list = chips.filter(c => (c.ghs || 0) < peak * 0.75);
   const root = $('chips');
+  if (!root) return;
   root.textContent = '';
   if (!list.length) { const n = mk('div', null, 'No chips match filter.'); n.style.cssText = 'font-size:11px;color:var(--dim);padding:10px 0'; root.appendChild(n); return; }
   const grid = mk('div', 'chipgrid');
@@ -2138,6 +2090,7 @@ function renderTabs(boards) {
   renderModalBoardTabs('tuneBoardTabs');
   renderModalBoardTabs('fanBoardTabs');
   const root = $('boardTabs');
+  if (!root) return;
   root.textContent = '';
   if (boards.length < 2) return;
   boards.forEach((b, i) => {
@@ -2349,6 +2302,7 @@ function renderFleet(d) {
 }
 
 function renderBoard(b) {
+  if (!$('hr')) { renderChipTemps(b && b.chips, true); return; }
   const online = !!b;
   $('boardhrlabel').textContent = online ? ('Hashrate — ' + (b.board_name || 'board')) : 'Hashrate';
   if (!online) { $('hr').innerHTML = '<span class="na">offline</span>'; renderChips(null, false); renderChipTemps(null, false); return; }
@@ -3061,7 +3015,7 @@ function openFromHash() {
   const h = location.hash.replace(/^#/, '');
   if (h === 'pool') { location.replace('/pool'); return; }
   const key = (h === 'fan-curve') ? 'curve' : h;
-  if (['power', 'tuning', 'fan', 'curve', 'display'].includes(key)) {
+  if (['power', 'tuning', 'fan', 'curve', 'display', 'led', 'firmware', 'info'].includes(key)) {
     openMenu(key);
     try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
   }

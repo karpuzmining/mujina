@@ -503,6 +503,7 @@
       <a href="#pd-input">USB-C PD</a>
       <a href="#hashrate-autotune">Hashrate</a>
       <a href="#fan-thermostat">Fan thermostat</a>
+      <a href="#psu-bypass">PSU bypass</a>
       <a href="#diagnostics">Diagnostics</a>
       <a href="#per-chip">Per-chip</a>
     </nav>
@@ -648,6 +649,15 @@
     </div>
     <div class="msg" id="fanThermMsg"></div>
     <p class="hint" style="margin-top:14px">A true emergency (chip temp still reaching the active mode's real safety limit despite the thermostat) always forces 100% fan, bypassing this target.</p>
+  </div>
+  <div class="sec" id="psu-bypass">PSU bypass<span class="sec-sub">lifts PD tiers, keeps the 137 W trip</span></div>
+  <div class="card">
+    <label style="display:flex;gap:10px;align-items:center">
+      <input type="checkbox" id="psuBypassToggle">
+      <span>PSU bypass</span>
+    </label>
+    <p class="hint">The stock adapter can overheat. Chip over-temperature shutdown and the 3912 mV limit stay on.</p>
+    <div class="msg" id="psuBypassMsg"></div>
   </div>
   <div class="sec" id="diagnostics">Diagnostics<span class="sec-sub">chain, chips, SmartSpeed, rail</span></div>
   <div class="card" id="diagCard">
@@ -1304,6 +1314,29 @@ setInterval(() => { if (!chipDemo()) { loadConn(); loadPsu(); loadAutotune(); } 
     const chk = $('ownContinuous');
     if (chk && !chk.disabled) { chk.checked = !chk.checked; EDITING = true; syncCont(); }
   });
+  const bypass = $('psuBypassToggle');
+  if (bypass) {
+    fetch('/api/v0/system').then(r => r.ok ? r.json() : null).then(s => {
+      if (s) bypass.checked = !!s.psu_bypass;
+    }).catch(() => {});
+    bypass.addEventListener('change', async () => {
+      const on = bypass.checked;
+      if (on && !confirm('PSU bypass lets the miner draw past the stock adapter limit. The stock adapter can overheat. The 137 W trip stays on. Enable PSU bypass?')) {
+        bypass.checked = false;
+        return;
+      }
+      const name = (SYS && SYS.boards && SYS.boards[0] && SYS.boards[0].name) || 'nano3s-0';
+      try {
+        const r = await fetch('/api/v0/boards/' + encodeURIComponent(name) + '/psu', {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ psu_bypass: on })
+        });
+        const msg = $('psuBypassMsg');
+        if (msg) msg.textContent = r.ok ? (on ? 'PSU bypass on' : 'PSU bypass off') : 'save failed';
+      } catch (e) {
+        bypass.checked = !on;
+      }
+    });
+  }
   boot();
   setInterval(poll, 5000);
 })();
