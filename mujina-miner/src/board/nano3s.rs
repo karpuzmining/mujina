@@ -33,7 +33,7 @@
 //!   this riscv64 target) `u32` words, no swap.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -1343,20 +1343,28 @@ const INA226_DEV: &str = "/dev/i2c-2";
 fn read_ina226_sdk() -> Option<(f64, f64, f64)> {
     #[cfg(target_os = "linux")]
     {
+        if power_bus_quiet() {
+            return None;
+        }
         static READY: AtomicBool = AtomicBool::new(false);
         if !READY.load(Ordering::Relaxed) {
             let cfg_ok = i2c_write_reg_be(INA226_DEV, POWER_I2C_ADDR, 0x00, INA226_CFG);
             let cal_ok = i2c_write_reg_be(INA226_DEV, POWER_I2C_ADDR, 0x05, INA226_CAL);
             if cfg_ok && cal_ok {
                 READY.store(true, Ordering::Relaxed);
-            } else if !POWER_SENSOR_LOGGED.swap(true, Ordering::Relaxed) {
-                eprintln!(
-                    "[nano3s] power sensor: could not program INA226 cfg/cal on {INA226_DEV} addr 0x40 (i2cget is not used)"
-                );
+            } else {
+                READY.store(false, Ordering::Relaxed);
+                power_bus_failed();
+                return None;
             }
         }
-        let bus = i2c_read_reg_be(INA226_DEV, POWER_I2C_ADDR, 0x02)?;
+        let Some(bus) = i2c_read_reg_be(INA226_DEV, POWER_I2C_ADDR, 0x02) else {
+            READY.store(false, Ordering::Relaxed);
+            power_bus_failed();
+            return None;
+        };
         let cur = i2c_read_reg_be(INA226_DEV, POWER_I2C_ADDR, 0x04).unwrap_or(0);
+        power_bus_recovered();
         Some(ina226_sdk_reading(bus, cur))
     }
     #[cfg(not(target_os = "linux"))]
@@ -1366,16 +1374,46 @@ fn read_ina226_sdk() -> Option<(f64, f64, f64)> {
 }
 
 static POWER_SENSOR_OK: AtomicBool = AtomicBool::new(false);
-static POWER_SENSOR_LOGGED: AtomicBool = AtomicBool::new(false);
+/// Monotonic millis after which `/dev/i2c-2` may be touched again.
+/// A missing INA226 makes the DesignWare controller time out, so a
+/// failed probe waits a minute instead of retrying every status tick.
+static POWER_BUS_NEXT_MS: AtomicU64 = AtomicU64::new(0);
+static POWER_BUS_LOG_MS: AtomicU64 = AtomicU64::new(0);
+const POWER_BUS_BACKOFF_MS: u64 = 60_000;
+
+fn power_bus_now_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+fn power_bus_quiet() -> bool {
+    power_bus_now_ms() < POWER_BUS_NEXT_MS.load(Ordering::Relaxed)
+}
+
+fn power_bus_failed() {
+    let now = power_bus_now_ms();
+    POWER_BUS_NEXT_MS.store(now.saturating_add(POWER_BUS_BACKOFF_MS), Ordering::Relaxed);
+    let last = POWER_BUS_LOG_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= POWER_BUS_BACKOFF_MS {
+        POWER_BUS_LOG_MS.store(now, Ordering::Relaxed);
+        eprintln!(
+            "[nano3s] power sensor unavailable on {INA226_DEV} (INA226 0x40 and PD 0x42). Holding voltage and frequency. The {POWER_TARGET_SAFETY_W:.0} W trip is not evaluated. Next probe in {POWER_BUS_BACKOFF_MS} ms. Overview power is the V²·f estimate."
+        );
+    }
+}
+
+fn power_bus_recovered() {
+    POWER_BUS_NEXT_MS.store(0, Ordering::Relaxed);
+    POWER_BUS_LOG_MS.store(0, Ordering::Relaxed);
+}
 
 fn note_power_sensor(ok: bool) {
     let was = POWER_SENSOR_OK.swap(ok, Ordering::Relaxed);
-    if ok {
-        POWER_SENSOR_LOGGED.store(false, Ordering::Relaxed);
-    } else if was || !POWER_SENSOR_LOGGED.swap(true, Ordering::Relaxed) {
-        eprintln!(
-            "[nano3s] power sensor unavailable on {INA226_DEV} addr 0x40. Holding the voltage. The {POWER_TARGET_SAFETY_W:.0} W trip is not evaluated against 0 W."
-        );
+    if ok && !was {
+        eprintln!("[nano3s] power sensor answered on {INA226_DEV} addr 0x40");
     }
 }
 
@@ -1489,7 +1527,16 @@ const PD_I2C_ADDR: u32 = 0x42;
 /// voltage from the INA226 is used as the sole ground truth instead
 /// (see [`pd_ceiling_w_for_voltage`]).
 fn read_pd_attached() -> Option<bool> {
-    i2c_read_byte(POWER_I2C_BUS, PD_I2C_ADDR, 0x01).map(|v| v & 0x40 != 0)
+    if power_bus_quiet() {
+        return None;
+    }
+    match i2c_read_byte(POWER_I2C_BUS, PD_I2C_ADDR, 0x01) {
+        Some(v) => Some(v & 0x40 != 0),
+        None => {
+            power_bus_failed();
+            None
+        }
+    }
 }
 
 /// Conservative USB-C PD power-contract ceiling, classified from

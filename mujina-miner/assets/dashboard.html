@@ -2283,8 +2283,8 @@ function renderFleet(d) {
   $('fboards').textContent = f.boards_online;
   const est = d.fleet.power_source === 'estimated';
   const mark = est ? '~' : '';
-  $('fpower').innerHTML = f.total_power_w == null ? '—' : mark + fx(f.total_power_w, 'W', 1);
-  $('fpower').title = est ? 'Estimated from per-chip voltage, frequency and core count. Scale it with a wall meter.' : 'Input-rail power';
+  $('fpower').innerHTML = f.total_power_w == null ? '—' : mark + fx(f.total_power_w, 'W', 1) + (est ? ' <small>estimated</small>' : '');
+  $('fpower').title = est ? 'Estimated from chip voltage and frequency (V²·f). The INA226 did not answer. Scale it with a wall meter. Voltage and frequency are held.' : 'Input-rail power';
   $('feff').innerHTML = f.efficiency_jth == null ? '—' : mark + fx(f.efficiency_jth, 'J/TH', 2);
   $('feff').title = $('fpower').title;
   const live = $('livePower');
