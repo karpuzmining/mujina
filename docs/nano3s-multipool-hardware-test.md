@@ -1,6 +1,10 @@
 # Nano 3S multi-pool hardware checklist
 
-Test build `v5.1.0-multipool-test.1`. It is v5.1.0 plus in-process multi-pool. The RT-Smart core is the v5.1.0 `rtos_core.elf`. Do not use this bundle to test the per-chip PLL changes; that is a different image.
+Test build `v5.1.0-multipool-test.1`. It is v5.1.0 plus in-process multi-pool. The RT-Smart core embedded in the miner is the v5.1.0 release `rtos_core.elf` (`2e88ff5f2b58acbe3761a1ab083ad3c46b89b296f7491f05ca1e0970717299d1`). Do not use this bundle to test the per-chip PLL changes; that is a different image.
+
+SHA-256 of `nano-mujina-v5.1.0-multipool-test.1-bundle.bin`:
+
+`0140aa5d8bceac70bf3a21e63f618c4b4a5e6f559ae4f1eb58363c372594b775`
 
 ## Install
 
