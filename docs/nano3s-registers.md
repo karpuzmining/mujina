@@ -114,7 +114,7 @@ the wrong field.
 | Bus | Node | Addr | Chip | Function |
 |-----|------|------|------|----------|
 | i2c@91407000 | `/dev/i2c-2` | 0x40 | INA226 | Power monitor on the USB-C PD input rail. Linux owns this bus. |
-| i2c@91407000 | `/dev/i2c-2` | 0x42 | PD controller | Not an HUSB238. Register 0x01 bit 6 is not an attach flag and is not read. |
+| i2c@91407000 | `/dev/i2c-2` | 0x42 | PD controller | One write, register 0x02 = 0x1B, before the hashboard rail. Register 0x01 is not read. `MUJINA_NANO3S_I2C2=off` skips the bus. |
 | i2c@91408000 | `/dev/i2c-3` | 0x48 | DC-DC | ASIC core voltage control (write-only) |
 | i2c@91408000 | `/dev/i2c-3` | 0x50 | EEPROM (AT24C) | Board serial number |
 

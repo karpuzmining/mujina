@@ -5,6 +5,18 @@
 //! calibration `0x0AEC` (a 10 mΩ shunt). The estimate is only used when that
 //! meter does not answer. See `docs/nano3s-power.md`.
 
+/// `MUJINA_NANO3S_I2C2=off` (also `0`, `disable`, `disabled`) skips every
+/// transaction on `/dev/i2c-2`. An unset or empty value leaves the bus on.
+pub(crate) fn i2c2_bus_enabled(value: Option<&str>) -> bool {
+    match value.map(str::trim).filter(|s| !s.is_empty()) {
+        None => true,
+        Some(v) => !matches!(
+            v.to_ascii_lowercase().as_str(),
+            "0" | "off" | "disable" | "disabled"
+        ),
+    }
+}
+
 /// Bus volts, amps, watts from the two INA226 words Canaan reads.
 pub(crate) fn ina226_sdk_reading(bus_raw: u16, cur_raw: u16) -> (f64, f64, f64) {
     const CUR_LSB_MA: f64 = 0.1831;
@@ -80,6 +92,16 @@ pub(crate) fn estimate_input_watts(dies_mv: &[f64], freq_mhz: &[f64], rail_mv: f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn i2c2_off_skips_the_bus() {
+        assert!(i2c2_bus_enabled(None));
+        assert!(i2c2_bus_enabled(Some("")));
+        assert!(i2c2_bus_enabled(Some("on")));
+        assert!(!i2c2_bus_enabled(Some("off")));
+        assert!(!i2c2_bus_enabled(Some("0")));
+        assert!(!i2c2_bus_enabled(Some(" Disable ")));
+    }
 
     #[test]
     fn ina226_scale_matches_canaan() {

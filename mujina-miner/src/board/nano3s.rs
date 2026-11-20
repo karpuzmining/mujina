@@ -45,7 +45,8 @@ use tokio::sync::{mpsc, watch};
 
 use super::a3197s::ChipClockPolicy;
 use super::nano3s_power::{
-    estimate_input_watts, i2c2_pad_gpio, i2c2_sda_stuck_low, ina226_sdk_reading, I2C2_PAD_ALT3,
+    estimate_input_watts, i2c2_bus_enabled, i2c2_pad_gpio, i2c2_sda_stuck_low, ina226_sdk_reading,
+    I2C2_PAD_ALT3,
 };
 use super::nano3s_auto_tune::ChipTuneStatus;
 use super::nano3s_auto_tune::{self as auto_tune, AutoTune, AutoTuneCmd, TuneChoice};
@@ -314,7 +315,7 @@ const NANO3S_MAX_SANE_DIFFICULTY: u64 = 100_000_000_000;
 /// Power-target voltage loop: given a target power in watts
 /// (`MUJINA_NANO3S_POWER_TARGET_W`, unset = feature off), steps core
 /// voltage up when measured power is below target and down when above,
-/// based on `ina_power_w` feedback (see `read_power_estimate()`), via the
+/// based on the INA226 input reading, via the
 /// same live-tuning IPC path the dashboard/API use.
 ///
 /// Step size matches the DC/DC controller's voltage quantization
@@ -1242,59 +1243,16 @@ fn send_task_to_chain(
     }))
 }
 
-/// INA226 power monitor. Bus voltage: 1.25 mV/LSB (reg 0x02). Shunt
-/// voltage: 2.5 uV/LSB, signed (reg 0x01). `i2cget`'s word mode returns
-/// SMBus LSB-first byte order, swapped back before applying the scale.
-/// Power = bus_v * (shunt_v / assumed_shunt_ohms), assuming a 10mOhm
-/// shunt. Returns 0.0 on any read failure ("unavailable", not "0W
-/// measured").
-const POWER_I2C_BUS: u32 = 2;
+/// INA226 on `/dev/i2c-2` address `0x40`. Canaan's Linux `psu_dcdc_pd.c`
+/// writes config `0x4727` and calibration `0x0AEC` once, then reads bus
+/// `0x02` and current `0x04` as two bytes each. It does not use `i2cget`.
 const POWER_I2C_ADDR: u32 = 0x40;
-
-fn i2c_read_word(bus: u32, addr: u32, reg: u32) -> Option<u32> {
-    let output = std::process::Command::new("i2cget")
-        .args([
-            "-y",
-            &bus.to_string(),
-            &format!("0x{addr:02x}"),
-            &format!("0x{reg:02x}"),
-            "w",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let text = text.trim();
-    let val = if let Some(hex) = text.strip_prefix("0x") {
-        u32::from_str_radix(hex, 16).ok()?
-    } else {
-        text.parse().ok()?
-    };
-    if val > 0xFFFF { None } else { Some(val) }
-}
-
-/// Reads the INA226 and returns `(bus_v, current_a, power_w)`. This is
-/// the USB-C PD input rail, not the ASIC core rail.
-fn read_power_estimate() -> (f64, f64, f64) {
-    let (Some(raw_bus), Some(raw_shunt)) = (
-        i2c_read_word(POWER_I2C_BUS, POWER_I2C_ADDR, 0x02),
-        i2c_read_word(POWER_I2C_BUS, POWER_I2C_ADDR, 0x01),
-    ) else {
-        return (0.0, 0.0, 0.0);
-    };
-
-    let bv_swapped = ((raw_bus & 0xff) << 8) | ((raw_bus >> 8) & 0xff);
-    let sv_swapped = ((raw_shunt & 0xff) << 8) | ((raw_shunt >> 8) & 0xff);
-    let shunt_signed = sv_swapped as u16 as i16;
-
-    let bus_v = bv_swapped as f64 * 1.25 / 1000.0;
-    let shunt_v = shunt_signed as f64 * 0.0025 / 1000.0;
-    let current_a = shunt_v / 0.010; // assumed 10mOhm shunt, unconfirmed
-
-    (bus_v, current_a, bus_v * current_a)
-}
+/// PD controller. The only transaction is one byte, register `0x02` =
+/// `0x1B`, which is Canaan's `PD_CFG_VAL` ("set i2c mode") in
+/// `pd_pout_limit`, done before GPIO34 enables the hashboard rail.
+const PD_I2C_ADDR: u32 = 0x42;
+const PD_CFG_REG: u8 = 0x02;
+const PD_CFG_I2C_MODE: u8 = 0x1B;
 
 const POWER_CAL_PATH: &str = "/data/userconfig/power_cal.conf";
 
@@ -1358,13 +1316,30 @@ const INA226_CFG: u16 = 0x4727;
 const INA226_CAL: u16 = 0x0AEC;
 const INA226_DEV: &str = "/dev/i2c-2";
 
+fn i2c2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = i2c2_bus_enabled(std::env::var("MUJINA_NANO3S_I2C2").ok().as_deref());
+        if !on {
+            eprintln!(
+                "[nano3s] MUJINA_NANO3S_I2C2 disables /dev/i2c-2. No INA226, no PD write, no bus recovery."
+            );
+        }
+        on
+    })
+}
+
 fn read_ina226_sdk() -> Option<(f64, f64, f64)> {
     #[cfg(target_os = "linux")]
     {
+        if !i2c2_enabled() {
+            return None;
+        }
         let _bus = POWER_BUS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if power_bus_quiet() {
             return None;
         }
+        pd_enter_i2c_mode();
         if let Some(reading) = ina226_sample() {
             power_bus_recovered();
             return Some(reading);
@@ -1388,6 +1363,24 @@ fn read_ina226_sdk() -> Option<(f64, f64, f64)> {
     {
         None
     }
+}
+
+/// One byte to the PD controller: register 0x02 = 0x1B. Canaan's
+/// `pd_pout_limit` does this before GPIO34 goes high and keeps going if
+/// the chip does not ack. test.2 instead ran `i2cget -y 2 0x42 0x01` on
+/// every `/psu` poll, a register the SDK never reads.
+#[cfg(target_os = "linux")]
+fn pd_enter_i2c_mode() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let mut buf = [PD_CFG_REG, PD_CFG_I2C_MODE];
+    let ok = i2c_xfer(INA226_DEV, PD_I2C_ADDR, &mut buf, None);
+    eprintln!(
+        "[nano3s] PD 0x42 reg 0x02 = 0x1B (i2c mode): {}",
+        if ok { "acked" } else { "no ack" }
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -3962,6 +3955,14 @@ fn run_worker(
         // Fall through: still process commands so the scheduler doesn't
         // hang waiting on responses, but nothing will ever hash.
     } else {
+        // Put the PD controller in I2C mode before the hashboard rail
+        // (GPIO34) comes up. Canaan writes this in pd_pout_limit, while
+        // the rail is still off.
+        if i2c2_enabled() {
+            let _bus = POWER_BUS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            #[cfg(target_os = "linux")]
+            pd_enter_i2c_mode();
+        }
         // Ramp the chain up from its ~100MHz cold bring-up default via
         // IPC_MSG_SET_MODE -- to the persisted frequency if one was saved,
         // otherwise the hardcoded LOW-mode-ish default. Fire-and-forget --
@@ -5366,10 +5367,16 @@ fn run_worker(
                             }
                             AutoTuneCmd::FanManual(d) => {
                                 eprintln!(
-                                    "[nano3s] auto-tune: fan:manual,{d} (temp_max {:.1}C)",
+                                    "[nano3s] fan manual {d}% (temp_max {:.1}C)",
                                     st.temp_max
                                 );
                                 write_harness_control(&format!("fan:manual,{d}"));
+                            }
+                            AutoTuneCmd::FanTarget(c) => {
+                                eprintln!(
+                                    "[nano3s] auto-tune: fan_chip_temp_target {c:.1}C (curve and escalation stay on)"
+                                );
+                                write_harness_control(&format!("fan_chip_temp_target:{c}"));
                             }
                             AutoTuneCmd::ReinitChain => {
                                 eprintln!(

@@ -878,8 +878,11 @@ pub(crate) enum AutoTuneCmd {
     SetVoltage(i32),
     /// Text for `/tmp/harness_control`.
     Fan(&'static str),
-    /// `fan:manual,<duty>` from the chip-temp fan loop.
+    /// User manual duty (`PATCH /fan` mode=manual). Auto-tune does not emit this.
     FanManual(u8),
+    /// Chip-temperature setpoint for the harness auto fan. Leaves the curve
+    /// and the over-temp escalation running.
+    FanTarget(f32),
     /// Power-cycle and re-enumerate the hash chain after a persistent stall.
     ReinitChain,
     /// Escalate to a rate-limited hardware reboot after unrecoverable stall.
@@ -1004,6 +1007,9 @@ pub(crate) struct AutoTune {
     fan_target_override: Option<f32>,
     fan_force_pending: bool,
     fan_restore_pending: bool,
+    /// Last chip-temp target published to the harness. `None` until the
+    /// next tick should send `fan_chip_temp_target`.
+    fan_target_sent: Option<f32>,
     manual_fan_duty: Option<u8>,
     chip_status: Option<ChipTuneStatus>,
 }
@@ -1031,6 +1037,7 @@ impl AutoTune {
             fan_target_override: None,
             fan_force_pending: false,
             fan_restore_pending: false,
+            fan_target_sent: None,
             manual_fan_duty: None,
             chip_status: None,
         }
@@ -1105,11 +1112,15 @@ impl AutoTune {
 
     /// `None` restores the default (profile temp cap - 5 C).
     pub(crate) fn set_fan_target(&mut self, c: Option<f32>) {
+        let before = self.fan_target_c();
         let valid = c.filter(|c| FAN_TARGET_RANGE_C.contains(c));
         if valid.is_some() && self.manual_fan_duty.take().is_some() {
             self.fan.sent = None;
         }
         self.fan_target_override = valid;
+        if (before - self.fan_target_c()).abs() > 0.05 {
+            self.fan_target_sent = None;
+        }
     }
 
     /// Effective fan target: the override (never within 2 C of the cap) or
@@ -1161,7 +1172,15 @@ impl AutoTune {
             return None;
         }
         let target = self.fan_target_c();
-        fan_step(&mut self.fan, temp_max_c, cap, target, force).map(AutoTuneCmd::FanManual)
+        // The duty stays inside the tuner (curve floor, no step-down at the
+        // target). Publishing it as `fan:manual` puts the harness in manual
+        // and suspends both its curve and its over-temp escalation.
+        let _ = fan_step(&mut self.fan, temp_max_c, cap, target, force);
+        if self.fan_target_sent.is_none_or(|sent| (sent - target).abs() > 0.05) {
+            self.fan_target_sent = Some(target);
+            return Some(AutoTuneCmd::FanTarget(target));
+        }
+        None
     }
 
     /// The running choice's search memory (see [`SearchMemory`]).
@@ -1244,6 +1263,7 @@ impl AutoTune {
             Some(d) => FanState { duty: d as f32, sent: Some(d), ..FanState::default() },
             None => FanState::default(),
         };
+        self.fan_target_sent = None;
         self.fan_force_pending = false;
         self.fan_restore_pending = false;
     }
@@ -1252,7 +1272,7 @@ impl AutoTune {
     /// back to auto if this tuner ever took it over.
     pub(crate) fn disable(&mut self) -> Option<AutoTuneCmd> {
         let restore = (self.manual_fan_duty.is_none()
-            && (self.fan.sent.is_some() || self.tuner.fan_forced()))
+            && (self.fan_target_sent.is_some() || self.fan.sent.is_some() || self.tuner.fan_forced()))
             .then_some(AutoTuneCmd::Fan("fan:auto,"));
         self.fan = match self.manual_fan_duty {
             Some(d) => FanState { duty: d as f32, sent: Some(d), ..FanState::default() },
@@ -1742,7 +1762,7 @@ mod tests {
             assert_eq!(o.fan_target_c(), expect);
             assert_eq!(expect, want, "{p:?}");
         }
-        assert_eq!(o.fan_tick(Some(75.0)), Some(AutoTuneCmd::FanManual(100)));
+        assert_eq!(o.fan_tick(Some(75.0)), Some(AutoTuneCmd::FanTarget(68.0)));
         assert_eq!(o.fan_tick(Some(75.0)), None);
         assert_eq!(o.disable(), Some(AutoTuneCmd::Fan("fan:auto,")));
         assert_eq!(o.fan_tick(Some(90.0)), None);
@@ -1780,6 +1800,19 @@ mod tests {
     }
 
     #[test]
+    fn auto_tune_does_not_put_the_fan_in_manual() {
+        let mut o = AutoTune::new();
+        o.enable(TuneProfile::MaxHash);
+        o.seed_fan_duty(Some(20));
+        match o.fan_tick(Some(71.0)) {
+            Some(AutoTuneCmd::FanTarget(c)) => assert!((c - 80.0).abs() < 0.1),
+            other => panic!("expected a chip-temp target, got {other:?}"),
+        }
+        assert!(o.manual_fan().is_none());
+        assert_eq!(o.fan_tick(Some(82.0)), None);
+    }
+
+    #[test]
     fn tuner_temp_breach_routes_through_the_fan_loop() {
         let mut o = AutoTune::new();
         o.enable(TuneProfile::Efficient); // temp cap 80, full latch >= 83
@@ -1789,13 +1822,13 @@ mod tests {
         // Mild over-cap (81 C < 83 C): core asks for SetFanMinPercent(45),
         // fan_tick ramps smoothly (< 100) instead of slamming 100 %.
         assert!(o.evaluate(&fan_metrics(81.0)).is_empty());
-        assert!(matches!(
-            o.fan_tick(Some(81.0)),
-            Some(AutoTuneCmd::FanManual(d)) if d >= 45 && d < 100
-        ));
-        // Severe over-cap (83.5 C >= 83 C): forces 100 % and holds until < 75 C.
+        assert!(!matches!(o.fan_tick(Some(81.0)), Some(AutoTuneCmd::FanManual(_))));
+        assert!(o.fan.duty_percent() >= 45 && o.fan.duty_percent() < 100);
+        // Severe over-cap (83.5 C >= 83 C): the internal duty goes to 100.
+        // The harness stays in auto, so its own escalation is what runs.
         assert!(o.evaluate(&fan_metrics(83.5)).is_empty());
-        assert_eq!(o.fan_tick(Some(83.5)), Some(AutoTuneCmd::FanManual(100)));
+        assert!(!matches!(o.fan_tick(Some(83.5)), Some(AutoTuneCmd::FanManual(_))));
+        assert_eq!(o.fan.duty_percent(), 100);
         // 76 C: under the cap but inside the release band -> stays 100.
         assert_eq!(o.fan_tick(Some(76.0)), None);
         assert_eq!(o.fan.duty_percent(), 100);
@@ -1835,7 +1868,7 @@ mod tests {
 
         let mut o = AutoTune::new();
         o.enable(TuneProfile::Balanced);
-        assert!(matches!(o.fan_tick(Some(75.0)), Some(AutoTuneCmd::FanManual(d)) if d < 100));
+        assert!(matches!(o.fan_tick(Some(75.0)), Some(AutoTuneCmd::FanTarget(_))));
 
         // Manual override pauses the auto-tune fan loop across cool ticks
         // and returns FanManual(100) to re-assert the harness file.
@@ -1852,7 +1885,7 @@ mod tests {
         assert_eq!(o.fan_tick(Some(60.0)), None);
         assert_eq!(o.set_manual_fan(None), None);
         assert_eq!(o.manual_fan(), None);
-        assert!(matches!(o.fan_tick(Some(60.0)), Some(AutoTuneCmd::FanManual(_))));
+        assert!(matches!(o.fan_tick(Some(60.0)), Some(AutoTuneCmd::FanTarget(_))));
         assert_eq!(o.disable(), Some(AutoTuneCmd::Fan("fan:auto,")));
 
         // Setting a chip-temp fan target also clears manual mode.
@@ -1860,19 +1893,15 @@ mod tests {
         assert_eq!(o.set_manual_fan(Some(80)), Some(AutoTuneCmd::FanManual(80)));
         o.set_fan_target(Some(75.0));
         assert_eq!(o.manual_fan(), None);
-        assert!(matches!(o.fan_tick(Some(60.0)), Some(AutoTuneCmd::FanManual(_))));
+        assert!(matches!(o.fan_tick(Some(60.0)), Some(AutoTuneCmd::FanTarget(c)) if (c - 75.0).abs() < 0.1));
     }
 
     #[test]
     fn manual_fan_override_resends_duty_after_race_with_fan_tick() {
         let mut o = AutoTune::new();
         o.enable(TuneProfile::Balanced);
-        // Simulate fan_tick overwriting /tmp/harness_control in the same worker
-        // iteration after write_fan_control_command wrote fan:manual,100.
-        assert!(matches!(
-            o.fan_tick(Some(75.0)),
-            Some(AutoTuneCmd::FanManual(d)) if d < 100
-        ));
+        // The automatic tick publishes a temperature target, not a manual duty.
+        assert!(matches!(o.fan_tick(Some(75.0)), Some(AutoTuneCmd::FanTarget(_))));
         // When run_worker syncs MANUAL_FAN_DUTY on the next check, set_manual_fan
         // must emit FanManual(100) so /tmp/harness_control is re-asserted rather
         // than leaving the harness stuck at the stale auto-tuner duty.

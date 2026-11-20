@@ -14,10 +14,12 @@ A negative current word (sign bit set) is treated as no current. Input
 power is bus voltage times that current. Supply is treated as absent
 below 8 V (`POWER_VALID_VOLT_MIN`).
 
-The PD controller is a separate chip at `0x42` on the same bus. Source
-capabilities are registers `0x6A`–`0x6F` (5, 9, 12, 15, 20 and 28 V).
-The low 7 bits are the advertised current in 100 mA steps. 28 V is the
-EPR PDO (`select 0xC0`).
+The PD controller is a separate chip at `0x42` on the same bus. Canaan's
+`pd_pout_limit` writes register `0x02` = `0x1B` once, before GPIO34
+enables the hashboard rail, and then reads source capabilities at
+`0x6A`–`0x6F`. This miner does only that one write. It does not read
+`0x01` and it does not shell out to `i2cget`. `MUJINA_NANO3S_I2C2=off`
+skips the write, the INA226, and bus recovery.
 
 The core rail is not a second current sensor. The DC-DC setpoint is
 register `0xF8` on address `0x48` of `/dev/i2c-3`, 26 mV steps around
