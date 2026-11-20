@@ -19,15 +19,17 @@ use tokio::sync::oneshot;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::commands::SchedulerCommand;
-use crate::board::nano3s_auto_tune::{AutoTuneRequest, AutoTuneStatus, MAX_DOMAIN_MHZ, NANO3S_ENVELOPE};
 use super::server::SharedState;
 use crate::api_client::types::{
-    AutotuneHashrateRequest, AutotuneHashrateResponse, BoardFanRequest, BoardLedRequest,
-    DisplayPatchRequest, DisplayState,
-    BoardChipClocksRequest, BoardLedState, BoardPauseRequest, BoardPowerTargetRequest, BoardTelemetry,
-    BoardTempTargetRequest, BoardTuningRequest, FanCurvePoint, FanCurveRequest, FanCurveResponse,
-    FirmwareBundleResponse, FirmwareUploadResponse, MinerPatchRequest, MinerTelemetry,
-    PoolConfigRequest, PoolConfigResponse, PsuOverrideRequest, PsuStatusResponse, SourceTelemetry,
+    AutotuneHashrateRequest, AutotuneHashrateResponse, BoardChipClocksRequest, BoardFanRequest,
+    BoardLedRequest, BoardLedState, BoardPauseRequest, BoardPowerTargetRequest, BoardTelemetry,
+    BoardTempTargetRequest, BoardTuningRequest, DisplayPatchRequest, DisplayState, FanCurvePoint,
+    FanCurveRequest, FanCurveResponse, FirmwareBundleResponse, FirmwareUploadResponse,
+    MinerPatchRequest, MinerTelemetry, PoolConfigRequest, PoolConfigResponse, PsuOverrideRequest,
+    PsuStatusResponse, SourceTelemetry,
+};
+use crate::board::nano3s_auto_tune::{
+    AutoTuneRequest, AutoTuneStatus, MAX_DOMAIN_MHZ, NANO3S_ENVELOPE,
 };
 
 /// Upper bound on a firmware upload body -- generous headroom over the
@@ -54,7 +56,10 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(patch_board_power_target))
         .routes(routes!(patch_board_temp_target))
         .routes(routes!(get_board_psu, patch_board_psu))
-        .routes(routes!(get_board_autotune_hashrate, patch_board_autotune_hashrate))
+        .routes(routes!(
+            get_board_autotune_hashrate,
+            patch_board_autotune_hashrate
+        ))
         .routes(routes!(get_board_auto_tune, patch_board_auto_tune))
         .routes(routes!(get_board_tuner, patch_board_tuner))
         .routes(routes!(get_system))
@@ -280,11 +285,13 @@ async fn patch_board_tuning(
     }
 }
 
-/// Set per-chip clock offsets (MHz), layered on the board's base clock.
+/// Set per-chip clocks, as offsets or as absolute PLL0 MHz.
 ///
-/// `offset_mhz` must hold one in-range value per chip. Applied live with a
-/// 10 MHz/s ramp and persisted across reboots. Needs an rtos_core build
-/// with per-chip clock support.
+/// Exactly one of `offset_mhz` / `freq_mhz` may be set; `policy` may be
+/// set alone or with either. Values outside the shared ChipTuner window,
+/// or that would push a domain outside 100..=580 MHz, are rejected. A
+/// write is refused with 409 while ChipTuner is judging a trial. 3600 mV
+/// is not a chip setting. Needs an rtos_core build with per-chip clocks.
 #[utoipa::path(
     patch,
     path = "/boards/{name}/chip-clocks",
@@ -294,8 +301,9 @@ async fn patch_board_tuning(
     ),
     request_body = BoardChipClocksRequest,
     responses(
-        (status = OK, description = "Offsets queued"),
-        (status = BAD_REQUEST, description = "Wrong count, or an offset outside the allowed range"),
+        (status = OK, description = "Chip clocks or policy queued"),
+        (status = BAD_REQUEST, description = "Wrong count, both clock fields, or a value outside the allowed range"),
+        (status = CONFLICT, description = "ChipTuner is judging a trial"),
         (status = NOT_FOUND, description = "Board not found"),
         (status = NOT_IMPLEMENTED, description = "This build's board driver doesn't support per-chip clocks"),
     ),
@@ -318,12 +326,39 @@ async fn patch_board_chip_clocks(
 
     #[cfg(feature = "nano3s")]
     {
-        use crate::board::nano3s::{CHIP_COUNT, CHIP_OFFSET_RANGE_MHZ};
-        let offsets: [i16; CHIP_COUNT] =
-            req.offset_mhz.try_into().map_err(|_| StatusCode::BAD_REQUEST)?;
-        if !offsets.iter().all(|o| CHIP_OFFSET_RANGE_MHZ.contains(o)) {
+        use crate::board::a3197s::{ChipClockPolicy, ChipClocks, resolve_chip_clocks};
+        use crate::board::nano3s::CHIP_COUNT;
+        use crate::board::nano3s_auto_tune::read_status;
+
+        if req.offset_mhz.is_some() && req.freq_mhz.is_some() {
             return Err(StatusCode::BAD_REQUEST);
         }
+        if let Some(policy) = req.policy.as_deref() {
+            let policy = ChipClockPolicy::parse(policy).ok_or(StatusCode::BAD_REQUEST)?;
+            crate::board::nano3s::write_chip_clock_policy(policy)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        }
+        let clocks = if let Some(offsets) = req.offset_mhz {
+            let offsets: [i16; CHIP_COUNT] =
+                offsets.try_into().map_err(|_| StatusCode::BAD_REQUEST)?;
+            ChipClocks::Offsets(offsets)
+        } else if let Some(freq) = req.freq_mhz {
+            let freq: [u32; CHIP_COUNT] = freq.try_into().map_err(|_| StatusCode::BAD_REQUEST)?;
+            ChipClocks::Absolute(freq)
+        } else if req.policy.is_some() {
+            return Ok(StatusCode::OK);
+        } else {
+            return Err(StatusCode::BAD_REQUEST);
+        };
+        if read_status()
+            .per_chip
+            .as_ref()
+            .is_some_and(|s| s.phase == "trial")
+        {
+            return Err(StatusCode::CONFLICT);
+        }
+        let offsets = resolve_chip_clocks(crate::board::nano3s::commanded_pll_freq(), clocks)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
         crate::board::nano3s::write_chip_offset_command(offsets)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         Ok(StatusCode::OK)
@@ -807,10 +842,14 @@ async fn get_system(State(state): State<SharedState>) -> Json<serde_json::Value>
         .collect();
     #[cfg(feature = "nano3s")]
     let info = {
-        let (_bus_v, _attached, detected_w, override_w, effective_w) = crate::board::nano3s::read_psu_status();
+        let (_bus_v, _attached, detected_w, override_w, effective_w) =
+            crate::board::nano3s::read_psu_status();
         let contract_w = override_w.or(detected_w);
         let ceiling = Some(effective_w);
-        let chips = crate::board::nano3s::get_detail_snapshot().map(|d| d.chips.len() as u32).filter(|n| *n > 0).unwrap_or(super::system::NANO3S_CHIPS);
+        let chips = crate::board::nano3s::get_detail_snapshot()
+            .map(|d| d.chips.len() as u32)
+            .filter(|n| *n > 0)
+            .unwrap_or(super::system::NANO3S_CHIPS);
         SystemInfo {
             mode: "embedded",
             platform: "nano3s-k230".into(),
@@ -851,7 +890,12 @@ async fn get_system(State(state): State<SharedState>) -> Json<serde_json::Value>
         psu_contract_w: None,
         boards: names
             .into_iter()
-            .map(|(name, model)| SystemBoard { name, model: Some(model), chips: 0, caps: BoardCaps::generic() })
+            .map(|(name, model)| SystemBoard {
+                name,
+                model: Some(model),
+                chips: 0,
+                caps: BoardCaps::generic(),
+            })
             .collect(),
     };
     Json(build_system(&info))
@@ -1240,7 +1284,11 @@ fn staged_firmware_path(live_path: &FsPath) -> PathBuf {
 /// shelling out to system tools (i2cset, reboot, etc.) for one-off system
 /// queries rather than linking libc/statvfs directly.
 fn free_space_bytes(mount_point: &FsPath) -> Option<u64> {
-    let out = std::process::Command::new("df").arg("-k").arg(mount_point).output().ok()?;
+    let out = std::process::Command::new("df")
+        .arg("-k")
+        .arg(mount_point)
+        .output()
+        .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let fields: Vec<&str> = text.lines().nth(1)?.split_whitespace().collect();
     // `df -k` columns: Filesystem, 1K-blocks, Used, Available, Use%, Mounted.
@@ -1416,7 +1464,8 @@ impl<'a> SectionValidator<'a> {
 
             if !self.found_ipc {
                 if data.len() >= Self::TAIL_CAP {
-                    self.tail.copy_from_slice(&data[data.len() - Self::TAIL_CAP..]);
+                    self.tail
+                        .copy_from_slice(&data[data.len() - Self::TAIL_CAP..]);
                     self.tail_len = Self::TAIL_CAP;
                 } else {
                     let combined = self.tail_len + data.len();
@@ -1474,7 +1523,10 @@ fn check_free_space(
         Some(_) => Ok(()),
         None => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("{target}: couldn't determine free space on {}", mount_point.display()),
+            format!(
+                "{target}: couldn't determine free space on {}",
+                mount_point.display()
+            ),
         )),
     }
 }
@@ -1504,12 +1556,14 @@ fn finalize_staged_file(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(staged_path, std::fs::Permissions::from_mode(0o755)).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("{target}: failed to chmod {}: {e}", staged_path.display()),
-            )
-        })?;
+        std::fs::set_permissions(staged_path, std::fs::Permissions::from_mode(0o755)).map_err(
+            |e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("{target}: failed to chmod {}: {e}", staged_path.display()),
+                )
+            },
+        )?;
     }
     Ok(())
 }
@@ -1660,7 +1714,12 @@ where
         }
         check_free_space(&target, &mount_point, len, free_space)?;
     } else {
-        check_free_space(&target, &mount_point, FIRMWARE_MIN_UPLOAD_BYTES as u64, free_space)?;
+        check_free_space(
+            &target,
+            &mount_point,
+            FIRMWARE_MIN_UPLOAD_BYTES as u64,
+            free_space,
+        )?;
     }
 
     let mut guard = StagedCleanupGuard::new();
@@ -1741,7 +1800,9 @@ fn trigger_system_reboot() {
         let _ = std::process::Command::new("/bin/sync").status();
         let _ = std::process::Command::new("sync").status();
         // Execute immediate hardware reboot
-        let res = std::process::Command::new("/sbin/reboot").arg("-f").status();
+        let res = std::process::Command::new("/sbin/reboot")
+            .arg("-f")
+            .status();
         if res.is_err() {
             let _ = std::process::Command::new("reboot").arg("-f").status();
         }
@@ -1782,7 +1843,9 @@ const BUNDLE_MAGIC: &[u8; 8] = b"MJBUNDL1";
         (status = INTERNAL_SERVER_ERROR, description = "Write, chmod, or rename failed"),
     ),
 )]
-async fn post_firmware_bundle(body: Body) -> Result<Json<FirmwareBundleResponse>, (StatusCode, String)> {
+async fn post_firmware_bundle(
+    body: Body,
+) -> Result<Json<FirmwareBundleResponse>, (StatusCode, String)> {
     handle_firmware_bundle_with(
         body,
         &FIRMWARE_UPLOAD_LOCK,
@@ -1913,7 +1976,10 @@ where
 
     Ok(Json(FirmwareBundleResponse {
         ok: true,
-        applied: staged.iter().map(|(target, _, _)| (*target).to_string()).collect(),
+        applied: staged
+            .iter()
+            .map(|(target, _, _)| (*target).to_string())
+            .collect(),
         detail: "swapped in, rebooting now".to_string(),
     }))
 }
@@ -1961,7 +2027,9 @@ async fn get_pool() -> Json<PoolConfigResponse> {
         (status = INTERNAL_SERVER_ERROR, description = "Failed to write the config file"),
     ),
 )]
-async fn patch_pool(Json(req): Json<PoolConfigRequest>) -> Result<Json<PoolConfigResponse>, StatusCode> {
+async fn patch_pool(
+    Json(req): Json<PoolConfigRequest>,
+) -> Result<Json<PoolConfigResponse>, StatusCode> {
     if req.url.is_none() && req.user.is_none() && req.password.is_none() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -1971,8 +2039,12 @@ async fn patch_pool(Json(req): Json<PoolConfigRequest>) -> Result<Json<PoolConfi
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let cfg = crate::pool_config::save_merged(req.url.as_deref(), req.user.as_deref(), req.password.as_deref())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let cfg = crate::pool_config::save_merged(
+        req.url.as_deref(),
+        req.user.as_deref(),
+        req.password.as_deref(),
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(PoolConfigResponse {
         url: cfg.url,
         user: cfg.user,
@@ -2326,7 +2398,10 @@ mod tests {
         // Place "nano3s_ipc_" near the middle and split right inside it,
         // plus test 1-byte / 3-byte splits around the symbol.
         let sym_offset = 1000;
-        let minerd = make_elf(FIRMWARE_MIN_UPLOAD_BYTES, Some((b"nano3s_ipc_init", sym_offset)));
+        let minerd = make_elf(
+            FIRMWARE_MIN_UPLOAD_BYTES,
+            Some((b"nano3s_ipc_init", sym_offset)),
+        );
         let bundle = make_bundle(Some(&minerd), None);
         // Bundle header is 8 (magic) + 4 (len) = 12 bytes before section 1.
         let abs_sym = 12 + sym_offset;
@@ -2466,7 +2541,10 @@ mod tests {
             .await
             .unwrap_err();
             assert_eq!(status2, StatusCode::CONFLICT);
-            assert!(msg2.contains("already in progress"), "unexpected msg: {msg2}");
+            assert!(
+                msg2.contains("already in progress"),
+                "unexpected msg: {msg2}"
+            );
         }
 
         // Once the first upload finishes and drops the guard, the next upload succeeds.
@@ -2482,10 +2560,7 @@ mod tests {
         assert!(res.0.ok);
     }
 
-    fn tuning_req(
-        pll_freq_mhz: Option<[u32; 4]>,
-        voltage_mv: Option<u32>,
-    ) -> BoardTuningRequest {
+    fn tuning_req(pll_freq_mhz: Option<[u32; 4]>, voltage_mv: Option<u32>) -> BoardTuningRequest {
         BoardTuningRequest {
             pll_freq_mhz,
             voltage_mv,
@@ -2506,13 +2581,13 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            validate_board_tuning(&tuning_req(None, Some(NANO3S_ENVELOPE.max_voltage_mv as u32))),
+            validate_board_tuning(&tuning_req(
+                None,
+                Some(NANO3S_ENVELOPE.max_voltage_mv as u32)
+            )),
             Ok(())
         );
-        assert_eq!(
-            validate_board_tuning(&tuning_req(None, Some(3605))),
-            Ok(())
-        );
+        assert_eq!(validate_board_tuning(&tuning_req(None, Some(3605))), Ok(()));
     }
 
     #[test]
@@ -2541,7 +2616,10 @@ mod tests {
             Err(StatusCode::BAD_REQUEST)
         );
         assert_eq!(
-            validate_board_tuning(&tuning_req(None, Some(NANO3S_ENVELOPE.max_voltage_mv as u32 + 1))),
+            validate_board_tuning(&tuning_req(
+                None,
+                Some(NANO3S_ENVELOPE.max_voltage_mv as u32 + 1)
+            )),
             Err(StatusCode::BAD_REQUEST)
         );
         // Forbidden voltage grid point (3600 mV).

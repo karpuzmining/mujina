@@ -18,7 +18,6 @@
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
-#include <math.h>
 #include "util.h"
 #include "asic_engine.h"
 
@@ -57,23 +56,15 @@ static void a3197s_pvt_select_mode(uint8_t miner_id, uint8_t mode, uint16_t asic
         write_tvsenw(miner_id, asic_id, 6);   /* bit2+bit1 (start+go) */
 }
 
-/* Raw TVSENR code -> degrees C, quartic polynomial. Coefficients are
- * hardware-calibration behavior determined experimentally against this
- * chip family -- no vendor datasheet or derivation is known/cited for
- * them. Do not change these values; if they're ever revisited, that
- * has to be re-validated against real chip readings, not derived from
- * first principles. */
+/* Raw TVSENR code -> degrees C. Canaan decode_pvt_temp()
+ * (a3197s_pvt.c, MIT, canaan_sdk_for_linux 07fe73f). Out of −50..200 °C
+ * is ASIC_TEMP_NONE; this tree reports that as −273 so existing callers
+ * keep their PVT_TEMP_INVALID check. */
 static double temp_decode(uint16_t raw)
 {
-        double temp;
-        double term1, term2, term3, term4;
-
-        term1 = pow(raw, 4) * pow(10, -10) *  2.28746;
-        term2 = pow(raw, 3) * pow(10,  -6) * -2.84236;
-        term3 = pow(raw, 2) * pow(10,  -2) *  1.31753;
-        term4 = -26.70380 * raw + 19725.61;
-
-        temp = term1 + term2 + term3 + term4;
+        double c = (double)raw;
+        double temp = (((2.28746e-10 * c + -2.84236e-06) * c + 1.31753e-02) * c + -26.70380) * c
+                + 19725.61;
 
         if ((temp < -50) || (temp > 200))
                 temp = -273;
@@ -81,16 +72,17 @@ static double temp_decode(uint16_t raw)
         return temp;
 }
 
-/* Raw TVSENR code -> mV, linear. Same provenance note as temp_decode():
- * experimentally-derived hardware calibration constants, no known
- * datasheet citation, do not change without re-validating against real
- * chip readings. */
+/* Raw TVSENR code -> mV. Canaan decode_pvt_volt(): 0 below 14 mV.
+ * The double is kept (the official helper rounds to uint16) so telemetry
+ * is not quantized by an extra 0.5 mV. */
 static double volt_decode(uint16_t raw)
 {
-        if (raw < 14)
+        double mv = ((double)raw * 1000.0 + 19144.2) / 3434.4847;
+
+        if (mv < 14.0)
                 return 0;
 
-        return (raw * 1000 + 19144.2) / 3434.4847;
+        return mv;
 }
 
 void a3197s_pvt_init(uint8_t miner_id, uint16_t asic_id)

@@ -14,6 +14,8 @@
 //! only [`ChipTuner::committed_offsets`] (never an unjudged trial), and calls
 //! [`ChipTuner::interrupt`] whenever the base point changes or ticking stops.
 
+use super::a3197s::{BACKSTOP_TEMP_C, CHIP_OFFSET_MAX_MHZ, CHIP_OFFSET_MIN_MHZ};
+
 pub const CHIPS: usize = 12;
 
 /// What a step is judged on at board level.
@@ -30,6 +32,9 @@ pub enum ChipGoal {
 pub struct ChipMetrics {
     pub chip_ghs: [f32; CHIPS],
     pub chip_fail_pct: [f32; CHIPS],
+    /// Per-die PVT temperature, °C. A reading at or below −100 is ignored
+    /// (the firmware's invalid sentinel is −273).
+    pub chip_temp_c: [f32; CHIPS],
     pub board_ths: f32,
     pub board_w: f32,
     pub temp_max_c: f32,
@@ -46,6 +51,11 @@ pub struct ChipTunerConfig {
     pub step_mhz: i16,
     pub min_offset_mhz: i16,
     pub max_offset_mhz: i16,
+    /// Step this chip down when its own PVT is at or above this, even if
+    /// its fail rate is fine. Kept under [`BACKSTOP_TEMP_C`].
+    pub hot_step_down_c: f32,
+    /// Do not step a chip up while its PVT is at or above this.
+    pub step_up_limit_c: f32,
     /// The moved chip must gain at least this fraction of its own work.
     pub chip_margin: f32,
     /// One step may cost the board at most this fraction of its hashrate
@@ -79,8 +89,10 @@ impl Default for ChipTunerConfig {
             settle_ticks: 6,
             discard_ticks: 2,
             step_mhz: 10,
-            min_offset_mhz: -100,
-            max_offset_mhz: 40,
+            min_offset_mhz: CHIP_OFFSET_MIN_MHZ,
+            max_offset_mhz: CHIP_OFFSET_MAX_MHZ,
+            hot_step_down_c: 95.0,
+            step_up_limit_c: 92.0,
             chip_margin: 0.015,
             board_guard: 0.01,
             total_guard: 0.02,
@@ -114,6 +126,7 @@ struct Accum {
     n: u32,
     chip_ghs: [f32; CHIPS],
     chip_fail: [f32; CHIPS],
+    chip_temp: [f32; CHIPS],
     ths: f32,
     w: f32,
     temp: f32,
@@ -125,6 +138,7 @@ impl Accum {
         for i in 0..CHIPS {
             self.chip_ghs[i] += m.chip_ghs[i];
             self.chip_fail[i] += m.chip_fail_pct[i];
+            self.chip_temp[i] += m.chip_temp_c[i];
         }
         self.ths += m.board_ths;
         self.w += m.board_w;
@@ -136,6 +150,7 @@ impl Accum {
         Window {
             chip_ghs: self.chip_ghs.map(|v| v / n),
             chip_fail: self.chip_fail.map(|v| v / n),
+            chip_temp: self.chip_temp.map(|v| v / n),
             ths: self.ths / n,
             w: self.w / n,
             temp: self.temp / n,
@@ -148,9 +163,21 @@ impl Accum {
 struct Window {
     chip_ghs: [f32; CHIPS],
     chip_fail: [f32; CHIPS],
+    chip_temp: [f32; CHIPS],
     ths: f32,
     w: f32,
     temp: f32,
+}
+
+impl Window {
+    /// Hottest usable per-die reading, or the board max when every die
+    /// reading is the invalid sentinel.
+    fn sensed_temp(&self) -> f32 {
+        self.chip_temp
+            .into_iter()
+            .filter(|t| *t > -100.0)
+            .fold(self.temp, f32::max)
+    }
 }
 
 pub struct ChipTuner {
@@ -238,7 +265,9 @@ impl ChipTuner {
         // by pre-existing high board fail rate or power.
         if let ChipPhase::Trial { chip, from } = self.phase
             && self.offsets[chip] > from
-            && (board_fail > self.cfg.max_board_fail_pct || m.board_w > self.cfg.power_cap_w)
+            && (board_fail > self.cfg.max_board_fail_pct
+                || m.board_w > self.cfg.power_cap_w
+                || m.chip_temp_c[chip] >= BACKSTOP_TEMP_C as f32)
         {
             self.offsets[chip] = from;
             self.mark_done(chip, true);
@@ -272,17 +301,20 @@ impl ChipTuner {
             ChipPhase::Baseline => {
                 self.baseline = Some(win);
                 self.reference.get_or_insert(win);
-                self.ref_temp.get_or_insert(win.temp);
+                self.ref_temp.get_or_insert(win.sensed_temp());
                 self.start_next_trial(&win)
             }
             ChipPhase::Trial { chip, from } => self.judge(chip, from, win),
             ChipPhase::Converged => {
                 self.converged_windows += 1;
-                if self.ref_temp.is_some_and(|t| (win.temp - t).abs() > self.cfg.retune_temp_delta_c) {
+                if self
+                    .ref_temp
+                    .is_some_and(|t| (win.sensed_temp() - t).abs() > self.cfg.retune_temp_delta_c)
+                {
                     self.restart("temperature shifted");
                     self.baseline = Some(win);
                     self.reference = Some(win);
-                    self.ref_temp = Some(win.temp);
+                    self.ref_temp = Some(win.sensed_temp());
                     return self.start_next_trial(&win);
                 }
                 if self.converged_windows >= self.reprobe_after {
@@ -303,7 +335,9 @@ impl ChipTuner {
     fn board_ratio(&self, win: &Window, base: &Window) -> f32 {
         match self.goal {
             ChipGoal::Hashrate => win.ths / base.ths.max(1e-6),
-            ChipGoal::Efficiency => (win.ths / win.w.max(1e-3)) / (base.ths / base.w.max(1e-3)).max(1e-9),
+            ChipGoal::Efficiency => {
+                (win.ths / win.w.max(1e-3)) / (base.ths / base.w.max(1e-3)).max(1e-9)
+            }
         }
     }
 
@@ -337,7 +371,7 @@ impl ChipTuner {
             self.mark_done(chip, !up);
             self.reprobe_after = self.cfg.reprobe_windows;
             self.baseline = Some(win);
-            self.ref_temp = Some(win.temp);
+            self.ref_temp = Some(win.sensed_temp());
             self.phase = ChipPhase::Baseline;
             self.start_next_trial(&win);
             self.last_event = format!("{kept}; {}", self.last_event);
@@ -377,7 +411,9 @@ impl ChipTuner {
 
     fn pick(&self, win: &Window) -> Option<(usize, i16)> {
         let step = self.cfg.step_mhz;
-        let alive: Vec<usize> = (0..CHIPS).filter(|&i| win.chip_ghs[i] >= DEAD_GHS).collect();
+        let alive: Vec<usize> = (0..CHIPS)
+            .filter(|&i| win.chip_ghs[i] >= DEAD_GHS)
+            .collect();
         if alive.len() < 2 {
             return None;
         }
@@ -385,6 +421,15 @@ impl ChipTuner {
         fails.sort_by(f32::total_cmp);
         let median = fails[fails.len() / 2];
 
+        let hot = alive
+            .iter()
+            .copied()
+            .filter(|&i| !self.done_down[i] && self.offsets[i] - step >= self.cfg.min_offset_mhz)
+            .filter(|&i| win.chip_temp[i] >= self.cfg.hot_step_down_c && win.chip_temp[i] < 250.0)
+            .max_by(|&a, &b| win.chip_temp[a].total_cmp(&win.chip_temp[b]));
+        if let Some(i) = hot {
+            return Some((i, -step));
+        }
         let weak = alive
             .iter()
             .copied()
@@ -406,6 +451,9 @@ impl ChipTuner {
             .copied()
             .filter(|&i| !self.done_up[i] && self.offsets[i] + step <= self.cfg.max_offset_mhz)
             .filter(|&i| win.chip_fail[i] < self.cfg.strong_fail_pct)
+            .filter(|&i| {
+                !(win.chip_temp[i] >= self.cfg.step_up_limit_c && win.chip_temp[i] < 250.0)
+            })
             .min_by(|&a, &b| {
                 win.chip_fail[a]
                     .total_cmp(&win.chip_fail[b])
@@ -452,18 +500,22 @@ impl ChipTuner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::board::a3197s::{BACKSTOP_TEMP_C, CHIP_OFFSET_MAX_MHZ, CHIP_OFFSET_MIN_MHZ};
     use crate::board::nano3s_chain_sim::{ChainSim, SimReading};
 
     /// A spread like the unit's: chip 5 weakest, then 7-9.
-    const UNIT: [f32; CHIPS] = [0.0, 4.0, 0.0, -6.0, 2.0, -20.0, 6.0, -14.0, -14.0, -14.0, 3.0, 8.0];
+    const UNIT: [f32; CHIPS] = [
+        0.0, 4.0, 0.0, -6.0, 2.0, -20.0, 6.0, -14.0, -14.0, -14.0, 3.0, 8.0,
+    ];
 
     fn metrics(r: &SimReading) -> ChipMetrics {
         ChipMetrics {
             chip_ghs: r.chip_ghs,
             chip_fail_pct: r.chip_fail_pct,
+            chip_temp_c: [70.0; CHIPS],
             board_ths: r.board_ths,
             board_w: r.board_w,
-            temp_max_c: 77.0,
+            temp_max_c: 70.0,
         }
     }
 
@@ -471,6 +523,7 @@ mod tests {
         ChipMetrics {
             chip_ghs: [140.0; CHIPS],
             chip_fail_pct: [fail; CHIPS],
+            chip_temp_c: [77.0; CHIPS],
             board_ths: 1.68,
             board_w: 100.0,
             temp_max_c: 77.0,
@@ -577,7 +630,10 @@ mod tests {
 
     #[test]
     fn no_step_ups_near_the_power_cap() {
-        let cfg = ChipTunerConfig { power_cap_w: 100.0, ..Default::default() };
+        let cfg = ChipTunerConfig {
+            power_cap_w: 100.0,
+            ..Default::default()
+        };
         let mut t = tuner(cfg);
         let mut m = flat(2.0);
         m.board_w = 98.0; // over 97 % of the cap
@@ -589,14 +645,21 @@ mod tests {
     #[test]
     fn an_unstable_or_over_cap_trial_is_reverted_on_the_next_tick() {
         for (fail, watts) in [(50.0, 95.0), (2.0, 130.0)] {
-            let cfg = ChipTunerConfig { power_cap_w: 110.0, ..Default::default() };
+            let cfg = ChipTunerConfig {
+                power_cap_w: 110.0,
+                ..Default::default()
+            };
             let mut t = tuner(cfg);
             let mut m = flat(2.0);
             m.board_w = 95.0;
             m.chip_fail_pct[3] = 0.5;
             settle(&mut t, &m);
             assert_eq!(t.offsets()[3], 10);
-            let bad = ChipMetrics { chip_fail_pct: [fail; CHIPS], board_w: watts, ..m };
+            let bad = ChipMetrics {
+                chip_fail_pct: [fail; CHIPS],
+                board_w: watts,
+                ..m
+            };
             assert!(t.tick(&bad));
             assert_eq!(t.offsets(), [0; CHIPS]);
             assert!(t.last_event().contains("at once"), "{}", t.last_event());
@@ -617,8 +680,64 @@ mod tests {
     }
 
     #[test]
+    fn a_hot_die_is_stepped_down_before_a_strong_die_is_raised() {
+        let mut t = tuner(ChipTunerConfig::default());
+        let mut m = flat(1.0);
+        m.chip_temp_c[4] = 96.0;
+        m.chip_fail_pct[8] = 0.5;
+        assert!(settle(&mut t, &m));
+        assert_eq!(t.offsets()[4], -10);
+        assert_eq!(t.offsets()[8], 0);
+    }
+
+    #[test]
+    fn a_die_near_the_backstop_is_not_stepped_up() {
+        let mut t = tuner(ChipTunerConfig::default());
+        let mut m = flat(4.0);
+        m.chip_fail_pct[8] = 0.5;
+        m.chip_temp_c[8] = 93.0;
+        assert!(!settle(&mut t, &m));
+        assert_eq!(t.offsets(), [0; CHIPS]);
+        assert_eq!(t.phase(), ChipPhase::Converged);
+    }
+
+    #[test]
+    fn a_step_up_that_crosses_97c_is_reverted_at_once() {
+        let mut t = tuner(ChipTunerConfig::default());
+        let mut m = flat(2.0);
+        m.chip_fail_pct[3] = 0.5;
+        settle(&mut t, &m);
+        assert_eq!(t.offsets()[3], 10);
+        let mut hot = m;
+        hot.chip_temp_c[3] = BACKSTOP_TEMP_C as f32;
+        assert!(t.tick(&hot));
+        assert_eq!(t.offsets()[3], 0);
+    }
+
+    #[test]
+    fn one_hot_die_restarts_a_converged_search_without_a_board_max_change() {
+        let cfg = ChipTunerConfig {
+            reprobe_windows: 1000,
+            ..Default::default()
+        };
+        let mut t = tuner(cfg);
+        let m = flat(5.0);
+        settle(&mut t, &m);
+        assert_eq!(t.phase(), ChipPhase::Converged);
+        let mut hot = flat(5.0);
+        hot.chip_temp_c[2] = 88.0;
+        hot.chip_fail_pct[2] = 1.0;
+        assert!(settle(&mut t, &hot));
+        assert_eq!(t.phase(), ChipPhase::Trial { chip: 2, from: 0 });
+        assert_eq!(t.offsets()[2], 10);
+    }
+
+    #[test]
     fn a_temperature_shift_restarts_a_converged_search() {
-        let cfg = ChipTunerConfig { reprobe_windows: 1000, ..Default::default() };
+        let cfg = ChipTunerConfig {
+            reprobe_windows: 1000,
+            ..Default::default()
+        };
         let mut t = tuner(cfg);
         let m = flat(5.0); // nobody failing, nobody strong: nothing to try
         settle(&mut t, &m);
@@ -641,9 +760,18 @@ mod tests {
         assert!(run(&mut t, &sim, 4000, 1), "never converged");
         let o = t.committed_offsets();
         let tuned = sim.measure(&o);
-        assert!(tuned.board_ths > uniform.board_ths * 1.03, "{} vs {} at {o:?}", tuned.board_ths, uniform.board_ths);
+        assert!(
+            tuned.board_ths > uniform.board_ths * 1.03,
+            "{} vs {} at {o:?}",
+            tuned.board_ths,
+            uniform.board_ths
+        );
         assert!(o[5] < 0, "weakest chip slowed: {o:?}");
-        assert!(o.iter().all(|&x| (-60..=40).contains(&x)), "{o:?}");
+        assert!(
+            o.iter()
+                .all(|&x| (CHIP_OFFSET_MIN_MHZ..=CHIP_OFFSET_MAX_MHZ).contains(&x)),
+            "{o:?}"
+        );
     }
 
     #[test]
@@ -653,7 +781,12 @@ mod tests {
         let mut t = tuner(ChipTunerConfig::default());
         run(&mut t, &sim, 4000, 7);
         let tuned = sim.measure(&t.committed_offsets());
-        assert!(tuned.board_ths >= uniform.board_ths * 0.99, "{} vs {}", tuned.board_ths, uniform.board_ths);
+        assert!(
+            tuned.board_ths >= uniform.board_ths * 0.99,
+            "{} vs {}",
+            tuned.board_ths,
+            uniform.board_ths
+        );
     }
 
     #[test]
@@ -682,7 +815,12 @@ mod tests {
             t.tick(&improved);
         }
         // Total ticks elapsed = 6 + 2 + 6 = 14 ticks (< 19 ticks in AutoTune's 20-tick window)
-        assert_eq!(t.committed_offsets()[5], -10, "step-down must be committed: {}", t.last_event());
+        assert_eq!(
+            t.committed_offsets()[5],
+            -10,
+            "step-down must be committed: {}",
+            t.last_event()
+        );
     }
 
     #[test]

@@ -1,13 +1,14 @@
+pub(crate) mod a3197s;
 pub(crate) mod bitaxe;
 pub(crate) mod cpu;
 pub(crate) mod emberone00;
 #[cfg(feature = "nano3s")]
 pub(crate) mod nano3s;
 pub(crate) mod nano3s_auto_tune;
-pub(crate) mod nano3s_tuner_core;
-pub(crate) mod nano3s_chip_tuner;
 #[cfg(test)]
 pub(crate) mod nano3s_chain_sim;
+pub(crate) mod nano3s_chip_tuner;
+pub(crate) mod nano3s_tuner_core;
 pub mod pattern;
 
 use anyhow::Result;

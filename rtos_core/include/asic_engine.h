@@ -188,9 +188,12 @@ void asic_refresh_rolltime(uint8_t miner_id, uint16_t freq3);
 /* Writes the given per-domain PLL frequency values. */
 void asic_apply_pll_freq(uint8_t miner_id, const uint32_t pll_freq[4]);
 /* Per-chip clock offsets (MHz, all four domains) layered on the base set
- * by asic_apply_pll_freq(). Ramped, blocking. Clamped at PLL_CHIP_MIN_MHZ. */
+ * by asic_apply_pll_freq(). Ramped, blocking. Each domain is clamped to
+ * PLL_CHIP_MIN_MHZ..PLL_CHIP_MAX_MHZ before the CPM lookup so a request
+ * can never program a zero PLL word. */
 #define PLL_CHIP_OFFSET_MAX 12
 #define PLL_CHIP_MIN_MHZ 100
+#define PLL_CHIP_MAX_MHZ 580
 void asic_set_pll_chip_offsets(uint8_t miner_id, const int16_t target[PLL_CHIP_OFFSET_MAX]);
 /* Blocking PLL ramp: steps domain 0 from init_freq to target_freq in
  * PLL_RAMP_STEP_MHZ increments, one real second apart. Each step,

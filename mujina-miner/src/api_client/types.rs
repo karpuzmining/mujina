@@ -120,12 +120,22 @@ pub struct BoardTuningRequest {
     pub temp_target_c: Option<f64>,
 }
 
-/// Request body for `PATCH /api/v0/boards/{name}/chip-clocks`: one clock
-/// offset per chip in MHz, added to every PLL domain of that chip on top of
-/// the board's base clock. All zero = uniform clocks.
+/// Request body for `PATCH /api/v0/boards/{name}/chip-clocks`.
+///
+/// Send `offset_mhz` or `freq_mhz`, not both. `freq_mhz` is absolute PLL0
+/// MHz per chip and is stored as an offset from the board's current PLL0.
+/// `policy` is `clear` (default, and the upgrade default) or `keep`.
+/// `clear` drops chip clocks when the profile or the board VF changes.
+/// `keep` leaves them. Per-chip voltage is not accepted: the twelve dies
+/// share one rail.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
 pub struct BoardChipClocksRequest {
-    pub offset_mhz: Vec<i16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset_mhz: Option<Vec<i16>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freq_mhz: Option<Vec<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
 }
 
 /// Request body for `PATCH /api/v0/boards/{name}/power-target`.

@@ -9,12 +9,12 @@
 use std::collections::{HashMap, VecDeque};
 
 use axum::{
-    Json,
+    Json, Router,
     http::StatusCode,
-    response::{Html, IntoResponse, Redirect},
-    routing, Router,
+    response::{Html, IntoResponse},
+    routing,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::server::SharedState;
 use crate::api_client::types::BoardTelemetry;
@@ -31,6 +31,10 @@ const LED_HTML: &str = include_str!("../../assets/led.html");
 /// `/dashboard` for the same reason `/led` is -- a standing config surface
 /// rather than a telemetry view.
 const TUNING_HTML: &str = include_str!("../../assets/tuning.html");
+const POOL_HTML: &str = include_str!("../../assets/pool.html");
+const POWER_HTML: &str = include_str!("../../assets/power.html");
+const FAN_HTML: &str = include_str!("../../assets/fan.html");
+const DISPLAY_HTML: &str = include_str!("../../assets/display.html");
 /// Network firmware updater (upload mujina-minerd or the harness binary,
 /// applied immediately with a reboot) -- separate from `/dashboard` for
 /// the same reason `/led`/`/pool` are.
@@ -95,6 +99,9 @@ pub fn routes() -> Router<SharedState> {
         .route("/led", routing::get(serve_led_page))
         .route("/pool", routing::get(serve_pool_page))
         .route("/tuning", routing::get(serve_tuning_page))
+        .route("/power", routing::get(serve_power_page))
+        .route("/fan", routing::get(serve_fan_page))
+        .route("/display", routing::get(serve_display_page))
         .route("/firmware", routing::get(serve_firmware_page))
         .route("/nano3s-detail", routing::get(serve_nano3s_detail))
         .route("/mujina-head-mark.svg", routing::get(serve_logo_svg))
@@ -114,7 +121,10 @@ async fn serve_auth_js() -> impl IntoResponse {
 
 async fn serve_page() -> impl IntoResponse {
     (
-        [(axum::http::header::CACHE_CONTROL, "no-store, no-cache, must-revalidate")],
+        [(
+            axum::http::header::CACHE_CONTROL,
+            "no-store, no-cache, must-revalidate",
+        )],
         Html(DASHBOARD_HTML),
     )
 }
@@ -142,7 +152,12 @@ async fn launch_doom() -> Json<Value> {
                echo doom > /mntapp/release/linux/app/fb_page; \
                cd /data && nohup ./nano3s_doom -iwad /data/doom1.wad -gfxmode rgb565 \
                > /data/nano3s_doom.log 2>&1 &";
-    match tokio::process::Command::new("sh").arg("-c").arg(cmd).output().await {
+    match tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .output()
+        .await
+    {
         Ok(out) if out.status.success() => Json(json!({"ok": true, "detail": "launched"})),
         Ok(out) => Json(json!({
             "ok": false,
@@ -160,9 +175,20 @@ async fn serve_led_page() -> impl IntoResponse {
     Html(LED_HTML)
 }
 
-/// Pool settings now live on the dashboard; keep old bookmarks working.
 async fn serve_pool_page() -> impl IntoResponse {
-    Redirect::temporary("/dashboard#pool")
+    Html(POOL_HTML)
+}
+
+async fn serve_power_page() -> impl IntoResponse {
+    Html(POWER_HTML)
+}
+
+async fn serve_fan_page() -> impl IntoResponse {
+    Html(FAN_HTML)
+}
+
+async fn serve_display_page() -> impl IntoResponse {
+    Html(DISPLAY_HTML)
 }
 
 async fn serve_tuning_page() -> impl IntoResponse {
@@ -189,9 +215,7 @@ async fn serve_nano3s_detail() -> Result<Json<Value>, StatusCode> {
     }
 }
 
-async fn serve_data(
-    axum::extract::State(state): axum::extract::State<SharedState>,
-) -> Json<Value> {
+async fn serve_data(axum::extract::State(state): axum::extract::State<SharedState>) -> Json<Value> {
     let m = state.miner_telemetry();
 
     // Fleet rate = sum of the boards' measured rates; the share-based miner
@@ -218,11 +242,7 @@ async fn serve_data(
         .unwrap_or_else(|e| e.into_inner())
         .push_fleet(fleet_ghs.unwrap_or(0.0));
 
-    let total_power: f64 = m
-        .boards
-        .iter()
-        .filter_map(|b| core_power_w(b))
-        .sum();
+    let total_power: f64 = m.boards.iter().filter_map(|b| core_power_w(b)).sum();
     let have_power = m.boards.iter().any(|b| core_power_w(b).is_some());
 
     let fan_rpms: Vec<f64> = boards
@@ -305,8 +325,14 @@ mod fleet_tests {
 
     #[test]
     fn fleet_is_the_sum_of_board_rates() {
-        assert_eq!(fleet_hashrate_ghs([Some(1000.0), Some(500.5), None].into_iter()), Some(1500.5));
-        assert_eq!(fleet_hashrate_ghs([Some(0.0), Some(2.0)].into_iter()), Some(2.0));
+        assert_eq!(
+            fleet_hashrate_ghs([Some(1000.0), Some(500.5), None].into_iter()),
+            Some(1500.5)
+        );
+        assert_eq!(
+            fleet_hashrate_ghs([Some(0.0), Some(2.0)].into_iter()),
+            Some(2.0)
+        );
     }
 
     #[test]
@@ -361,7 +387,16 @@ fn board_json(b: &BoardTelemetry, series: Vec<f64>) -> Value {
                 let chips: Vec<Value> = detail
                     .chips
                     .iter()
-                    .map(|c| json!({ "index": c.chip, "ghs": c.ghsspd, "temp_c": c.temp_c, "spd_dh": c.spd_dh }))
+                    .map(|c| {
+                        json!({
+                            "index": c.chip,
+                            "ghs": c.ghsspd,
+                            "temp_c": c.temp_c,
+                            "volt_mv": c.volt_mv,
+                            "spd_dh": c.spd_dh,
+                            "pll_mhz": c.pll_freq[0],
+                        })
+                    })
                     .collect();
                 (
                     chips,
