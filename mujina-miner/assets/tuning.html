@@ -114,7 +114,7 @@
   .row:last-of-type { margin-bottom: 0; }
   .row label { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--dim); }
   .row label small { text-transform: none; letter-spacing: 0; }
-  .row input[type=text], .row input[type=number] {
+  .row input[type=text], .row input[type=number], .row select {
     background: var(--panel2); color: var(--ink); border: 1px solid var(--line);
     border-radius: 4px; padding: 10px 12px; font: inherit; font-size: 13px;
   }
@@ -136,7 +136,17 @@
   .msg { margin-top: 12px; font-size: 12px; color: var(--dim); }
   .msg.ok { color: var(--green); }
   .msg.err { color: var(--red); }
-  .hint { font-size: 12px; color: var(--dim); margin: 0 0 14px; line-height: 1.5; }
+  .hint, .note { font-size: 12px; color: var(--dim); margin: 0 0 14px; line-height: 1.5; }
+  .seg { display: flex; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+  .segbtn {
+    flex: 1; text-align: center; padding: 8px 6px; font-family: inherit; font-size: 11px;
+    letter-spacing: .1em; text-transform: uppercase; color: var(--dim); background: var(--panel2);
+    cursor: pointer; border: none;
+  }
+  .segbtn + .segbtn { border-left: 1px solid var(--line); }
+  .segbtn.active { color: var(--ink); background: rgba(0,240,255,.12); }
+  .boardtabs { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 14px; }
+  .boardtabs button { font: inherit; }
 
   .kv { display: grid; grid-template-columns: auto 1fr; gap: 7px 16px; font-size: 12px; margin: 0; }
   .kv dt { color: var(--dim); }
@@ -459,16 +469,99 @@
   </div>
   <nav class="menubar" aria-label="Main Menu">
     <a class="menubtn" href="/dashboard">Dashboard</a>
-    <a class="menubtn" href="/dashboard#power">Power</a>
-    <a class="menubtn on" href="/dashboard#tuning">Tuning</a>
-    <a class="menubtn" href="/dashboard#fan">Fan</a>
-    <a class="menubtn" href="/dashboard#curve">Fan Curve</a>
-    <a class="menubtn" href="/dashboard#pool">Pool</a>
+    <a class="menubtn" href="/power">Power</a>
+    <a class="menubtn on" href="/tuning">Tuning</a>
+    <a class="menubtn" href="/fan">Fan</a>
+    <a class="menubtn" href="/fan#curve">Fan Curve</a>
+    <a class="menubtn" href="/pool">Pool</a>
     <a class="menubtn" href="/led">LED</a>
     <a class="menubtn" href="/firmware">Firmware</a>
-    <a class="menubtn" href="/dashboard#display">Display</a>
+    <a class="menubtn" href="/display">Display</a>
     <a class="menubtn" href="/info">Info</a>
   </nav>
+
+  <div class="boardtabs" id="tuneBoardTabs" hidden></div>
+  <div class="note" id="powerLine" hidden></div>
+  <div class="note" id="tuningNone" hidden>No tuning controls for this board.</div>
+
+  <div id="ownSection" hidden>
+  <div class="sec">Auto Tuner<span class="sec-sub">profile, target, continuous</span></div>
+  <div class="card">
+    <div id="ownCur">tuner status loading&hellip;</div>
+    <div class="row">
+      <label for="ownProfile">Profile</label>
+      <select id="ownProfile" autocomplete="off">
+        <option value="off">Off</option>
+        <option value="quiet">Quiet</option>
+        <option value="efficient">Efficient</option>
+        <option value="balanced">Balanced</option>
+        <option value="max_hash">Max hash</option>
+        <option value="target">Target (power / hashrate)</option>
+      </select>
+    </div>
+    <div id="ownTargetRows" hidden>
+      <div class="row">
+        <label>Target</label>
+        <div class="seg" id="ownTargetAxis">
+          <button type="button" class="segbtn active" data-axis="power">Power (W)</button>
+          <button type="button" class="segbtn" data-axis="hashrate">Hashrate (TH/s)</button>
+        </div>
+      </div>
+      <div class="row">
+        <label for="ownTargetVal">Value <small id="ownTargetUnit">W</small></label>
+        <input type="number" id="ownTargetVal" name="tuner_target_value" min="20" max="200" step="1" placeholder="e.g. 115" autocomplete="off">
+      </div>
+      <div class="note" id="ownTargetNote"></div>
+    </div>
+    <div class="toggle-row" id="ownContinuousRow">
+      <div>
+        <label for="ownContinuous">Continuous Tuning</label>
+        <small style="display:block;color:var(--dim);margin-top:4px">Disabled: warms up and tunes, then locks in. Enabled: keeps re-tuning as cooling and ambient temperature change.</small>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px">
+        <span id="ownContinuousState">OFF</span>
+        <label class="switch"><input type="checkbox" id="ownContinuous" name="tuner_continuous" autocomplete="off"><span class="slider"></span></label>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="btn pri" id="ownApply" type="button">Apply</button>
+    </div>
+    <div class="msg" id="ownMsg"></div>
+    <p class="hint">Using any Live Tuning control below switches the auto tuner off.</p>
+  </div>
+  </div>
+
+  <div id="manualSection" hidden>
+  <div class="sec">Live Tuning<span class="sec-sub">clock frequency and core voltage</span></div>
+  <div class="card">
+    <div class="row" id="tunePresetRow">
+      <label for="tunePreset">Mode</label>
+      <select id="tunePreset" autocomplete="off">
+        <option value="custom">Custom</option>
+        <option value="210,230,250,270">LOW — 210-270MHz</option>
+        <option value="338,358,378,398" selected>MED — 338-398MHz</option>
+        <option value="420,440,460,480">HIGH — 420-480MHz</option>
+      </select>
+      <small style="color:var(--dim)">Selecting a mode sets frequency, voltage, and power target together.</small>
+    </div>
+    <div class="row">
+      <label for="tuneFreq">Base Frequency <small>MHz (domains step +20 each)</small></label>
+      <input type="number" id="tuneFreq" name="manual_base_freq_mhz" min="100" max="520" step="1" value="338" autocomplete="off">
+    </div>
+    <div class="row">
+      <label for="tuneVolt">Core Voltage <small>mV. 3600 is rejected.</small></label>
+      <input type="number" id="tuneVolt" name="manual_core_voltage_mv" min="3300" max="3912" step="1" value="3704" autocomplete="off">
+    </div>
+    <div class="row" id="tunePowerRow">
+      <label for="tunePowerTarget">Power Target <small>W (blank = leave unchanged)</small></label>
+      <input type="number" id="tunePowerTarget" name="manual_power_target_w" min="20" max="130" step="0.1" value="95" autocomplete="off">
+    </div>
+    <div class="actions">
+      <button class="btn pri" id="tuneApply" type="button">Apply Mode</button>
+    </div>
+    <div class="msg" id="tuneMsg"></div>
+  </div>
+  </div>
 
   <div class="sec">USB-C PD Input<span class="sec-sub">what the connected PSU is actually delivering</span></div>
   <div class="card">
@@ -672,6 +765,310 @@ loadConn();
 loadPsu();
 loadAutotune();
 setInterval(() => { loadConn(); loadPsu(); loadAutotune(); }, 5000);
+</script>
+<script>
+(function () {
+  const PRESETS = {
+    '210,230,250,270': { freq: [210, 230, 250, 270], volt: 3392, power_target: 62.0 },
+    '338,358,378,398': { freq: [338, 358, 378, 398], volt: 3496, power_target: 95.0 },
+    '420,440,460,480': { freq: [420, 440, 460, 480], volt: 3704, power_target: 130.0 },
+  };
+  let SYS = null, DATA = null, ACTIVE = null, STATUS = null, SYNCED = false;
+  let AXIS = 'power', CEILING = undefined, EDITING = false, WRITE_UNTIL = 0;
+
+  function show(id, on) { const el = $(id); if (el) el.hidden = !on; }
+  function say(id, text, ok) {
+    const m = $(id); if (!m) return;
+    m.textContent = text;
+    m.className = ok === true ? 'msg ok' : ok === false ? 'msg err' : 'msg';
+  }
+  function busy(id) {
+    if (Date.now() < WRITE_UNTIL) { say(id, 'wait a few seconds between commands'); return true; }
+    return false;
+  }
+  function lock() {
+    WRITE_UNTIL = Date.now() + 6000;
+    document.querySelectorAll('#ownApply, #tuneApply').forEach(b => { b.disabled = true; });
+    setTimeout(() => document.querySelectorAll('#ownApply, #tuneApply').forEach(b => { b.disabled = false; }), 6000);
+  }
+  async function send(method, url, body) {
+    const r = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!r.ok) throw new Error('HTTP ' + r.status + (await r.text().then(t => t ? ': ' + t.slice(0, 160) : '').catch(() => '')));
+    return r;
+  }
+  function names() {
+    if (SYS && SYS.boards && SYS.boards.length) return SYS.boards.map(b => b.name);
+    return (DATA && DATA.boards) ? DATA.boards.map(b => b.board_name) : [];
+  }
+  function name() { return ACTIVE || names()[0] || null; }
+  function caps() {
+    if (!SYS || !SYS.boards) return null;
+    const b = SYS.boards.find(x => x.name === name());
+    return b ? (b.caps || {}) : null;
+  }
+  function board() {
+    return (DATA && DATA.boards) ? (DATA.boards.find(b => b.board_name === name()) || null) : null;
+  }
+  function nano() { return !!(SYS && SYS.power && SYS.power.ceiling_w != null); }
+  function safe(u) { return typeof u === 'string' && u.charAt(0) === '/' && u.charAt(1) !== '/'; }
+
+  function syncCont() {
+    const el = $('ownContinuous'), st = $('ownContinuousState');
+    if (!el || !st) return;
+    st.textContent = el.checked ? 'ON' : 'OFF';
+  }
+  function setAxis(axis) {
+    AXIS = axis === 'hashrate' ? 'hashrate' : 'power';
+    document.querySelectorAll('#ownTargetAxis .segbtn').forEach(b => b.classList.toggle('active', b.dataset.axis === AXIS));
+    const inp = $('ownTargetVal'), hash = AXIS === 'hashrate';
+    $('ownTargetUnit').textContent = hash ? 'TH/s' : 'W';
+    inp.step = hash ? '0.01' : '1';
+    inp.min = hash ? '0.5' : '20';
+    inp.max = hash ? '12' : '140';
+    inp.placeholder = hash ? 'e.g. 6.0' : 'e.g. 115';
+    $('ownTargetNote').textContent = hash
+      ? 'Reaches the hashrate, then trims core voltage for the best J/TH while holding it.'
+      : 'Climbs to the most hashrate that fits in this whole-board power, trimming voltage to make room.'
+        + (CEILING != null ? ' Power ceiling ' + CEILING.toFixed(0) + ' W. A higher target runs at the ceiling.' : '');
+  }
+  function syncTarget() {
+    const isTarget = $('ownProfile').value === 'target';
+    show('ownTargetRows', isTarget);
+    if (isTarget) setAxis(AXIS);
+    if (isTarget && CEILING === undefined) {
+      CEILING = null;
+      const n = name();
+      if (n) fetch('/api/v0/boards/' + encodeURIComponent(n) + '/psu').then(r => r.ok ? r.json() : null).then(d => {
+        CEILING = d && typeof d.effective_ceiling_w === 'number' ? d.effective_ceiling_w : null;
+        setAxis(AXIS);
+      }).catch(() => {});
+    }
+  }
+  function labelOf(t) {
+    if (!t || t.value == null) return null;
+    return t.axis === 'hashrate' ? 'target ' + (+t.value).toFixed(2) + ' TH/s' : 'target ' + (+t.value).toFixed(0) + ' W';
+  }
+  function modeLabel(o) { return labelOf(o.target) || o.profile || '?'; }
+
+  function renderStatus(o) {
+    STATUS = o;
+    let text = 'tuner off';
+    if (o.enabled) {
+      text = modeLabel(o) + ' / ' + (o.phase || '?');
+      if (o.per_chip && o.per_chip.phase) text += ' · per-chip ' + o.per_chip.phase;
+      if (o.fan_duty_percent != null) text += ' · fan ' + o.fan_duty_percent + '%';
+      if (o.continuous_ceiling_w != null) text += ' · cap ' + (+o.continuous_ceiling_w).toFixed(0) + ' W';
+      const f = o.setpoint && (o.setpoint.freq_mhz != null ? o.setpoint.freq_mhz : o.setpoint.frequency_mhz);
+      const v = o.setpoint && (o.setpoint.voltage_mv != null ? o.setpoint.voltage_mv : o.setpoint.core_voltage_mv);
+      const ff = f != null ? f : o.frequency_mhz;
+      const vv = v != null ? v : o.core_voltage_mv;
+      if (ff != null) text += ' · set ' + Math.round(ff) + ' MHz' + (vv != null ? ' @ ' + vv + ' mV' : '');
+    }
+    $('ownCur').textContent = 'Current: ' + text;
+    if (!SYNCED && $('ownProfile')) {
+      if (o.enabled && o.target) {
+        $('ownProfile').value = 'target';
+        AXIS = o.target.axis;
+        $('ownTargetVal').value = o.target.value;
+      } else {
+        $('ownProfile').value = o.enabled ? (o.profile || 'off') : 'off';
+      }
+      $('ownContinuous').checked = !!o.continuous;
+      syncCont();
+      SYNCED = true;
+    }
+    syncTarget();
+  }
+
+  function applyCaps() {
+    const c = caps(), tuner = !!(c && safe(c.tuner)), manual = !!(c && safe(c.manual_tuning));
+    show('ownSection', tuner);
+    show('manualSection', manual);
+    show('tuningNone', !!SYS && !tuner && !manual);
+    const isNano = nano();
+    show('tunePresetRow', isNano);
+    show('tunePowerRow', isNano);
+    if ($('tuneFreq')) {
+      $('tuneFreq').min = isNano ? 100 : 50;
+      $('tuneFreq').max = isNano ? 520 : 1200;
+      $('tuneVolt').min = isNano ? 3300 : 500;
+      $('tuneVolt').max = isNano ? 3912 : 1600;
+    }
+    const b = board();
+    if (b && !isNano) {
+      if (b.freq_mhz != null) $('tuneFreq').value = Math.round(b.freq_mhz);
+      if (b.core_v != null) $('tuneVolt').value = Math.round(b.core_v * 1000);
+    }
+    const pw = (SYS && SYS.power) || {};
+    const parts = [];
+    if (pw.psu_contract_w != null) parts.push('PSU contract ' + pw.psu_contract_w + ' W');
+    if (pw.ceiling_w != null) parts.push('power ceiling ' + pw.ceiling_w + ' W');
+    if (pw.shared_rail) parts.push('shared rail');
+    $('powerLine').textContent = parts.join(' · ');
+    show('powerLine', parts.length > 0);
+    const tabs = $('tuneBoardTabs');
+    const list = names();
+    tabs.hidden = list.length < 2;
+    tabs.textContent = '';
+    list.forEach(n => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'btn' + (n === name() ? ' pri' : '');
+      btn.textContent = n;
+      btn.addEventListener('click', () => { ACTIVE = n; SYNCED = false; applyCaps(); poll(); });
+      tabs.appendChild(btn);
+    });
+  }
+
+  async function poll() {
+    const c = caps();
+    if (!c || !safe(c.tuner)) return;
+    try {
+      const r = await fetch(c.tuner);
+      if (!r.ok) return;
+      renderStatus(await r.json());
+    } catch (e) { /* leave the last line */ }
+  }
+
+  async function applyOwner() {
+    const n = name(), c = caps();
+    if (!c || !safe(c.tuner)) { say('ownMsg', 'tuner not available for this board', false); return; }
+    if (busy('ownMsg')) return;
+    const sel = $('ownProfile'), v = sel.value, label = sel.options[sel.selectedIndex].textContent;
+    if (v === 'target') {
+      const val = parseFloat($('ownTargetVal').value), inp = $('ownTargetVal');
+      if (!isFinite(val) || val < +inp.min || val > +inp.max) {
+        say('ownMsg', 'Enter a target between ' + inp.min + ' and ' + inp.max, false);
+        return;
+      }
+      const target = { axis: AXIS, value: val }, tl = labelOf(target);
+      const cur = STATUS && STATUS.enabled && STATUS.target;
+      const cont = $('ownContinuous').checked;
+      const contChanged = cont !== !!(STATUS && STATUS.continuous);
+      const same = !!cur && cur.axis === target.axis && +cur.value === val;
+      if (same && !contChanged) { say('ownMsg', 'No changes to apply', false); return; }
+      if (!same && !confirm('Switch the auto tuner to ' + tl + '? This restarts the tuning search.')) return;
+      const body = { board_name: n, continuous: cont };
+      if (!same) body.target = target;
+      say('ownMsg', 'Sending…');
+      lock();
+      try {
+        await send('PATCH', c.tuner, body);
+        say('ownMsg', 'Queued: ' + tl + ' (applies within ~1 s)', true);
+        setTimeout(poll, 2500);
+      } catch (e) { say('ownMsg', 'Failed: ' + e.message, false); }
+      return;
+    }
+    const curProfile = (STATUS && STATUS.enabled) ? (STATUS.target ? 'target' : (STATUS.profile || 'off')) : 'off';
+    const curCont = !!(STATUS && STATUS.continuous);
+    const newCont = $('ownContinuous').checked;
+    if (v === curProfile && newCont === curCont) { say('ownMsg', 'No changes to apply', false); return; }
+    if (v === curProfile && newCont !== curCont) {
+      if (!STATUS || !STATUS.enabled) { say('ownMsg', 'turn on a profile first', false); return; }
+      say('ownMsg', 'Sending…');
+      lock();
+      try {
+        await send('PATCH', c.tuner, { enabled: true, continuous: newCont, board_name: n });
+        say('ownMsg', 'Queued: continuous ' + (newCont ? 'ON' : 'OFF'), true);
+        EDITING = false;
+        setTimeout(poll, 2500);
+      } catch (e) { say('ownMsg', 'Failed: ' + e.message, false); }
+      return;
+    }
+    if (!confirm(v === 'off' ? 'Turn the auto tuner OFF?' : 'Switch the auto tuner to ' + label + '? This replaces any power/temp target.')) return;
+    const enabled = v !== 'off';
+    const body = { enabled, profile: enabled ? v : null, board_name: n };
+    if (enabled) body.continuous = newCont;
+    say('ownMsg', 'Sending…');
+    lock();
+    try {
+      await send('PATCH', c.tuner, body);
+      say('ownMsg', 'Queued: ' + label + (enabled && newCont ? ' + continuous' : '') + ' (applies within ~1 s)', true);
+      EDITING = false;
+      setTimeout(poll, 2500);
+    } catch (e) { say('ownMsg', 'Failed: ' + e.message, false); }
+  }
+
+  function syncPreset() {
+    const v = $('tunePreset').value;
+    if (v === 'custom') return;
+    const p = PRESETS[v];
+    $('tuneFreq').value = p.freq[0];
+    $('tuneVolt').value = p.volt;
+    $('tunePowerTarget').value = p.power_target;
+  }
+  async function applyTune() {
+    const n = name(), c = caps();
+    if (!n || !c || !safe(c.manual_tuning)) { say('tuneMsg', 'tuning is not available for this board', false); return; }
+    if (busy('tuneMsg')) return;
+    const volt = +$('tuneVolt').value;
+    const vmin = +$('tuneVolt').min, vmax = +$('tuneVolt').max;
+    if (!isFinite(volt) || volt < vmin || volt > vmax) {
+      say('tuneMsg', 'voltage must be ' + vmin + '–' + vmax + ' mV', false);
+      return;
+    }
+    if (volt === 3600) { say('tuneMsg', '3600 mV is rejected', false); return; }
+    let body, label;
+    if (nano()) {
+      const preset = $('tunePreset').value;
+      const base = +$('tuneFreq').value;
+      const freq = preset !== 'custom' ? PRESETS[preset].freq : [base, base + 20, base + 40, base + 60];
+      if (freq.some(mhz => mhz < 100 || mhz > 580) || !(freq[0] <= freq[1] && freq[1] <= freq[2] && freq[2] <= freq[3])) {
+        say('tuneMsg', 'frequency domains must be 100–580 MHz and non-decreasing', false);
+        return;
+      }
+      body = { pll_freq_mhz: freq, voltage_mv: volt };
+      const pt = $('tunePowerTarget').value;
+      if (pt !== '') {
+        const w = +pt;
+        if (!isFinite(w) || w < 20 || w > 130) { say('tuneMsg', 'power target must be 20–130 W, or blank', false); return; }
+        body.power_target_w = w;
+      }
+      label = freq.join('/') + 'MHz @ ' + volt + 'mV';
+    } else {
+      const f = +$('tuneFreq').value;
+      body = { frequency_mhz: f, core_voltage_mv: volt };
+      label = f + 'MHz @ ' + volt + 'mV';
+    }
+    body.board_name = n;
+    say('tuneMsg', 'applying…');
+    lock();
+    try {
+      await send('PATCH', c.manual_tuning, body);
+      say('tuneMsg', 'applied: ' + label, true);
+    } catch (e) { say('tuneMsg', 'tuning failed (' + e.message + ')', false); }
+  }
+
+  async function boot() {
+    try {
+      const r = await fetch('/api/v0/system');
+      if (r.ok) SYS = await r.json();
+    } catch (e) {}
+    try {
+      const r = await fetch('/data');
+      if (r.ok) {
+        const d = await r.json();
+        if (d.ok) DATA = d;
+      }
+    } catch (e) {}
+    applyCaps();
+    poll();
+  }
+
+  $('tunePreset').addEventListener('change', syncPreset);
+  $('tuneApply').addEventListener('click', applyTune);
+  $('ownApply').addEventListener('click', applyOwner);
+  $('ownProfile').addEventListener('change', syncTarget);
+  document.querySelectorAll('#ownTargetAxis .segbtn').forEach(b => b.addEventListener('click', () => setAxis(b.dataset.axis)));
+  $('ownContinuous').addEventListener('change', () => { EDITING = true; syncCont(); });
+  $('ownContinuousRow').addEventListener('click', (e) => {
+    if (e.target.closest('label') || e.target.closest('input')) return;
+    const chk = $('ownContinuous');
+    if (chk && !chk.disabled) { chk.checked = !chk.checked; EDITING = true; syncCont(); }
+  });
+  boot();
+  setInterval(poll, 5000);
+})();
 </script>
 </body>
 </html>
