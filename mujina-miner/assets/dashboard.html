@@ -1811,6 +1811,10 @@ function applySystem() {
   }
   show('pauseBtn', PAUSE_AVAILABLE);
   applyBoardCaps();
+  if (SYS && !window.__liveTuneLoaded) {
+    window.__liveTuneLoaded = true;
+    loadLiveTuning();
+  }
 }
 
 // Per-board visibility, driven by the selected board's caps.
@@ -2983,6 +2987,24 @@ function closeMenus() {
     try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
   }
 }
+async function loadLiveTuning() {
+  const name = activeName();
+  if (!name || !$('tunePreset')) return;
+  try {
+    const r = await fetch('/api/v0/boards/' + encodeURIComponent(name) + '/tuning');
+    if (!r.ok) return;
+    const d = await r.json();
+    const preset = d.live_preset;
+    if (preset && Array.from($('tunePreset').options).some(o => o.value === preset)) {
+      $('tunePreset').value = preset;
+    } else if (d.pll_freq_mhz) {
+      $('tunePreset').value = 'custom';
+    }
+    if (d.pll_freq_mhz && d.pll_freq_mhz.length) $('tuneFreq').value = d.pll_freq_mhz[0];
+    if (d.voltage_mv != null) $('tuneVolt').value = d.voltage_mv;
+    if (d.power_target_w != null && $('tunePowerTarget')) $('tunePowerTarget').value = d.power_target_w;
+  } catch (e) { /* leave the form */ }
+}
 function openMenu(key) {
   if (key === 'dashboard') {
     closeMenus();
@@ -2997,6 +3019,7 @@ function openMenu(key) {
   const b = document.querySelector('.menubtn[data-menu="' + key + '"]');
   if (b) b.classList.add('on');
   if (key === 'power') loadPsuConfig();
+  if (key === 'tuning') loadLiveTuning();
   if (key === 'fan') {
     renderModalBoardTabs('fanBoardTabs');
     applyBoardCaps();
