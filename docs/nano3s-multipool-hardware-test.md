@@ -2,7 +2,9 @@
 
 Test build `v5.1.0-multipool-test.2`. It is v5.1.0 plus in-process multi-pool, and the dashboard menus open their own pages. The RT-Smart core embedded in the miner is the v5.1.0 release `rtos_core.elf` (`2e88ff5f2b58acbe3761a1ab083ad3c46b89b296f7491f05ca1e0970717299d1`). Do not use this bundle to test the per-chip PLL changes; that is a different image.
 
-SHA-256 of `nano-mujina-v5.1.0-multipool-test.2-bundle.bin` is recorded on the `v5.1.0-multipool-test.2` release.
+SHA-256 of `nano-mujina-v5.1.0-multipool-test.2-bundle.bin`:
+
+`ffee1ec7cb1cad4904dc5eecdd382bbb63d8e0a9534144f17406e694cc6d3297`
 
 ## Install
 
