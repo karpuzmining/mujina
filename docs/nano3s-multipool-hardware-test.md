@@ -1,16 +1,24 @@
 # Nano 3S multi-pool hardware checklist
 
-Test build `v5.1.0-multipool-test.1`. It is v5.1.0 plus in-process multi-pool. The RT-Smart core embedded in the miner is the v5.1.0 release `rtos_core.elf` (`2e88ff5f2b58acbe3761a1ab083ad3c46b89b296f7491f05ca1e0970717299d1`). Do not use this bundle to test the per-chip PLL changes; that is a different image.
+Test build `v5.1.0-multipool-test.2`. It is v5.1.0 plus in-process multi-pool, and the dashboard menus open their own pages. The RT-Smart core embedded in the miner is the v5.1.0 release `rtos_core.elf` (`2e88ff5f2b58acbe3761a1ab083ad3c46b89b296f7491f05ca1e0970717299d1`). Do not use this bundle to test the per-chip PLL changes; that is a different image.
 
-SHA-256 of `nano-mujina-v5.1.0-multipool-test.1-bundle.bin`:
-
-`0140aa5d8bceac70bf3a21e63f618c4b4a5e6f559ae4f1eb58363c372594b775`
+SHA-256 of `nano-mujina-v5.1.0-multipool-test.2-bundle.bin` is recorded on the `v5.1.0-multipool-test.2` release.
 
 ## Install
 
 1. Boot the unit into the normal dashboard, not ROM boot mode. Boot mode only accepts a `.kdimg`.
-2. Open **Firmware** and upload `nano-mujina-v5.1.0-multipool-test.1-bundle.bin`.
+2. Open **Firmware** and upload `nano-mujina-v5.1.0-multipool-test.2-bundle.bin`.
 3. Wait until the dashboard is back. Confirm the build string on **Info**.
+
+## Menus
+
+Each item opens its own page. Old `/dashboard#...` links redirect there. There is no in-page sheet.
+
+- **Power** `/power` — pause, reboot, restart, and the power-profile ceiling (50–140 W). The 112 W and 130 W profiles and the overclock warning are unchanged.
+- **Tuning** `/tuning` — auto tuner, live clock and voltage (3600 mV is still rejected), plus the older PD / hashrate / fan-thermostat sections.
+- **Fan** and **Fan Curve** `/fan` — mode, duty 0–100, and the outlet-temperature curve (2–8 points).
+- **Pool** `/pool` — the multi-pool editor. The old single-pool form is not repeated.
+- **Display** `/display` — the LCD theme.
 
 ## Pool page
 
