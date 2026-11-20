@@ -11,7 +11,7 @@ use std::collections::{HashMap, VecDeque};
 use axum::{
     Json, Router,
     http::StatusCode,
-    response::{Html, IntoResponse, Redirect},
+    response::{Html, IntoResponse},
     routing,
 };
 use serde_json::{Value, json};
@@ -31,6 +31,10 @@ const LED_HTML: &str = include_str!("../../assets/led.html");
 /// `/dashboard` for the same reason `/led` is -- a standing config surface
 /// rather than a telemetry view.
 const TUNING_HTML: &str = include_str!("../../assets/tuning.html");
+const POOL_HTML: &str = include_str!("../../assets/pool.html");
+const POWER_HTML: &str = include_str!("../../assets/power.html");
+const FAN_HTML: &str = include_str!("../../assets/fan.html");
+const DISPLAY_HTML: &str = include_str!("../../assets/display.html");
 /// Network firmware updater (upload mujina-minerd or the harness binary,
 /// applied immediately with a reboot) -- separate from `/dashboard` for
 /// the same reason `/led`/`/pool` are.
@@ -95,6 +99,9 @@ pub fn routes() -> Router<SharedState> {
         .route("/led", routing::get(serve_led_page))
         .route("/pool", routing::get(serve_pool_page))
         .route("/tuning", routing::get(serve_tuning_page))
+        .route("/power", routing::get(serve_power_page))
+        .route("/fan", routing::get(serve_fan_page))
+        .route("/display", routing::get(serve_display_page))
         .route("/firmware", routing::get(serve_firmware_page))
         .route("/nano3s-detail", routing::get(serve_nano3s_detail))
         .route("/mujina-head-mark.svg", routing::get(serve_logo_svg))
@@ -168,9 +175,20 @@ async fn serve_led_page() -> impl IntoResponse {
     Html(LED_HTML)
 }
 
-/// Pool settings now live on the dashboard; keep old bookmarks working.
 async fn serve_pool_page() -> impl IntoResponse {
-    Redirect::temporary("/dashboard#pool")
+    Html(POOL_HTML)
+}
+
+async fn serve_power_page() -> impl IntoResponse {
+    Html(POWER_HTML)
+}
+
+async fn serve_fan_page() -> impl IntoResponse {
+    Html(FAN_HTML)
+}
+
+async fn serve_display_page() -> impl IntoResponse {
+    Html(DISPLAY_HTML)
 }
 
 async fn serve_tuning_page() -> impl IntoResponse {

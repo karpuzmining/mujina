@@ -1073,14 +1073,14 @@
 
   <div class="menubar" id="menubar">
     <a class="menubtn on" data-menu="dashboard" href="/dashboard">Dashboard</a>
-    <button type="button" class="menubtn" data-menu="power" style="display:none">Power</button>
+    <a class="menubtn" data-menu="power" href="/power" style="display:none">Power</a>
     <a class="menubtn" data-menu="tuning" href="/tuning" style="display:none">Tuning</a>
-    <button type="button" class="menubtn" data-menu="fan" style="display:none">Fan</button>
-    <button type="button" class="menubtn" data-menu="curve" style="display:none">Fan Curve</button>
-    <button type="button" class="menubtn" data-menu="pool" style="display:none">Pool</button>
+    <a class="menubtn" data-menu="fan" href="/fan" style="display:none">Fan</a>
+    <a class="menubtn" data-menu="curve" href="/fan#curve" style="display:none">Fan Curve</a>
+    <a class="menubtn" data-menu="pool" href="/pool" style="display:none">Pool</a>
     <a class="menubtn" data-menu="led" href="/led">LED</a>
     <a class="menubtn" data-menu="firmware" href="/firmware" style="display:none">Firmware</a>
-    <button type="button" class="menubtn" data-menu="display">Display</button>
+    <a class="menubtn" data-menu="display" href="/display">Display</a>
     <a class="menubtn" data-menu="info" href="/info">Info</a>
   </div>
   <div class="sysnotice" id="sysNotice" style="display:none"></div>
@@ -1090,251 +1090,17 @@
     <span id="alertText">⚠️ Thermal Warning: ASIC temperature elevated</span>
   </div>
 
-  <div class="modal menusheet" id="menu-power">
-    <div class="sheet">
-      <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
-      <h2>Power</h2>
-  <!-- Power Controls -->
-  <div class="sec">Power Controls<span class="sec-sub">Idle the chain, restart the miner or reboot the device</span></div>
-  <div class="card" style="max-width:560px">
-    <div style="display:flex;gap:10px;flex-wrap:wrap">
-      <button class="btn pri wbtn" id="pauseBtn" style="display:none;flex:1;min-width:160px">PAUSE MINING</button>
-      <button class="btn wbtn" id="rebootBtn" style="display:none;flex:1;min-width:160px;border-color:var(--mag);color:var(--mag)">REBOOT DEVICE</button>
-      <button class="btn wbtn" id="restartBtn" style="display:none;flex:1;min-width:160px;border-color:var(--mag);color:var(--mag)">RESTART MINER</button>
-    </div>
-    <small style="color:var(--dim);display:block;margin-top:10px">
-      Pause idles the chain live (no reboot, ~5-10s to take effect, safe while mining).
-      Reboot restarts the whole device; Restart miner restarts only the mining process.
-    </small>
-    <div class="msg" id="powerMsg"></div>
-  </div>
+    <!-- Power controls live on /power. -->
 
-  <!-- PSU Delivery & Overclock -->
-  <div class="sec" id="psuDeliverySec" style="margin-top:18px">Power Delivery & Overclock<span class="sec-sub">Input power supply limits & continuous VRM headroom</span></div>
-  <div class="card" id="psuDeliveryCard" style="max-width:560px">
-    <div class="note" id="psuCurStatus">Detecting power supply contract…</div>
-    <div class="row" style="margin-top:10px">
-      <label for="psuModeSelect">Power Profile</label>
-      <select id="psuModeSelect" style="background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit">
-        <option value="stock">Standard USB-PD (112W Safe · 80% duty)</option>
-        <option value="aggressive">Aggressive PD (130W · Canaan High Match)</option>
-        <option value="custom">Mean Well / Custom DC (Overclock Bypass)</option>
-      </select>
-    </div>
-    <div class="row" id="psuCustomRow" style="display:none;margin-top:10px">
-      <label for="psuCustomInput">Board Power Ceiling <small style="color:var(--dim)">Watts (50–140W)</small></label>
-      <input type="number" id="psuCustomInput" name="psu_power_w" min="50" max="140" step="1" value="135" autocomplete="off" style="width:90px">
-    </div>
-    <div id="psuOverclockWarning" style="display:none;margin-top:12px;padding:10px 12px;border-radius:8px;background:rgba(255,170,0,0.12);border:1px solid rgba(255,170,0,0.3);color:var(--amber,#ffaa00);font-size:12px;line-height:1.4">
-      ⚠️ <strong>Overclock / Headroom Warning:</strong> Exceeds the standard 80% USB-PD continuous duty rating. Requires a high-grade 140W+ GaN adapter or a dedicated Mean Well DC power supply (e.g. 24–28V via XT30). Board VRM ceiling (140W) and thermal trip backstops remain permanently enforced.
-    </div>
-    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:14px">
-      <button class="btn pri wbtn" id="psuApplyBtn" type="button">Apply Power Profile</button>
-    </div>
-    <div class="msg" id="psuMsg"></div>
-  </div>
+<!-- Tuning controls live on /tuning. -->
 
-    </div>
-  </div>
+  <!-- Fan and fan curve live on /fan. -->
 
-  <div class="modal menusheet" id="menu-tuning">
-    <div class="sheet">
-      <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
-      <h2>Tuning</h2>
-      <div class="boardtabs" id="tuneBoardTabs" style="display:none;margin:10px 0 14px 0"></div>
-      <div class="note" id="powerLine" style="display:none"></div>
-      <div class="note" id="tuningNone" style="display:none">No tuning controls for this board.</div>
-      <div id="ownSection" style="display:none">
-      <div class="modalsec" style="margin-top:12px">Auto Tuner</div>
-      <div id="ownCur">tuner status loading&hellip;</div>
-      <div class="row">
-        <label for="ownProfile">Profile</label>
-        <select id="ownProfile" style="background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit">
-          <option value="off">Off</option>
-          <option value="quiet">Quiet</option>
-          <option value="efficient">Efficient</option>
-          <option value="balanced">Balanced</option>
-          <option value="max_hash">Max hash</option>
-          <option value="target">Target (power / hashrate)</option>
-        </select>
-      </div>
-      <div id="ownTargetRows" style="display:none">
-        <div class="row">
-          <label>Target</label>
-          <div class="seg" id="ownTargetAxis">
-            <button type="button" class="segbtn active" data-axis="power">Power (W)</button>
-            <button type="button" class="segbtn" data-axis="hashrate">Hashrate (TH/s)</button>
-          </div>
-        </div>
-        <div class="row">
-          <label for="ownTargetVal">Value <small style="color:var(--dim)" id="ownTargetUnit">W</small></label>
-          <input type="number" id="ownTargetVal" name="tuner_target_value" min="20" max="200" step="1" placeholder="e.g. 115" autocomplete="off">
-        </div>
-        <div class="note" id="ownTargetNote"></div>
-      </div>
-      <div class="toggle-row" id="ownContinuousRow" style="margin-top:10px">
-        <div class="toggle-label-wrap">
-          <label for="ownContinuous" class="toggle-label">Continuous Tuning</label>
-          <small>
-            Disabled: warms up &amp; tunes board, optimizes individual chips, then locks in.<br>
-            Enabled: continuously re-tunes as cooling, fan speeds, or ambient temps change.
-          </small>
-        </div>
-        <div class="toggle-ctrl">
-          <span id="ownContinuousState">OFF</span>
-          <label class="switch" for="ownContinuous">
-            <input type="checkbox" id="ownContinuous" name="tuner_continuous" autocomplete="off">
-            <span class="slider"></span>
-          </label>
-        </div>
-      </div>
-      <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:8px">
-        <button class="btn pri wbtn" id="ownApply" type="button">Apply</button>
-      </div>
-      <div class="msg" id="ownMsg"></div>
-      <div class="note">Using any Live Tuning control below switches the auto tuner off.</div>
-      </div>
+<!-- Pool controls live on /pool. -->
 
-  <div id="manualSection" style="display:none">
-  <div class="sec">Live Tuning<span class="sec-sub">clock frequency &amp; core voltage</span></div>
-  <div class="card" style="max-width:560px">
-    <div class="row" id="tunePresetRow">
-      <label for="tunePreset">Mode</label>
-      <select id="tunePreset" style="background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit">
-        <option value="custom">Custom</option>
-        <option value="210,230,250,270">LOW — 210-270MHz</option>
-        <option value="338,358,378,398" selected>MED — 338-398MHz</option>
-        <option value="420,440,460,480">HIGH — 420-480MHz</option>
-      </select>
-      <small style="color:var(--dim);display:block;margin-top:4px">
-        Real per-mode values from this device's own <code>/data/factory/hashrate_cali.ini</code> —
-        selecting a mode sets frequency, voltage, <em>and</em> power target together.
-      </small>
-    </div>
-    <div class="row">
-      <label for="tuneFreq">Base Frequency <small style="color:var(--dim)">MHz (domains step +20 each)</small></label>
-      <input type="number" id="tuneFreq" name="manual_base_freq_mhz" min="100" max="520" step="1" value="338" autocomplete="off">
-    </div>
-    <div class="row">
-      <label for="tuneVolt">Core Voltage <small style="color:var(--dim)">mV</small></label>
-      <input type="number" id="tuneVolt" name="manual_core_voltage_mv" min="3300" max="3912" step="1" value="3704" autocomplete="off">
-    </div>
-    <div class="row" id="tunePowerRow">
-      <label for="tunePowerTarget">Power Target <small style="color:var(--dim)">W (power-target loop, blank = leave unchanged)</small></label>
-      <input type="number" id="tunePowerTarget" name="manual_power_target_w" min="20" max="130" step="0.1" value="95" autocomplete="off">
-    </div>
-    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:4px">
-      <button class="btn pri wbtn" id="tuneApply">Apply Mode</button>
-    </div>
-    <div class="msg" id="tuneMsg"></div>
-  </div>
-  </div>
+  <!-- Display controls live on /display. -->
 
-    </div>
-  </div>
-
-  <div class="modal menusheet" id="menu-fan">
-    <div class="sheet">
-      <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
-      <h2>Fan</h2>
-      <div class="boardtabs" id="fanBoardTabs" style="display:none;margin:10px 0 14px 0"></div>
-  <div id="fanSection" style="display:none">
-  <!-- Fan Control -->
-  <div class="sec">Fan Control<span class="sec-sub" id="fanNote"></span></div>
-  <div class="card" style="max-width:560px">
-    <div class="row">
-      <label for="fanMode">Mode</label>
-      <select id="fanMode" style="background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit">
-        <option value="auto" selected>Auto (curve + chip-limit escalation)</option>
-        <option value="manual">Manual</option>
-      </select>
-    </div>
-    <div class="row" id="fanManualRow" style="display:none">
-      <label for="fanDuty">Fan Duty <small style="color:var(--dim)">% (0-100, no floor)</small></label>
-      <input type="number" id="fanDuty" name="fan_duty_percent" min="0" max="100" step="1" value="50" autocomplete="off">
-    </div>
-    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:4px">
-      <button class="btn pri wbtn" id="fanApply">Apply</button>
-    </div>
-    <div class="msg" id="fanMsg"></div>
-  </div>
-  </div>
-
-    </div>
-  </div>
-
-  <div class="modal menusheet" id="menu-curve">
-    <div class="sheet">
-      <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
-      <h2>Fan Curve</h2>
-  <div id="curveSection" style="display:none">
-  <!-- Fan Curve -->
-  <div class="sec">Fan Curve<span class="sec-sub">Outlet-temp → duty% baseline, used in Auto mode — saved immediately, applied within ~1s</span></div>
-  <div class="card" style="max-width:560px">
-    <svg id="curvePreview" viewBox="0 0 300 120" style="width:100%;height:120px;display:block;margin-bottom:10px;background:var(--panel2);border:1px solid var(--line);border-radius:6px">
-      <g id="curveGrid" stroke="var(--line)" stroke-width="1"></g>
-      <polyline id="curveLine" fill="none" stroke="var(--cyan)" stroke-width="2"></polyline>
-      <g id="curveDots" fill="var(--cyan)"></g>
-    </svg>
-    <div id="curvePoints"></div>
-    <div style="display:flex;gap:10px;justify-content:space-between;margin-top:10px">
-      <button class="btn" id="curveAddPoint">+ Add Point</button>
-      <button class="btn pri wbtn" id="curveApply">Save Curve</button>
-    </div>
-    <div class="msg" id="curveMsg"></div>
-  </div>
-  </div>
-
-    </div>
-  </div>
-
-  <div class="modal menusheet" id="menu-pool">
-    <div class="sheet">
-      <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
-      <h2>Pool</h2>
-  <div class="sec" id="pool">Pool Settings<span class="sec-sub" id="poolApplyNote">saved immediately</span></div>
-  <div class="card" id="poolCard" style="max-width:560px">
-    <div class="prow">
-      <label for="poolUrl">Pool URL</label>
-      <input type="text" id="poolUrl" name="pool_url" placeholder="stratum+tcp://pool.example.com:3333" autocomplete="off" autocapitalize="off" spellcheck="false">
-    </div>
-    <div class="prow">
-      <label for="poolUser">Worker <small>(usually address.workername)</small></label>
-      <input type="text" id="poolUser" name="pool_user" placeholder="bc1q....worker1" autocomplete="off" autocapitalize="off" spellcheck="false">
-    </div>
-    <div class="prow">
-      <label for="poolPass">Password <small>(blank keeps current; most pools ignore it)</small></label>
-      <input type="password" id="poolPass" name="pool_password" placeholder="unchanged" autocomplete="new-password">
-    </div>
-    <div class="pacts">
-      <button class="btn pri wbtn" id="poolSave">Save</button>
-      <button class="btn" id="poolReboot" data-apply="restart" style="display:none;border-color:var(--mag);color:var(--mag)">Restart now</button>
-    </div>
-    <div class="msg" id="poolMsg"></div>
-  </div>
-
-    </div>
-  </div>
-
-  <div class="modal menusheet" id="menu-display">
-    <div class="sheet">
-      <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
-      <h2>Display</h2>
-      <div class="sec">Theme<span class="sec-sub">synced with unit LCD</span></div>
-      <div class="card" style="max-width:560px">
-        <div class="row">
-          <label for="uitheme">Visual Theme</label>
-          <select id="uitheme" style="background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit">
-            <option value="cyberpunk">Cyberpunk Neon</option>
-            <option value="minimal">Minimal</option>
-            <option value="parasite">Parasite Retro B&amp;W</option>
-          </select>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="sec">Fleet Overview<span class="sec-sub" id="fleetsub"></span></div>
+<div class="sec">Fleet Overview<span class="sec-sub" id="fleetsub"></span></div>
   
   <!-- Fleet Board Summary Cards -->
   <div class="board-summary-grid" id="boardSummaryGrid" style="display:none"></div>
@@ -1500,7 +1266,7 @@ const fx = (v, u, d = 2) => v == null ? '—' : (+v).toFixed(d) + ' <small>' + u
 function show(e, on) { if (typeof e === 'string') e = $(e); if (e) e.style.display = on ? '' : 'none'; }
 function mk(tag, cls, text) { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; }
 function safeUrl(u) { return typeof u === 'string' && u.charAt(0) === '/' && u.charAt(1) !== '/'; }
-function setMsg(id, text, ok) { const m = $(id); m.textContent = text; m.className = ok ? 'msg ok' : 'msg'; }
+function setMsg(id, text, ok) { const m = $(id); if (!m) return; m.textContent = text; m.className = ok ? 'msg ok' : 'msg'; }
 
 let SYS = null;                 // last good /api/v0/system document
 let LAST = null, ACTIVE_NAME = null, CHIP_FILTER = 'all';
@@ -1797,15 +1563,21 @@ function applySystem() {
     if (pw.psu_contract_w != null) parts.push('PSU contract ' + pw.psu_contract_w + ' W');
     if (pw.ceiling_w != null) parts.push('power ceiling ' + pw.ceiling_w + ' W');
     if (pw.shared_rail) parts.push('shared rail');
-    $('powerLine').textContent = parts.join(' · ');
-    show('powerLine', parts.length > 0);
+    if ($('powerLine')) {
+      $('powerLine').textContent = parts.join(' · ');
+      show('powerLine', parts.length > 0);
+    }
     const how = (SYS.pool && SYS.pool.apply) || 'restart';
-    $('poolApplyNote').textContent = how === 'live' ? 'saved immediately and applied live'
-      : how === 'reboot' ? 'saved immediately, applied after a device reboot'
-      : 'saved immediately, applied after the miner restarts';
+    if ($('poolApplyNote')) {
+      $('poolApplyNote').textContent = how === 'live' ? 'saved immediately and applied live'
+        : how === 'reboot' ? 'saved immediately, applied after a device reboot'
+        : 'saved immediately, applied after the miner restarts';
+    }
     const pr = $('poolReboot');
-    pr.textContent = how === 'reboot' ? 'Reboot now' : 'Restart now';
-    pr.dataset.apply = how;
+    if (pr) {
+      pr.textContent = how === 'reboot' ? 'Reboot now' : 'Restart now';
+      pr.dataset.apply = how;
+    }
   } else {
     show(badge, false);
     show('rebootBtn', false); show('restartBtn', false);
@@ -1827,7 +1599,7 @@ function applyBoardCaps() {
     : !!(LAST && LAST.boards && LAST.boards.some(x => x.outlet_c != null));
   show('fcOutlet', anyOutlet);
   const tuner = !!(caps && safeUrl(caps.tuner)), manual = !!(caps && safeUrl(caps.manual_tuning));
-  show('ownSection', tuner);
+  if ($('ownSection')) show('ownSection', tuner);
   show('tunerCard', tuner);
   const pcElem = $('at-per-chip');
   const contChk = $('ownContinuous');
@@ -1837,19 +1609,24 @@ function applyBoardCaps() {
   } else {
     if (contChk) { contChk.disabled = false; syncContinuousUI(); }
   }
-  show('manualSection', manual);
-  show('tuningNone', !!SYS && !tuner && !manual);
+  if ($('manualSection')) show('manualSection', manual);
+  if ($('tuningNone')) show('tuningNone', !!SYS && !tuner && !manual);
   const nano = hasCeiling();
-  show('tunePresetRow', nano); show('tunePowerRow', nano); $('tuneFreq').min = nano ? 100 : 50; $('tuneFreq').max = nano ? 520 : 1200;
-  $('tuneVolt').min = nano ? 3300 : 500; $('tuneVolt').max = nano ? 3912 : 1600;
+  if ($('tuneFreq') && $('tuneVolt')) {
+    show('tunePresetRow', nano); show('tunePowerRow', nano);
+    $('tuneFreq').min = nano ? 100 : 50; $('tuneFreq').max = nano ? 520 : 1200;
+    $('tuneVolt').min = nano ? 3300 : 500; $('tuneVolt').max = nano ? 3912 : 1600;
+  }
   const fan = caps ? caps.fan : 'none';
-  show('fanSection', !!SYS && fan && fan !== 'none');
-  $('fanNote').textContent = fan === 'harness'
-    ? 'Controlled by the device harness: Auto follows the fan curve (and escalates to 100% if a chip runs too hot); Manual holds a fixed duty.'
-    : 'Board fan: Auto lets the board regulate temperature; Manual holds a fixed duty.';
-  show('curveSection', !!(caps && caps.fan_curve));
-  if (caps && caps.fan_curve && CURVE_FOR !== name) { CURVE_FOR = name; loadCurve(); }
-  if (b && nano === false && TUNE_FOR !== name) {
+  if ($('fanNote')) {
+    show('fanSection', !!SYS && fan && fan !== 'none');
+    $('fanNote').textContent = fan === 'harness'
+      ? 'Controlled by the device harness: Auto follows the fan curve (and escalates to 100% if a chip runs too hot); Manual holds a fixed duty.'
+      : 'Board fan: Auto lets the board regulate temperature; Manual holds a fixed duty.';
+    show('curveSection', !!(caps && caps.fan_curve));
+    if (caps && caps.fan_curve && $('curvePoints') && CURVE_FOR !== name) { CURVE_FOR = name; loadCurve(); }
+  }
+  if ($('tuneFreq') && b && nano === false && TUNE_FOR !== name) {
     TUNE_FOR = name;
     if (b.freq_mhz != null) $('tuneFreq').value = Math.round(b.freq_mhz);
     if (b.core_v != null) $('tuneVolt').value = Math.round(b.core_v * 1000);
@@ -2295,10 +2072,12 @@ async function pollDetail() {
       if (!pauseBusy) {
         PAUSED = nd.paused;
         const btn = $('pauseBtn');
-        btn.textContent = PAUSED ? 'RESUME MINING' : 'PAUSE MINING';
-        btn.classList.toggle('pri', !PAUSED);
-        btn.style.borderColor = PAUSED ? 'var(--amber)' : '';
-        btn.style.color = PAUSED ? 'var(--amber)' : '';
+        if (btn) {
+          btn.textContent = PAUSED ? 'RESUME MINING' : 'PAUSE MINING';
+          btn.classList.toggle('pri', !PAUSED);
+          btn.style.borderColor = PAUSED ? 'var(--amber)' : '';
+          btn.style.color = PAUSED ? 'var(--amber)' : '';
+        }
       }
     }
   } catch (e) {
@@ -2495,6 +2274,7 @@ const restartMiner = () => powerAction('/api/v0/restart', 'restartBtn', 'powerMs
 
 // ---- PSU Overclock & Power Delivery ----
 async function loadPsuConfig() {
+  if (!$('psuModeSelect')) return;
   const name = activeName();
   if (!name) return;
   try {
@@ -2583,6 +2363,7 @@ async function applyPsuProfile() {
 
 // ---- Pool ----
 async function loadPool() {
+  if (!$('poolUrl')) return;
   try {
     const r = await fetch('/api/v0/pool');
     if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -2665,6 +2446,7 @@ function setTargetAxis(axis) {
         : '');
 }
 function syncTargetMode() {
+  if (!$('ownProfile')) return;
   const isTarget = $('ownProfile').value === 'target';
   $('ownTargetRows').style.display = isTarget ? '' : 'none';
   if (isTarget) setTargetAxis(TARGET_AXIS);
@@ -2685,8 +2467,8 @@ function renderOwnerTune(o) {
     const sp = pt(o.setpoint) || (o.frequency_mhz != null ? { f: o.frequency_mhz, v: o.core_voltage_mv } : null);
     if (sp && sp.f != null) ownTxt += ' · set ' + Math.round(sp.f) + ' MHz' + (sp.v != null ? ' @ ' + sp.v + ' mV' : '');
   }
-  $('ownCur').textContent = 'Current: ' + ownTxt;
-  if (!OWN_SYNCED) {
+  if ($('ownCur')) $('ownCur').textContent = 'Current: ' + ownTxt;
+  if ($('ownProfile') && !OWN_SYNCED) {
     if (o.enabled && o.target) {
       $('ownProfile').value = 'target';
       TARGET_AXIS = o.target.axis;
@@ -2894,11 +2676,6 @@ function openMenu(key) {
   const b = document.querySelector('.menubtn[data-menu="' + key + '"]');
   if (b) b.classList.add('on');
   if (key === 'power') loadPsuConfig();
-  if (key === 'tuning') {
-    renderModalBoardTabs('tuneBoardTabs');
-    applyBoardCaps();
-    pollOwnerTune();
-  }
   if (key === 'fan') {
     renderModalBoardTabs('fanBoardTabs');
     applyBoardCaps();
@@ -2906,10 +2683,8 @@ function openMenu(key) {
 }
 function openFromHash() {
   const h = location.hash.replace(/^#/, '');
-  if (['power', 'tuning', 'fan', 'curve', 'pool', 'display'].includes(h)) {
-    openMenu(h);
-    try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
-  }
+  const go = { tuning: '/tuning', pool: '/pool', power: '/power', fan: '/fan', curve: '/fan#curve', display: '/display' };
+  if (go[h]) { location.replace(go[h]); return; }
 }
 
 // ---- wiring ----
@@ -2930,23 +2705,23 @@ document.querySelectorAll('.menusheet').forEach(m => m.addEventListener('click',
 }));
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeMenus(); });
 window.addEventListener('hashchange', openFromHash);
-$('tunePreset').addEventListener('change', syncTunePreset);
-$('tuneApply').addEventListener('click', applyTuning);
-$('fanMode').addEventListener('change', syncFanMode);
-$('fanApply').addEventListener('click', applyFan);
-$('curveAddPoint').addEventListener('click', addCurvePoint);
-$('curveApply').addEventListener('click', applyCurve);
-$('pauseBtn').addEventListener('click', togglePause);
-$('rebootBtn').addEventListener('click', rebootDevice);
-$('restartBtn').addEventListener('click', restartMiner);
-$('psuModeSelect').addEventListener('change', syncPsuMode);
-$('psuApplyBtn').addEventListener('click', applyPsuProfile);
-$('poolSave').addEventListener('click', savePool);
-$('poolReboot').addEventListener('click', poolApplyNow);
-$('ownApply').addEventListener('click', applyOwner);
-$('ownProfile').addEventListener('change', syncTargetMode);
+if ($('tunePreset')) $('tunePreset').addEventListener('change', syncTunePreset);
+if ($('tuneApply')) $('tuneApply').addEventListener('click', applyTuning);
+if ($('fanMode')) $('fanMode').addEventListener('change', syncFanMode);
+if ($('fanApply')) $('fanApply').addEventListener('click', applyFan);
+if ($('curveAddPoint')) $('curveAddPoint').addEventListener('click', addCurvePoint);
+if ($('curveApply')) $('curveApply').addEventListener('click', applyCurve);
+if ($('pauseBtn')) $('pauseBtn').addEventListener('click', togglePause);
+if ($('rebootBtn')) $('rebootBtn').addEventListener('click', rebootDevice);
+if ($('restartBtn')) $('restartBtn').addEventListener('click', restartMiner);
+if ($('psuModeSelect')) $('psuModeSelect').addEventListener('change', syncPsuMode);
+if ($('psuApplyBtn')) $('psuApplyBtn').addEventListener('click', applyPsuProfile);
+if ($('poolSave')) $('poolSave').addEventListener('click', savePool);
+if ($('poolReboot')) $('poolReboot').addEventListener('click', poolApplyNow);
+if ($('ownApply')) $('ownApply').addEventListener('click', applyOwner);
+if ($('ownProfile')) $('ownProfile').addEventListener('change', syncTargetMode);
 document.querySelectorAll('#ownTargetAxis .segbtn').forEach(b => b.addEventListener('click', () => setTargetAxis(b.dataset.axis)));
-$('ownContinuous').addEventListener('change', () => {
+if ($('ownContinuous')) $('ownContinuous').addEventListener('change', () => {
   USER_EDITING_CONTINUOUS = true;
   syncContinuousUI();
 });
@@ -2972,11 +2747,11 @@ $('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(b => {
 });
 
 const themeSel = $('uitheme');
-themeSel.value = themeNow();
+if (themeSel) themeSel.value = themeNow();
 let LAST_THEME_PUSH_MS = 0;
 function applyThemeSelection(t, pushToUnit) {
   if (THEMES.indexOf(t) < 0) t = 'cyberpunk';
-  themeSel.value = t;
+  if (themeSel) themeSel.value = t;
   try { localStorage.setItem('mujina-theme', t); } catch (e) { /* storage blocked */ }
   document.body.className = 'theme-' + t;
   if (LAST) render(LAST);
@@ -2989,7 +2764,7 @@ function applyThemeSelection(t, pushToUnit) {
     }).catch(() => {});
   }
 }
-themeSel.addEventListener('change', () => applyThemeSelection(themeSel.value, true));
+if (themeSel) themeSel.addEventListener('change', () => applyThemeSelection(themeSel.value, true));
 async function loadDisplayTheme() {
   try {
     const r = await fetch('/api/v0/display');
