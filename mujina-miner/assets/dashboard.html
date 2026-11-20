@@ -1074,7 +1074,7 @@
   <div class="menubar" id="menubar">
     <a class="menubtn on" data-menu="dashboard" href="/dashboard">Dashboard</a>
     <button type="button" class="menubtn" data-menu="power" style="display:none">Power</button>
-    <button type="button" class="menubtn" data-menu="tuning" style="display:none">Tuning</button>
+    <a class="menubtn" data-menu="tuning" href="/tuning" style="display:none">Tuning</a>
     <button type="button" class="menubtn" data-menu="fan" style="display:none">Fan</button>
     <button type="button" class="menubtn" data-menu="curve" style="display:none">Fan Curve</button>
     <button type="button" class="menubtn" data-menu="pool" style="display:none">Pool</button>
@@ -2919,6 +2919,8 @@ document.querySelectorAll('.menubtn').forEach(b => b.addEventListener('click', (
     closeMenus();
     return;
   }
+  const href = b.getAttribute && b.getAttribute('href');
+  if (href && href.charAt(0) === '/' && href.indexOf('#') < 0) return;
   if (b.dataset.menu && document.getElementById('menu-' + b.dataset.menu)) {
     openMenu(b.dataset.menu);
   }
