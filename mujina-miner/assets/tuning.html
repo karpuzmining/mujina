@@ -503,6 +503,7 @@
       <a href="#pd-input">USB-C PD</a>
       <a href="#hashrate-autotune">Hashrate</a>
       <a href="#fan-thermostat">Fan thermostat</a>
+      <a href="#diagnostics">Diagnostics</a>
       <a href="#per-chip">Per-chip</a>
     </nav>
   </div>
@@ -647,6 +648,12 @@
     </div>
     <div class="msg" id="fanThermMsg"></div>
     <p class="hint" style="margin-top:14px">A true emergency (chip temp still reaching the active mode's real safety limit despite the thermostat) always forces 100% fan, bypassing this target.</p>
+  </div>
+  <div class="sec" id="diagnostics">Diagnostics<span class="sec-sub">chain, chips, SmartSpeed, rail</span></div>
+  <div class="card" id="diagCard">
+    <p id="diagSummary">Waiting for chain telemetry.</p>
+    <p id="diagPower"></p>
+    <div id="diagErrors" class="hint"></div>
   </div>
   <div class="sec" id="per-chip">Per-chip clocks<span class="sec-sub">12× A3197S, one shared rail</span></div>
   <div class="card">
@@ -901,7 +908,31 @@ async function loadChips() {
   try {
     const r = await fetch('/nano3s-detail');
     if (!r.ok) throw new Error('HTTP ' + r.status);
-    renderChips(await r.json(), phase);
+    const detail = await r.json();
+    renderChips(detail, phase);
+    const hot = (detail.chips || []).reduce((m, c) => Math.max(m, +c.temp_c || 0), 0);
+    const worst = (detail.chips || []).reduce((m, c) => Math.max(m, +c.spd_dh || 0), 0);
+    const n = detail.asics_total || (detail.chips || []).length;
+    if ($('diagSummary')) {
+      $('diagSummary').textContent = (detail.ipc_connected ? 'chain up' : 'chain down')
+        + ' · ' + n + ' chips · hottest ' + (hot ? hot.toFixed(1) + ' °C' : '—')
+        + ' · worst fail ' + (worst ? worst.toFixed(1) + '%' : '—')
+        + ' · nameplate ' + (detail.ghsmm != null ? detail.ghsmm + ' GH/s' : '—')
+        + ' · measured ' + (detail.ghsspd != null ? detail.ghsspd + ' GH/s' : '—');
+    }
+    if ($('diagPower')) {
+      const w = detail.ina_power_w;
+      $('diagPower').textContent = 'Input ' + (w > 0 ? w.toFixed(1) + ' W' : 'sensor unavailable or estimated on the overview')
+        + (detail.ina_bus_v > 1 ? ' · ' + detail.ina_bus_v.toFixed(2) + ' V' : '')
+        + (detail.ina_current_a > 0 ? ' · ' + detail.ina_current_a.toFixed(2) + ' A' : '');
+    }
+    if ($('diagErrors')) {
+      $('diagErrors').textContent = 'crc ' + (detail.err_crc || 0)
+        + ' · nonce ' + (detail.nonce_read_err || 0)
+        + ' · bad len ' + (detail.nonce_bad_len || 0)
+        + ' · overflow ' + (detail.nonce_overflow || 0)
+        + ' · regread ' + (detail.regread_err || 0);
+    }
   } catch (e) {
     if (!$('chipBody').children.length) {
       $('chipMsg').textContent = 'per-chip telemetry unavailable: ' + e;
