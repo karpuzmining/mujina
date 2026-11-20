@@ -1055,7 +1055,11 @@ async fn patch_board_fan(
     if !known {
         return Err(StatusCode::NOT_FOUND);
     }
-    if req.mode.is_none() && req.manual_duty_percent.is_none() && req.chip_temp_target_c.is_none() {
+    if req.mode.is_none()
+        && req.manual_duty_percent.is_none()
+        && req.chip_temp_target_c.is_none()
+        && req.immersion.is_none()
+    {
         return Err(StatusCode::BAD_REQUEST);
     }
     if let Some(t) = req.chip_temp_target_c
@@ -1088,6 +1092,10 @@ async fn patch_board_fan(
         }
         if let Some(t) = req.chip_temp_target_c {
             crate::board::nano3s::write_fan_control_command(&format!("fan_chip_temp_target:{t}"))
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        }
+        if let Some(on) = req.immersion {
+            crate::board::nano3s::set_immersion(on)
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         }
         Ok(StatusCode::OK)
