@@ -3112,7 +3112,7 @@ if (contRow) {
     }
   });
 }
-$('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(b => {
+if ($('chipFilterBtns')) $('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(b => {
   b.addEventListener('click', () => {
     $('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(x => x.classList.remove('active'));
     b.classList.add('active');
