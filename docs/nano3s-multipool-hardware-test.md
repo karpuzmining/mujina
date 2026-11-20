@@ -4,7 +4,7 @@ Test build `v5.1.0-multipool-test.3`. It is v5.1.0 plus in-process multi-pool, a
 
 SHA-256 of `nano-mujina-v5.1.0-multipool-test.3-bundle.bin`:
 
-`8f5afd422881364b6ca6fb6cd374a675a2fc707e3d2ca01b0e3179797b76f8c6`
+`73d428c90a2b453b3656d1472709ba82fce4da8f6a9821f09a1d726842fd5e6f`
 
 ## Install
 
