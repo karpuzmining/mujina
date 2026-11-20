@@ -1,0 +1,52 @@
+Mujina is licensed under the GNU General Public License version 3 or
+later. See LICENSE.
+
+This distribution includes code adapted from Canaan Creative's
+canaan_sdk_for_linux v1.1.2-alpha (commit 07fe73f, November 2026),
+which is licensed under the MIT License. Copyright (c) 2026, Canaan
+Creative Co., Ltd.
+
+The MIT-licensed portions are:
+
+  rtos_core/src/pll_cpm_table.c
+  rtos_core/include/pll_cpm_table.h
+  mujina-miner/src/board/a3197s.rs
+  mujina-miner/src/board/a3197s_cpm_table.inc.rs
+
+and the PLL programming order in rtos_core/src/asic_pll.c plus the PVT
+temperature and voltage formulas in rtos_core/src/pvt_sensor.c. Those
+were ported from:
+
+  apps/miner/hal/asic/a3197s/a3197s_cpm_table.c
+  apps/miner/hal/asic/a3197s/a3197s_pll.c
+  apps/miner/hal/asic/a3197s/a3197s_pll_seq.c
+  apps/miner/hal/asic/a3197s/a3197s_pvt.c
+
+of https://github.com/Canaan-Creative/canaan_sdk_for_linux
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+The combined work is distributed under GPL-3.0-or-later. The MIT
+notice above is preserved as required by that license. Nothing from
+Avalon_mm (BUSL-1.1), Canaan debug-image credentials, or Canaan's OTA
+signing key is included.

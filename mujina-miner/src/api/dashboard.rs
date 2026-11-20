@@ -9,12 +9,12 @@
 use std::collections::{HashMap, VecDeque};
 
 use axum::{
-    Json,
+    Json, Router,
     http::StatusCode,
     response::{Html, IntoResponse, Redirect},
-    routing, Router,
+    routing,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::server::SharedState;
 use crate::api_client::types::BoardTelemetry;
@@ -114,7 +114,10 @@ async fn serve_auth_js() -> impl IntoResponse {
 
 async fn serve_page() -> impl IntoResponse {
     (
-        [(axum::http::header::CACHE_CONTROL, "no-store, no-cache, must-revalidate")],
+        [(
+            axum::http::header::CACHE_CONTROL,
+            "no-store, no-cache, must-revalidate",
+        )],
         Html(DASHBOARD_HTML),
     )
 }
@@ -142,7 +145,12 @@ async fn launch_doom() -> Json<Value> {
                echo doom > /mntapp/release/linux/app/fb_page; \
                cd /data && nohup ./nano3s_doom -iwad /data/doom1.wad -gfxmode rgb565 \
                > /data/nano3s_doom.log 2>&1 &";
-    match tokio::process::Command::new("sh").arg("-c").arg(cmd).output().await {
+    match tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .output()
+        .await
+    {
         Ok(out) if out.status.success() => Json(json!({"ok": true, "detail": "launched"})),
         Ok(out) => Json(json!({
             "ok": false,
@@ -189,9 +197,7 @@ async fn serve_nano3s_detail() -> Result<Json<Value>, StatusCode> {
     }
 }
 
-async fn serve_data(
-    axum::extract::State(state): axum::extract::State<SharedState>,
-) -> Json<Value> {
+async fn serve_data(axum::extract::State(state): axum::extract::State<SharedState>) -> Json<Value> {
     let m = state.miner_telemetry();
 
     // Fleet rate = sum of the boards' measured rates; the share-based miner
@@ -218,11 +224,7 @@ async fn serve_data(
         .unwrap_or_else(|e| e.into_inner())
         .push_fleet(fleet_ghs.unwrap_or(0.0));
 
-    let total_power: f64 = m
-        .boards
-        .iter()
-        .filter_map(|b| core_power_w(b))
-        .sum();
+    let total_power: f64 = m.boards.iter().filter_map(|b| core_power_w(b)).sum();
     let have_power = m.boards.iter().any(|b| core_power_w(b).is_some());
 
     let fan_rpms: Vec<f64> = boards
@@ -305,8 +307,14 @@ mod fleet_tests {
 
     #[test]
     fn fleet_is_the_sum_of_board_rates() {
-        assert_eq!(fleet_hashrate_ghs([Some(1000.0), Some(500.5), None].into_iter()), Some(1500.5));
-        assert_eq!(fleet_hashrate_ghs([Some(0.0), Some(2.0)].into_iter()), Some(2.0));
+        assert_eq!(
+            fleet_hashrate_ghs([Some(1000.0), Some(500.5), None].into_iter()),
+            Some(1500.5)
+        );
+        assert_eq!(
+            fleet_hashrate_ghs([Some(0.0), Some(2.0)].into_iter()),
+            Some(2.0)
+        );
     }
 
     #[test]
@@ -361,7 +369,16 @@ fn board_json(b: &BoardTelemetry, series: Vec<f64>) -> Value {
                 let chips: Vec<Value> = detail
                     .chips
                     .iter()
-                    .map(|c| json!({ "index": c.chip, "ghs": c.ghsspd, "temp_c": c.temp_c, "spd_dh": c.spd_dh }))
+                    .map(|c| {
+                        json!({
+                            "index": c.chip,
+                            "ghs": c.ghsspd,
+                            "temp_c": c.temp_c,
+                            "volt_mv": c.volt_mv,
+                            "spd_dh": c.spd_dh,
+                            "pll_mhz": c.pll_freq[0],
+                        })
+                    })
                     .collect();
                 (
                     chips,

@@ -3,13 +3,12 @@
 
 #include <stdint.h>
 
-/* Frequency(MHz)->PLL-register-code lookup table. This is factual
- * calibration data for the A3197S's PLL synthesizer, not project logic --
- * see pll_cpm_table.c's header comment for its licensing status. Kept in
- * its own translation unit, separate from asic_engine.c's control logic,
- * specifically so a notice on this file doesn't have to cover code that
- * doesn't need one. */
-#define PLL_TABLE_ROWS 293
+/* SPDX-License-Identifier: MIT
+ *
+ * Frequency (MHz) -> PLL L1 word. Official Canaan A3197S table,
+ * 349 rows, 15–600 MHz. See pll_cpm_table.c and NOTICE.
+ */
+#define PLL_TABLE_ROWS 349
 
 extern const uint32_t cpm_table[PLL_TABLE_ROWS][2];
 

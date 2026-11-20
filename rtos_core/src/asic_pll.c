@@ -1,12 +1,20 @@
 /*
- * A3197S PLL programming: MHz<->register-encoding table lookups, the
- * blocking one-second-per-step ramp, and a3197s_pll_apply() (formerly
- * asic_set_miner_pll()) -- the PLL0-3 register write sequence bracketed
- * by the SmartSpeed SS_CTRL PRE/MID/COMMIT handshake (see
- * asic_smartspeed.c's a3197s_smartspeed_set_ctrl()). The call sequence
- * and every register write below are unchanged from the pre-split
- * function; only the 3 repeated SS_CTRL+SPD_SYNC_CFG write pairs were
- * factored into a shared helper.
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * A3197S PLL programming.
+ *
+ * The write order in a3197s_set_pll_seq() is Canaan's a3197s_set_pll_seq
+ * (canaan_sdk_for_linux v1.1.2-alpha, commit 07fe73f,
+ * apps/miner/hal/asic/a3197s/a3197s_pll_seq.c, MIT). A wrong order or chip
+ * select can hang or damage the chips. See NOTICE.
+ *
+ * The ramp, per-chip offsets, and rolltime refresh around that sequence
+ * are this project's.
+ *
+ * Frequency words come from get_cpm_pll() (ceiling to the next official
+ * table row). Canaan's correct_freq() additionally snaps some integers
+ * down by 1 MHz (230 -> 229, 100 -> 99). That snap is not applied: it
+ * would move clocks already saved by AutoTune and the manual API.
  */
 
 #include <stdint.h>
@@ -60,11 +68,54 @@ static int pll_offsets_active(uint8_t miner_id)
 	return 0;
 }
 
+static uint32_t pll_clamp_freq(int32_t freq)
+{
+	if (freq < PLL_CHIP_MIN_MHZ)
+		return PLL_CHIP_MIN_MHZ;
+	if (freq > PLL_CHIP_MAX_MHZ)
+		return PLL_CHIP_MAX_MHZ;
+	return (uint32_t)freq;
+}
+
 static uint32_t pll_offset_freq(uint32_t base, int16_t offset)
 {
-	int32_t f = (int32_t)base + offset;
+	return pll_clamp_freq((int32_t)base + offset);
+}
 
-	return (uint32_t)(f < PLL_CHIP_MIN_MHZ ? PLL_CHIP_MIN_MHZ : f);
+/* SS_CTRL + SPD_SYNC, after selecting the chip this step is for. */
+static void pll_ss_write(uint8_t miner_id, uint16_t asic_id, uint32_t ss_ctrl)
+{
+	a3197s_select_chip(miner_id, asic_id);
+	a3197s_smartspeed_set_ctrl(miner_id, ss_ctrl);
+}
+
+/* Official lock check: log only. A mismatch does not abort the sequence. */
+static void pll_lock_check(uint8_t miner_id, uint16_t asic_id, const char *pll, uint32_t want)
+{
+	uint32_t cnt;
+
+	delay_ms(5);
+	if (asic_id == CHIP_ADDR_BROADCAST)
+		a3197s_select_chip(miner_id, 0);
+	cnt = a3197s_get_reg(miner_id, REG_SS_CORE_DIST);
+	if (cnt != want)
+		fprintf(stderr,
+			"board %u asic %u: %s did not lock (lock count 0x%08x, expected 0x%08x)\n",
+			miner_id, asic_id, pll, cnt, want);
+}
+
+/* Mux divider field: <400 -> 4, <600 -> 6, <800 -> 8, else 10. */
+static uint32_t pll_mux_word(uint32_t freq)
+{
+	uint32_t mode = 10;
+
+	if (freq < 400)
+		mode = 4;
+	else if (freq < 600)
+		mode = 6;
+	else if (freq < 800)
+		mode = 8;
+	return (DEFAULT_PLL_COMMIT & ~(0x0Fu << 21)) | (mode << 21);
 }
 
 /* Sets g_pll_state.set_pll[miner_id][0][0..3] and applies it via
@@ -119,31 +170,66 @@ void asic_ramp_pll_freq(uint8_t miner_id, uint16_t init_freq, uint16_t target_fr
 	}
 }
 
-/* The PLL write sequence for whatever chip (or broadcast) is selected. */
-static void pll_write_sequence(uint8_t miner_id, uint32_t freq0, uint32_t freq1,
-			       uint32_t freq2, uint32_t freq3)
+/*
+ * Official a3197s_set_pll_seq with pll0_update=1 (every running clock
+ * change retargets PLL0). pll0_update=0 parks PLL0 at init_freq and
+ * leaves it there. Markers around the update-path writes let the Rust
+ * order test see them.
+ */
+static void a3197s_set_pll_seq(uint8_t miner_id, uint16_t asic_id, uint8_t pll0_update,
+			       uint32_t freq0, uint32_t freq1, uint32_t freq2, uint32_t freq3)
 {
-	uint32_t tmp32;
+	uint32_t f0 = pll_clamp_freq((int32_t)freq0);
+	uint32_t f1 = pll_clamp_freq((int32_t)freq1);
+	uint32_t f2 = pll_clamp_freq((int32_t)freq2);
+	uint32_t f3 = pll_clamp_freq((int32_t)freq3);
+	uint32_t w0 = get_cpm_pll(f0);
+	uint32_t w1 = get_cpm_pll(f1);
+	uint32_t w2 = get_cpm_pll(f2);
+	uint32_t w3 = get_cpm_pll(f3);
+	uint16_t saved = asic_get_chip_select();
 
-	/* SS_CTRL handshake bracketing this PLL step. */
-	a3197s_smartspeed_set_ctrl(miner_id, SS_CTRL_RAMP_PRE);
+	if (w0 == 0 || w1 == 0 || w2 == 0 || w3 == 0) {
+		fprintf(stderr,
+			"board %u asic %u: refused PLL program, no table word for %u/%u/%u/%u\n",
+			miner_id, asic_id, f0, f1, f2, f3);
+		return;
+	}
 
-	tmp32 = get_cpm_pll(freq1);
-	a3197s_set_reg(miner_id, REG_PLL1_FREQ, tmp32);
-	tmp32 = get_cpm_pll(freq2);
-	a3197s_set_reg(miner_id, REG_PLL2_FREQ, tmp32);
-	tmp32 = get_cpm_pll(freq3);
-	a3197s_set_reg(miner_id, REG_PLL3_FREQ, tmp32);
+	if (!pll0_update) {
+		uint32_t park = get_cpm_pll(pll_clamp_freq(PLL_CHIP_MIN_MHZ)) & 0xf7fffffeu;
 
-	a3197s_smartspeed_set_ctrl(miner_id, SS_CTRL_RAMP_MID);
+		a3197s_select_chip(miner_id, asic_id);
+		a3197s_set_reg(miner_id, REG_PLL0_FREQ, park);
+		delay_ms(1);
+	}
 
-	tmp32 = get_cpm_pll(freq0);
-	a3197s_set_reg(miner_id, REG_PLL0_FREQ, tmp32);
+	/* SEQ_UPDATE_BEGIN */
+	pll_ss_write(miner_id, asic_id, SS_CTRL_RAMP_PRE);
+	pll_lock_check(miner_id, asic_id, "PLL0", 152);
 
-	a3197s_smartspeed_set_ctrl(miner_id, SS_CTRL_RAMP_COMMIT);
+	a3197s_select_chip(miner_id, asic_id);
+	a3197s_set_reg(miner_id, REG_PLL1_FREQ, w1);
+	a3197s_set_reg(miner_id, REG_PLL2_FREQ, w2);
+	a3197s_set_reg(miner_id, REG_PLL3_FREQ, w3);
+	a3197s_set_reg(miner_id, REG_ROLLTIME, ROLLTIME_TIMEOUT_CONST / f3);
+	delay_ms(1);
 
-	tmp32 = ROLLTIME_TIMEOUT_CONST / freq3;
-	a3197s_set_reg(miner_id, REG_ROLLTIME, tmp32);
+	if (pll0_update) {
+		pll_ss_write(miner_id, asic_id, SS_CTRL_RAMP_MID);
+		pll_lock_check(miner_id, asic_id, "PLL1", 152u << 8);
+
+		a3197s_select_chip(miner_id, asic_id);
+		a3197s_set_reg(miner_id, REG_PLL_COMMIT, pll_mux_word(f1) | (1u << 4));
+		a3197s_set_reg(miner_id, REG_PLL0_FREQ, w0);
+		delay_ms(1);
+		a3197s_set_reg(miner_id, REG_PLL_COMMIT, pll_mux_word(f0));
+		delay_ms(1);
+	}
+
+	pll_ss_write(miner_id, asic_id, SS_CTRL_RAMP_COMMIT);
+	/* SEQ_UPDATE_END */
+	a3197s_select_chip(miner_id, saved);
 }
 
 void a3197s_pll_apply(uint8_t miner_id, uint16_t asic_id)
@@ -155,22 +241,20 @@ void a3197s_pll_apply(uint8_t miner_id, uint16_t asic_id)
 	chip_select_id = asic_get_chip_select();
 
 	if (!pll_offsets_active(miner_id)) {
-		a3197s_select_chip(miner_id, CHIP_ADDR_BROADCAST);
-		pll_write_sequence(miner_id, base[0], base[1], base[2], base[3]);
+		a3197s_set_pll_seq(miner_id, CHIP_ADDR_BROADCAST, 1,
+			base[0], base[1], base[2], base[3]);
 	} else {
-		/* Each chip gets the same handshake and writes the broadcast
-		 * path sends, addressed to it alone, at its own clocks. */
+		/* Each chip gets the same sequence the broadcast path sends,
+		 * addressed to it alone, at its own clocks. */
 		uint16_t chip;
 
 		for (chip = 0; chip < PLL_CHIP_OFFSET_MAX; chip++) {
 			int16_t off = g_pll_chip_offset[miner_id][chip];
 
-			a3197s_select_chip(miner_id, chip);
-			pll_write_sequence(miner_id, pll_offset_freq(base[0], off),
-				pll_offset_freq(base[1], off), pll_offset_freq(base[2], off),
-				pll_offset_freq(base[3], off));
+			a3197s_set_pll_seq(miner_id, chip, 1,
+				pll_offset_freq(base[0], off), pll_offset_freq(base[1], off),
+				pll_offset_freq(base[2], off), pll_offset_freq(base[3], off));
 		}
-		a3197s_select_chip(miner_id, CHIP_ADDR_BROADCAST);
 	}
 	delay_ms(1);
 

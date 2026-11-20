@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Generator for the A3197S PLL frequency->register-code table.
+"""Historical generator for a reverse-engineered A3197S PLL table.
+
+The table that ships in pll_cpm_table.c is now the official MIT table
+from Canaan Creative canaan_sdk_for_linux v1.1.2-alpha (commit 07fe73f).
+Do not overwrite that file with this script's output. The --extend-700
+and --extend-low ranges were never validated on silicon.
+
+Generator for the A3197S PLL frequency->register-code table.
 
 Implements the verified register bitfield model (see pll_cpm_table.c's
 header comment for the full derivation and verification method):

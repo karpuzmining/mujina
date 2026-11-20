@@ -137,6 +137,14 @@
   .msg.ok { color: var(--green); }
   .msg.err { color: var(--red); }
   .hint { font-size: 12px; color: var(--dim); margin: 0 0 14px; line-height: 1.5; }
+  .chip-scroll { overflow-x: auto; }
+  table.chips { width: 100%; border-collapse: collapse; font-size: 12px; min-width: 760px; }
+  table.chips th, table.chips td { border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: right; white-space: nowrap; }
+  table.chips th { color: var(--dim); font-weight: 400; letter-spacing: .08em; text-transform: uppercase; font-size: 10px; }
+  table.chips td.chip { text-align: left; color: var(--cyan); }
+  table.chips input[type=number] { width: 72px; background: var(--panel2); color: var(--ink); border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; font: inherit; font-size: 12px; }
+  table.chips input:disabled { opacity: .45; }
+  .sim-banner { border: 1px solid var(--amber); color: var(--amber); padding: 8px 12px; margin-bottom: 12px; letter-spacing: .06em; }
 
   .kv { display: grid; grid-template-columns: auto 1fr; gap: 7px 16px; font-size: 12px; margin: 0; }
   .kv dt { color: var(--dim); }
@@ -470,6 +478,41 @@
     <a class="menubtn" href="/info">Info</a>
   </nav>
 
+  <div class="sec">Per-chip clocks<span class="sec-sub">12× A3197S, one shared rail</span></div>
+  <div class="card">
+    <div id="chipSim" class="sim-banner" hidden>SIMULATED DATA — not from hardware. The numbers below are a layout preview.</div>
+    <p class="hint">Temperature and PVT mV are on-die sensors. Freq is that die's PLL0. Err % is the speed-log fail rate (fail ÷ (pass + fail)); GH/s is the speed-log pass count × 0.256 / 1000. Offsets are added to every PLL domain. Absolute MHz is PLL0 only and is saved as an offset, so a later board clock change moves it unless you choose Keep. There is no per-chip voltage: all 12 dies share the series rail, and 3600 mV is rejected. Edits are locked while ChipTuner is judging a trial.</p>
+    <div class="row">
+      <label for="chipPolicy">When the profile or board clock changes</label>
+      <select id="chipPolicy" style="background:var(--panel2);color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:10px 12px;font:inherit;font-size:13px">
+        <option value="clear">Clear chip clocks (default)</option>
+        <option value="keep">Keep chip clocks</option>
+      </select>
+    </div>
+    <div class="chip-scroll">
+      <table class="chips">
+        <thead>
+          <tr>
+            <th style="text-align:left">Chip</th>
+            <th>Temp °C</th>
+            <th>PVT mV</th>
+            <th>Freq</th>
+            <th>Err %</th>
+            <th>GH/s</th>
+            <th>Offset</th>
+            <th>Absolute</th>
+          </tr>
+        </thead>
+        <tbody id="chipBody"></tbody>
+      </table>
+    </div>
+    <div class="actions" style="margin-top:14px">
+      <button class="btn pri" id="chipApplyOff">Apply offsets</button>
+      <button class="btn" id="chipApplyAbs">Apply absolute MHz</button>
+    </div>
+    <div class="msg" id="chipMsg"></div>
+  </div>
+
   <div class="sec">USB-C PD Input<span class="sec-sub">what the connected PSU is actually delivering</span></div>
   <div class="card">
     <dl class="kv">
@@ -662,6 +705,149 @@ async function saveFanThermostat() {
   } catch (e) { $('fanThermMsg').textContent = 'failed: ' + e; $('fanThermMsg').className = 'msg err'; }
 }
 
+const CHIP_N = 12;
+let chipTrial = false;
+
+function chipDemo() {
+  return new URLSearchParams(location.search).get('demo') === '1';
+}
+
+function demoDetail() {
+  const chips = [];
+  for (let i = 0; i < CHIP_N; i++) {
+    const off = [0, -20, 10, 0, -40, 0, 20, -10, 0, 30, -10, 0][i];
+    chips.push({
+      chip: i,
+      temp_c: 68 + (i % 5) * 4.5 + (i === 4 ? 18 : 0),
+      volt_mv: 310 - off * 0.4,
+      pll_freq: [400 + off, 420 + off, 440 + off, 460 + off],
+      spd_dh: i === 4 ? 12.4 : 1.2 + (i % 3) * 0.3,
+      ghsspd: 148 + off * 0.35,
+    });
+  }
+  return {
+    pll_freq_commanded: [400, 420, 440, 460],
+    chip_offset_mhz: chips.map(c => c.pll_freq[0] - 400),
+    chip_clock_policy: 'clear',
+    chips,
+  };
+}
+
+function renderChips(d, phase) {
+  chipTrial = phase === 'trial';
+  const base = (d.pll_freq_commanded && d.pll_freq_commanded[0]) || 0;
+  const offsets = d.chip_offset_mhz || [];
+  const body = $('chipBody');
+  const focus = document.activeElement && document.activeElement.closest && document.activeElement.closest('#chipBody');
+  if (focus) return;
+  body.innerHTML = '';
+  const rows = (d.chips && d.chips.length) ? d.chips : Array.from({length: CHIP_N}, (_, i) => ({ chip: i }));
+  rows.forEach((c, i) => {
+    const off = offsets[i] != null ? offsets[i] : 0;
+    const freq = (c.pll_freq && c.pll_freq[0] > 0) ? c.pll_freq[0] : (base ? base + off : null);
+    const tr = document.createElement('tr');
+    const temp = c.temp_c > -100 ? c.temp_c.toFixed(1) : '—';
+    const volt = c.volt_mv > 0 ? c.volt_mv.toFixed(0) : '—';
+    const err = c.spd_dh != null ? c.spd_dh.toFixed(1) : '—';
+    const ghs = c.ghsspd != null ? c.ghsspd.toFixed(1) : '—';
+    tr.innerHTML =
+      '<td class="chip">' + i + '</td>' +
+      '<td>' + temp + '</td>' +
+      '<td>' + volt + '</td>' +
+      '<td>' + (freq != null ? freq : '—') + '</td>' +
+      '<td>' + err + '</td>' +
+      '<td>' + ghs + '</td>' +
+      '<td><input type="number" class="off" data-i="' + i + '" step="1" min="-150" max="50" value="' + off + '"' + (chipTrial ? ' disabled' : '') + '></td>' +
+      '<td><input type="number" class="abs" data-i="' + i + '" step="1" min="100" max="580" value="' + (base ? base + off : '') + '"' + (chipTrial ? ' disabled' : '') + '></td>';
+    body.appendChild(tr);
+  });
+  if (d.chip_clock_policy === 'keep' || d.chip_clock_policy === 'clear') {
+    if (document.activeElement !== $('chipPolicy')) $('chipPolicy').value = d.chip_clock_policy;
+  }
+  $('chipPolicy').disabled = chipTrial;
+  $('chipApplyOff').disabled = chipTrial;
+  $('chipApplyAbs').disabled = chipTrial;
+  if (chipTrial) {
+    $('chipMsg').textContent = 'ChipTuner is judging a trial. Edits are locked until it keeps or reverts.';
+    $('chipMsg').className = 'msg';
+  }
+}
+
+async function loadChips() {
+  if (chipDemo()) {
+    $('chipSim').hidden = false;
+    renderChips(demoDetail(), 'baseline');
+    $('connDot').className = 'dot warn';
+    $('connText').textContent = 'simulated';
+    return;
+  }
+  let phase = '';
+  try {
+    const tune = await fetch('/api/v0/boards/nano3s-0/auto-tune');
+    if (tune.ok) {
+      const t = await tune.json();
+      phase = t.per_chip && t.per_chip.phase || '';
+    }
+  } catch (e) { /* tuner status is optional */ }
+  try {
+    const r = await fetch('/nano3s-detail');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    renderChips(await r.json(), phase);
+  } catch (e) {
+    if (!$('chipBody').children.length) {
+      $('chipMsg').textContent = 'per-chip telemetry unavailable: ' + e;
+      $('chipMsg').className = 'msg err';
+    }
+  }
+}
+
+function readChipNumbers(cls) {
+  const vals = [];
+  document.querySelectorAll('#chipBody .' + cls).forEach(el => vals.push(el.value));
+  return vals;
+}
+
+async function applyChips(absolute) {
+  if (chipTrial) return;
+  const policy = $('chipPolicy').value;
+  const body = { policy };
+  if (absolute) {
+    const freq = readChipNumbers('abs').map(Number);
+    if (freq.length !== CHIP_N || freq.some(v => !isFinite(v))) {
+      $('chipMsg').textContent = 'enter 12 absolute MHz values';
+      $('chipMsg').className = 'msg err';
+      return;
+    }
+    body.freq_mhz = freq;
+  } else {
+    const off = readChipNumbers('off').map(Number);
+    if (off.length !== CHIP_N || off.some(v => !isFinite(v))) {
+      $('chipMsg').textContent = 'enter 12 offsets';
+      $('chipMsg').className = 'msg err';
+      return;
+    }
+    body.offset_mhz = off;
+  }
+  $('chipMsg').textContent = 'saving…';
+  $('chipMsg').className = 'msg';
+  try {
+    const r = await fetch('/api/v0/boards/nano3s-0/chip-clocks', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    if (r.status === 409) throw new Error('ChipTuner trial in progress');
+    if (!r.ok) throw new Error('HTTP ' + r.status + ': ' + (await r.text()));
+    $('chipMsg').textContent = absolute ? 'absolute clocks queued ✓' : 'offsets queued ✓';
+    $('chipMsg').className = 'msg ok';
+    loadChips();
+  } catch (e) {
+    $('chipMsg').textContent = 'failed: ' + e;
+    $('chipMsg').className = 'msg err';
+  }
+}
+
+$('chipApplyOff').addEventListener('click', () => applyChips(false));
+$('chipApplyAbs').addEventListener('click', () => applyChips(true));
+
 $('psuOverrideSave').addEventListener('click', () => savePsuOverride(false));
 $('psuOverrideClear').addEventListener('click', () => savePsuOverride(true));
 $('atSave').addEventListener('click', saveAutotune);
@@ -671,7 +857,8 @@ syncAtEnableState();
 loadConn();
 loadPsu();
 loadAutotune();
-setInterval(() => { loadConn(); loadPsu(); loadAutotune(); }, 5000);
+loadChips();
+setInterval(() => { if (!chipDemo()) { loadConn(); loadPsu(); loadAutotune(); } loadChips(); }, 5000);
 </script>
 </body>
 </html>
