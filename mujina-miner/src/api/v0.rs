@@ -528,8 +528,8 @@ async fn patch_board_temp_target(
 }
 
 /// Read the current USB-C PD power-contract state -- live INA226 bus
-/// voltage, HUSB238A attach status, the auto-detected contract ceiling,
-/// any manual override, and the ceiling actually being enforced.
+/// voltage, the auto-detected contract ceiling, any manual override,
+/// the ceiling actually being enforced, and the last I2C2 recovery.
 #[utoipa::path(
     get,
     path = "/boards/{name}/psu",
@@ -574,6 +574,7 @@ async fn get_board_psu(
             } else {
                 "unavailable".into()
             },
+            i2c_recovery: crate::board::nano3s::power_i2c_recovery().into(),
         }))
     }
     #[cfg(not(feature = "nano3s"))]

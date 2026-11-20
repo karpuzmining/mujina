@@ -33,7 +33,7 @@
 //!   this riscv64 target) `u32` words, no swap.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -44,7 +44,9 @@ use bitcoin::hashes::sha256d;
 use tokio::sync::{mpsc, watch};
 
 use super::a3197s::ChipClockPolicy;
-use super::nano3s_power::{estimate_input_watts, ina226_sdk_reading};
+use super::nano3s_power::{
+    estimate_input_watts, i2c2_pad_gpio, i2c2_sda_stuck_low, ina226_sdk_reading, I2C2_PAD_ALT3,
+};
 use super::nano3s_auto_tune::ChipTuneStatus;
 use super::nano3s_auto_tune::{self as auto_tune, AutoTune, AutoTuneCmd, TuneChoice};
 use super::nano3s_chip_tuner::{ChipGoal, ChipMetrics, ChipPhase, ChipTuner, ChipTunerConfig};
@@ -1343,29 +1345,28 @@ const INA226_DEV: &str = "/dev/i2c-2";
 fn read_ina226_sdk() -> Option<(f64, f64, f64)> {
     #[cfg(target_os = "linux")]
     {
+        let _bus = POWER_BUS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if power_bus_quiet() {
             return None;
         }
-        static READY: AtomicBool = AtomicBool::new(false);
-        if !READY.load(Ordering::Relaxed) {
-            let cfg_ok = i2c_write_reg_be(INA226_DEV, POWER_I2C_ADDR, 0x00, INA226_CFG);
-            let cal_ok = i2c_write_reg_be(INA226_DEV, POWER_I2C_ADDR, 0x05, INA226_CAL);
-            if cfg_ok && cal_ok {
-                READY.store(true, Ordering::Relaxed);
-            } else {
-                READY.store(false, Ordering::Relaxed);
-                power_bus_failed();
-                return None;
-            }
+        if let Some(reading) = ina226_sample() {
+            power_bus_recovered();
+            return Some(reading);
         }
-        let Some(bus) = i2c_read_reg_be(INA226_DEV, POWER_I2C_ADDR, 0x02) else {
-            READY.store(false, Ordering::Relaxed);
-            power_bus_failed();
-            return None;
-        };
-        let cur = i2c_read_reg_be(INA226_DEV, POWER_I2C_ADDR, 0x04).unwrap_or(0);
-        power_bus_recovered();
-        Some(ina226_sdk_reading(bus, cur))
+        // The DesignWare controller timed out. If SDA is stuck low, clock
+        // it free and program the INA226 again before giving up.
+        match i2c2_recover() {
+            I2cRecovery::Clocked => {
+                INA_READY.store(false, Ordering::Relaxed);
+                if let Some(reading) = ina226_sample() {
+                    power_bus_recovered();
+                    return Some(reading);
+                }
+            }
+            I2cRecovery::Skipped | I2cRecovery::Failed | I2cRecovery::None => {}
+        }
+        power_bus_failed();
+        None
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1373,7 +1374,26 @@ fn read_ina226_sdk() -> Option<(f64, f64, f64)> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn ina226_sample() -> Option<(f64, f64, f64)> {
+    if !INA_READY.load(Ordering::Relaxed) {
+        let cfg_ok = i2c_write_reg_be(INA226_DEV, POWER_I2C_ADDR, 0x00, INA226_CFG);
+        let cal_ok = i2c_write_reg_be(INA226_DEV, POWER_I2C_ADDR, 0x05, INA226_CAL);
+        if !(cfg_ok && cal_ok) {
+            INA_READY.store(false, Ordering::Relaxed);
+            return None;
+        }
+        INA_READY.store(true, Ordering::Relaxed);
+    }
+    let bus = i2c_read_reg_be(INA226_DEV, POWER_I2C_ADDR, 0x02)?;
+    let cur = i2c_read_reg_be(INA226_DEV, POWER_I2C_ADDR, 0x04).unwrap_or(0);
+    Some(ina226_sdk_reading(bus, cur))
+}
+
 static POWER_SENSOR_OK: AtomicBool = AtomicBool::new(false);
+static INA_READY: AtomicBool = AtomicBool::new(false);
+static POWER_BUS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static LAST_I2C_RECOVERY: AtomicU8 = AtomicU8::new(0);
 /// Monotonic millis after which `/dev/i2c-2` may be touched again.
 /// A missing INA226 makes the DesignWare controller time out, so a
 /// failed probe waits a minute instead of retrying every status tick.
@@ -1400,7 +1420,8 @@ fn power_bus_failed() {
     if now.saturating_sub(last) >= POWER_BUS_BACKOFF_MS {
         POWER_BUS_LOG_MS.store(now, Ordering::Relaxed);
         eprintln!(
-            "[nano3s] power sensor unavailable on {INA226_DEV} (INA226 0x40 and PD 0x42). Holding voltage and frequency. The {POWER_TARGET_SAFETY_W:.0} W trip is not evaluated. Next probe in {POWER_BUS_BACKOFF_MS} ms. Overview power is the V²·f estimate."
+            "[nano3s] power sensor unavailable on {INA226_DEV} addr 0x40 (i2c recovery: {}). Holding voltage and frequency. The {POWER_TARGET_SAFETY_W:.0} W trip is not evaluated. Next probe in {POWER_BUS_BACKOFF_MS} ms. Overview power is the V²·f estimate.",
+            power_i2c_recovery()
         );
     }
 }
@@ -1419,6 +1440,28 @@ fn note_power_sensor(ok: bool) {
 
 pub(crate) fn power_sensor_ok() -> bool {
     POWER_SENSOR_OK.load(Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy)]
+enum I2cRecovery {
+    None = 0,
+    Skipped = 1,
+    Clocked = 2,
+    Failed = 3,
+}
+
+fn note_i2c_recovery(result: I2cRecovery) {
+    LAST_I2C_RECOVERY.store(result as u8, Ordering::Relaxed);
+}
+
+/// Last bus-2 recovery: `none`, `skipped` (SDA was not stuck), `clocked`, or `failed`.
+pub(crate) fn power_i2c_recovery() -> &'static str {
+    match LAST_I2C_RECOVERY.load(Ordering::Relaxed) {
+        1 => "skipped",
+        2 => "clocked",
+        3 => "failed",
+        _ => "none",
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1479,26 +1522,113 @@ fn i2c_read_reg_be(dev: &str, addr: u32, reg: u8) -> Option<u16> {
     i2c_xfer(dev, addr, &mut w, Some(&mut r)).then_some(u16::from_be_bytes(r))
 }
 
-fn i2c_read_byte(bus: u32, addr: u32, reg: u32) -> Option<u8> {
-    let output = std::process::Command::new("i2cget")
-        .args([
-            "-y",
-            &bus.to_string(),
-            &format!("0x{addr:02x}"),
-            &format!("0x{reg:02x}"),
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+/// IOMUX page and the GPIO bank that owns IO11 (SCL) and IO12 (SDA)
+/// once SEL is 0. Bit 31 of each pad register is the live input.
+const IOMUX_BASE: u64 = 0x9110_5000;
+const IO11_OFF: usize = 0x2C;
+const IO12_OFF: usize = 0x30;
+const GPIOA_BASE: u64 = 0x9140_B000;
+const GPIO_DR: usize = 0x00;
+const GPIO_DDR: usize = 0x04;
+const SCL_BIT: u32 = 1 << 11;
+const SDA_BIT: u32 = 1 << 12;
+
+#[cfg(target_os = "linux")]
+struct DevMem {
+    ptr: *mut u8,
+    len: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl DevMem {
+    fn map(base: u64, len: usize) -> Option<Self> {
+        let fd = unsafe { libc::open(c"/dev/mem".as_ptr(), libc::O_RDWR | libc::O_SYNC) };
+        if fd < 0 {
+            return None;
+        }
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                base as libc::off_t,
+            )
+        };
+        unsafe { libc::close(fd) };
+        if ptr == libc::MAP_FAILED {
+            return None;
+        }
+        Some(Self { ptr: ptr as *mut u8, len })
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let text = text.trim();
-    if let Some(hex) = text.strip_prefix("0x") {
-        u8::from_str_radix(hex, 16).ok()
-    } else {
-        text.parse().ok()
+
+    fn read(&self, off: usize) -> u32 {
+        unsafe { std::ptr::read_volatile(self.ptr.add(off) as *const u32) }
     }
+
+    fn write(&self, off: usize, value: u32) {
+        unsafe { std::ptr::write_volatile(self.ptr.add(off) as *mut u32, value) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for DevMem {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.len) };
+    }
+}
+
+/// Clock SCL nine times and send STOP while SDA is stuck low, then put
+/// IO11/IO12 back on I2C2. The caller programs the INA226 afterwards.
+#[cfg(target_os = "linux")]
+fn i2c2_recover() -> I2cRecovery {
+    let Some(mux) = DevMem::map(IOMUX_BASE, 0x1000) else {
+        note_i2c_recovery(I2cRecovery::Failed);
+        return I2cRecovery::Failed;
+    };
+    let sda = mux.read(IO12_OFF);
+    if !i2c2_sda_stuck_low(sda) {
+        note_i2c_recovery(I2cRecovery::Skipped);
+        return I2cRecovery::Skipped;
+    }
+    let Some(gpio) = DevMem::map(GPIOA_BASE, 0x1000) else {
+        note_i2c_recovery(I2cRecovery::Failed);
+        return I2cRecovery::Failed;
+    };
+    // Idle SCL high and SDA an input before the pads leave I2C2.
+    let mut dr = gpio.read(GPIO_DR) | SCL_BIT;
+    let mut ddr = (gpio.read(GPIO_DDR) | SCL_BIT) & !SDA_BIT;
+    gpio.write(GPIO_DR, dr);
+    gpio.write(GPIO_DDR, ddr);
+    let gpio_mode = i2c2_pad_gpio(I2C2_PAD_ALT3);
+    mux.write(IO11_OFF, gpio_mode);
+    mux.write(IO12_OFF, gpio_mode);
+    let pause = || std::thread::sleep(std::time::Duration::from_micros(5));
+    for _ in 0..9 {
+        dr &= !SCL_BIT;
+        gpio.write(GPIO_DR, dr);
+        pause();
+        dr |= SCL_BIT;
+        gpio.write(GPIO_DR, dr);
+        pause();
+    }
+    ddr |= SDA_BIT;
+    dr &= !SDA_BIT;
+    dr &= !SCL_BIT;
+    gpio.write(GPIO_DR, dr);
+    gpio.write(GPIO_DDR, ddr);
+    pause();
+    dr |= SCL_BIT;
+    gpio.write(GPIO_DR, dr);
+    pause();
+    dr |= SDA_BIT;
+    gpio.write(GPIO_DR, dr);
+    pause();
+    mux.write(IO11_OFF, I2C2_PAD_ALT3);
+    mux.write(IO12_OFF, I2C2_PAD_ALT3);
+    note_i2c_recovery(I2cRecovery::Clocked);
+    I2cRecovery::Clocked
 }
 
 /// Margin subtracted from the classified/overridden PD ceiling before
@@ -1513,35 +1643,9 @@ fn i2c_read_byte(bus: u32, addr: u32, reg: u32) -> Option<u8> {
 /// and this margin is the only thing guarding against it being wrong.
 const PD_CEILING_MARGIN_W: f64 = 3.0;
 
-const PD_I2C_ADDR: u32 = 0x42;
-
-/// HUSB238A `PD_STATUS1` (reg `0x01`) bit 6 = ATTACH -- whether a PD
-/// contract is currently established. This is the only bit read from
-/// this chip; `PD_STATUS0`'s voltage/current code nibbles are NOT
-/// decoded here -- live-verified 2026-09-16 that they read wrong for
-/// this board: `PD_STATUS0=0x40` decodes on the standard (base
-/// HUSB238) code table to 15V/0.5A, while the INA226 on the same bus
-/// simultaneously measures 27.64V/3.05A. This chip variant negotiates
-/// USB PD 3.1 EPR (28/36/48V), which uses code values the base table
-/// doesn't cover, so its raw codes are not trustworthy here -- bus
-/// voltage from the INA226 is used as the sole ground truth instead
-/// (see [`pd_ceiling_w_for_voltage`]).
-fn read_pd_attached() -> Option<bool> {
-    if power_bus_quiet() {
-        return None;
-    }
-    match i2c_read_byte(POWER_I2C_BUS, PD_I2C_ADDR, 0x01) {
-        Some(v) => Some(v & 0x40 != 0),
-        None => {
-            power_bus_failed();
-            None
-        }
-    }
-}
-
 /// Conservative USB-C PD power-contract ceiling, classified from
-/// measured INA226 bus voltage alone -- never from HUSB238A's own
-/// status codes (see [`read_pd_attached`]'s doc comment for why).
+/// measured INA226 bus voltage alone. The part at 0x42 is not an
+/// HUSB238, so register 0x01 bit 6 is not an attach flag and is not read.
 /// Current is *assumed* at each voltage tier's typical/spec maximum,
 /// never measured, so this only ever misclassifies in the conservative
 /// direction (a charger that can't sustain the assumed current at a
@@ -1611,7 +1715,7 @@ fn write_psu_override_w(override_max_w: Option<f64>) {
 pub(crate) fn read_psu_status() -> (Option<f64>, Option<bool>, Option<f64>, Option<f64>, f64) {
     let measured = read_ina226_sdk();
     let bus_v = measured.and_then(|(v, _, _)| (v >= 8.0).then_some(v));
-    let attached = read_pd_attached();
+    let attached = None;
     let detected_ceiling_w = bus_v
         .map(pd_ceiling_w_for_voltage)
         .filter(|w| w.is_finite());
@@ -5204,7 +5308,12 @@ fn run_worker(
                         write_harness_control("fan:manual,0");
                     } else {
                         sync_manual_fan_with_tuner(&mut auto_tuner);
-                        let fan_temp = Some(st.temp_max).filter(|t| *t > 0.0);
+                        let samples: Vec<f32> = st.chips.iter().take(CHIP_COUNT).map(|c| c.temp_c).collect();
+                        let fan_temp = auto_tune::control_temp_c(&samples);
+                        let floor = fan_temp
+                            .map(|t| auto_tune::fan_curve_floor_percent(t, &read_fan_curve()))
+                            .unwrap_or(20);
+                        auto_tuner.set_fan_floor(floor);
                         cmds.extend(auto_tuner.fan_tick(fan_temp));
                     }
                     for cmd in cmds {

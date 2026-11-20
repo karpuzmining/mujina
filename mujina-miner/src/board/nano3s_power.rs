@@ -39,6 +39,22 @@ pub(crate) fn chip_input_watts(die_mv: f64, freq_mhz: f64) -> f64 {
     asic / INPUT_EFFICIENCY
 }
 
+/// IOMUX pad at `0x91105000`. SEL is bits[13:11]. Alt3 (`0x19CF` on
+/// IO11/IO12) is I2C2. Clearing SEL leaves the same pull and drive
+/// bits with the pad in GPIO mode (`0x01CF`).
+pub(crate) const I2C2_PAD_ALT3: u32 = 0x19CF;
+pub(crate) const I2C2_PAD_SEL_MASK: u32 = 0x7 << 11;
+pub(crate) const I2C2_PAD_INPUT_BIT: u32 = 1 << 31;
+
+pub(crate) fn i2c2_pad_gpio(pad: u32) -> u32 {
+    pad & !I2C2_PAD_SEL_MASK
+}
+
+/// Bit 31 is the pad's live input. SDA stuck low is that bit clear.
+pub(crate) fn i2c2_sda_stuck_low(sda_pad: u32) -> bool {
+    sda_pad & I2C2_PAD_INPUT_BIT == 0
+}
+
 /// Sum of twelve chips. Missing die voltage uses `rail_mv / 12`.
 pub(crate) fn estimate_input_watts(dies_mv: &[f64], freq_mhz: &[f64], rail_mv: f64) -> f64 {
     let n = 12usize;
@@ -84,5 +100,17 @@ mod tests {
         let die = 3392.0 / 12.0;
         let from_die = estimate_input_watts(&[die; 12], &[210.0; 12], 0.0);
         assert!((from_die - low).abs() < 0.2, "die {from_die}");
+    }
+
+    #[test]
+    fn i2c2_gpio_mode_clears_only_the_sel_field() {
+        assert_eq!(i2c2_pad_gpio(I2C2_PAD_ALT3), 0x01CF);
+        assert_eq!(i2c2_pad_gpio(0x8000_19CF) & !I2C2_PAD_INPUT_BIT, 0x01CF);
+    }
+
+    #[test]
+    fn sda_input_bit_is_stuck_only_when_low() {
+        assert!(i2c2_sda_stuck_low(0x0000_19CF));
+        assert!(!i2c2_sda_stuck_low(0x8000_19CF));
     }
 }

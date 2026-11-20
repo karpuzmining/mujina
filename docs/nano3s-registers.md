@@ -15,12 +15,14 @@ turned out to be wrong when actually tested, which is exactly why the
 distinction matters.
 
 **Board:** h1_f1_v1_nano3s_3197S
-**SoC:** Kendryte K230 (dual-core RISC-V64: big core RTOS + little core
-Linux)
+**SoC:** Kendryte K230 (dual-core RISC-V64). Linux runs on the little
+C906. RT-Smart (`rtos_core.elf`) runs on the big C908.
 **Kernel:** Linux 5.10.4, GPIO bank A @ `0x9140b000` (GPIO0-31), bank B
 @ `0x9140c000` (GPIO32-71)
-**IOMUX base:** `0x91105000`, one 4-byte register per pad, `bits[5:0]`
-= SEL function
+**IOMUX base:** `0x91105000`, one 4-byte register per pad. The function
+select is `bits[13:11]` (SEL). Bit 31 is the live pad input. I2C2 is
+IO11/IO12, alt3, pad value `0x19CF` (`0x9110502C` SCL, `0x91105030` SDA).
+Clearing SEL (`0x01CF`) makes those pads GPIO.
 
 ---
 
@@ -93,13 +95,15 @@ big-core RTOS firmware, not exposed to Linux userspace as GPIOs.
 
 ## IOMUX Pad Assignments (Peripheral Bus)
 
-Base `0x91105000`, `bits[5:0]` = SEL.
+Base `0x91105000`. SEL is `bits[13:11]`, not `bits[5:0]`. Older notes
+that treated a whole pad word as a 6-bit function number were reading
+the wrong field.
 
 | Pads | SEL | Peripheral |
 |------|-----|------------|
-| GPIO0, GPIO1 | 0x04 | UART1 TX/RX -- `/dev/ttyS1`, 115200 baud, Linux console |
-| GPIO3, GPIO4 | 0x08 | I2C2 SCL/SDA -- `/dev/i2c-2`, 100kHz |
-| GPIO5, GPIO6 | 0x08 | I2C3 SCL/SDA -- `/dev/i2c-3`, 100kHz |
+| GPIO0, GPIO1 | — | UART1 TX/RX -- `/dev/ttyS1`, 115200 baud, Linux console |
+| IO11, IO12 | 3 (alt3, pad `0x19CF`) | I2C2 SCL/SDA -- `/dev/i2c-2`, Linux. Stock RTOS has no power code on this bus. |
+| — | — | I2C3 SCL/SDA -- `/dev/i2c-3`, 100kHz |
 | GPIO14-22 | 0x1F | SPI0 / NAND flash, 4-bit QSPI, 50MHz |
 | GPIO34 | 0x2E | UART3_TX to the ASIC chain |
 | GPIO36-40 | 0x0F (GPIO mode) | SPI1 / LCD, 25MHz |
@@ -109,8 +113,8 @@ Base `0x91105000`, `bits[5:0]` = SEL.
 
 | Bus | Node | Addr | Chip | Function |
 |-----|------|------|------|----------|
-| i2c@91407000 | `/dev/i2c-2` | 0x40 | INA226 | Power monitor on the USB-C PD input rail |
-| i2c@91407000 | `/dev/i2c-2` | 0x42 | HUSB238A | USB-C PD/PPS sink controller |
+| i2c@91407000 | `/dev/i2c-2` | 0x40 | INA226 | Power monitor on the USB-C PD input rail. Linux owns this bus. |
+| i2c@91407000 | `/dev/i2c-2` | 0x42 | PD controller | Not an HUSB238. Register 0x01 bit 6 is not an attach flag and is not read. |
 | i2c@91408000 | `/dev/i2c-3` | 0x48 | DC-DC | ASIC core voltage control (write-only) |
 | i2c@91408000 | `/dev/i2c-3` | 0x50 | EEPROM (AT24C) | Board serial number |
 
@@ -126,7 +130,7 @@ Base `0x91105000`, `bits[5:0]` = SEL.
 ## ASIC Communication Path
 
 ```
-Linux (big core)                    RTOS (little core, this fork's rtos_core.elf)
+Linux (little C906)                 RT-Smart (big C908, this fork's rtos_core.elf)
 ─────────────────                   ────────────────────────────────────────────
 mujina-minerd                       rtos_core.elf
   │ IPC (shared mem)  ◄────────────►  │

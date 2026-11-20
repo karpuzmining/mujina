@@ -281,8 +281,8 @@ pub struct PsuStatusResponse {
     /// `null` if the sensor couldn't be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bus_v: Option<f64>,
-    /// HUSB238A ATTACH bit -- whether a PD contract is currently
-    /// established. `null` if the chip couldn't be read.
+    /// Not reported. The device at I2C 0x42 is not an HUSB238, so
+    /// register 0x01 bit 6 is not an attach flag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attached: Option<bool>,
     /// Power ceiling classified from `bus_v` alone (see
@@ -303,6 +303,13 @@ pub struct PsuStatusResponse {
     /// `ok` when the INA226 answered with at least 8 V, otherwise `unavailable`.
     #[serde(default = "sensor_unavailable")]
     pub power_sensor: String,
+    /// Last I2C2 recovery: `none`, `skipped` (SDA was high), `clocked`, or `failed`.
+    #[serde(default = "recovery_none")]
+    pub i2c_recovery: String,
+}
+
+fn recovery_none() -> String {
+    "none".into()
 }
 
 fn sensor_unavailable() -> String {
