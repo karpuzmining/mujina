@@ -10,6 +10,8 @@
 #include "asic_internal.h"
 
 static uint16_t g_get_pllcnt[HBOARD_COUNT][MAX_ASIC_ON_SINGLE_HASH][PLL_DOMAIN_COUNT];
+/* Bit n set when domain n's PLL_LOCK bit was set on the last read. */
+static uint8_t g_pll_lock[HBOARD_COUNT][MAX_ASIC_ON_SINGLE_HASH];
 static uint32_t g_ss_pass_count[HBOARD_COUNT][MAX_ASIC_ON_SINGLE_HASH];
 static uint32_t g_ss_fail_count[HBOARD_COUNT][MAX_ASIC_ON_SINGLE_HASH];
 static uint32_t g_estimated_hashrate_ghs = 0;
@@ -154,15 +156,19 @@ void a3197s_read_smartspeed_counts(uint8_t miner_id, uint16_t asic_id)
 
 	tmp32 = a3197s_get_reg(miner_id, REG_PLL0_FREQ);
 	g_pll_state.get_pll[miner_id][asic_id][0] = get_cpm_freq(tmp32);
+	g_pll_lock[miner_id][asic_id] = (tmp32 & PLL_LOCK_MASK) ? 1u : 0u;
 
 	tmp32 = a3197s_get_reg(miner_id, REG_PLL1_FREQ);
 	g_pll_state.get_pll[miner_id][asic_id][1] = get_cpm_freq(tmp32);
+	g_pll_lock[miner_id][asic_id] |= (tmp32 & PLL_LOCK_MASK) ? 2u : 0u;
 
 	tmp32 = a3197s_get_reg(miner_id, REG_PLL2_FREQ);
 	g_pll_state.get_pll[miner_id][asic_id][2] = get_cpm_freq(tmp32);
+	g_pll_lock[miner_id][asic_id] |= (tmp32 & PLL_LOCK_MASK) ? 4u : 0u;
 
 	tmp32 = a3197s_get_reg(miner_id, REG_PLL3_FREQ);
 	g_pll_state.get_pll[miner_id][asic_id][3] = get_cpm_freq(tmp32);
+	g_pll_lock[miner_id][asic_id] |= (tmp32 & PLL_LOCK_MASK) ? 8u : 0u;
 }
 
 /* Getter for per-chip, per-PLL-domain SmartSpeed core distribution
@@ -175,4 +181,11 @@ void asic_get_pll_detail(uint8_t miner_id, uint16_t asic_id, uint16_t cnt_out[4]
 		cnt_out[k] = g_get_pllcnt[miner_id][asic_id][k];
 		freq_out[k] = g_pll_state.get_pll[miner_id][asic_id][k];
 	}
+}
+
+uint8_t asic_get_pll_lock(uint8_t miner_id, uint16_t asic_id)
+{
+	if (miner_id >= HBOARD_COUNT || asic_id >= MAX_ASIC_ON_SINGLE_HASH)
+		return 0;
+	return g_pll_lock[miner_id][asic_id];
 }

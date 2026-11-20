@@ -129,3 +129,18 @@ void asic_enum_verify_alladdr(uint8_t channel, uint32_t chip_count,
 
 	a3197s_select_chip(channel, CHIP_ADDR_BROADCAST);
 }
+
+/* One chip's REG_UART_STATUS id. Returns the read_fifo code (0 = a valid
+ * frame). *out_id is bits [9:0], or 0x3ff when the read failed. */
+int asic_read_chip_id(uint8_t channel, uint16_t chip, uint32_t *out_id)
+{
+	uint32_t status = 0;
+	int ret;
+
+	a3197s_select_chip(channel, chip);
+	a3197s_write_fifo(channel, REG_UART_STATUS, NULL, 1, UART_READ_MODE);
+	ret = a3197s_read_fifo(channel, REG_UART_STATUS, &status, 1);
+	if (out_id)
+		*out_id = ret ? 0x3ffu : (status & 0x3ffu);
+	return ret;
+}

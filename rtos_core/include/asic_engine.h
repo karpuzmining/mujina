@@ -179,6 +179,8 @@ void a3197s_efuse_read(uint8_t channel, uint32_t *data);
 void a3197s_read_smartspeed_log(uint8_t miner_id, uint16_t asic_id);
 void a3197s_read_smartspeed_counts(uint8_t miner_id, uint16_t asic_id);
 void asic_get_pll_detail(uint8_t miner_id, uint16_t asic_id, uint16_t cnt_out[4], uint32_t freq_out[4]);
+/* Bit n set when PLL domain n had PLL_LOCK_MASK set on the last read. */
+uint8_t asic_get_pll_lock(uint8_t miner_id, uint16_t asic_id);
 void a3197s_set_uart_baud(uint8_t channel, uint32_t baud);
 void a3197s_select_chip(uint8_t channel, uint16_t chip_addr);
 void a3197s_submit_job(uint8_t miner_id, uint16_t asic_id, uint8_t block);
@@ -187,6 +189,8 @@ void a3197s_pll_apply(uint8_t miner_id, uint16_t asic_id);
 void asic_refresh_rolltime(uint8_t miner_id, uint16_t freq3);
 /* Writes the given per-domain PLL frequency values. */
 void asic_apply_pll_freq(uint8_t miner_id, const uint32_t pll_freq[4]);
+/* Soft-reset one chip and program its PLLs again. */
+void asic_reinit_chip(uint8_t miner_id, uint16_t asic_id);
 /* Per-chip clock offsets (MHz, all four domains) layered on the base set
  * by asic_apply_pll_freq(). Ramped, blocking. Each domain is clamped to
  * PLL_CHIP_MIN_MHZ..PLL_CHIP_MAX_MHZ before the CPM lookup so a request
@@ -223,6 +227,8 @@ int asic_enum_verify_lastchip(uint8_t channel, uint32_t chip_count,
  * Both arrays must be sized >= chip_count by the caller. Diagnostic only. */
 void asic_enum_verify_alladdr(uint8_t channel, uint32_t chip_count,
 	int *out_ret, uint32_t *out_chipid);
+/* Read one chip's REG_UART_STATUS id. 0 = frame ok. */
+int asic_read_chip_id(uint8_t channel, uint16_t chip, uint32_t *out_id);
 uint32_t a3197s_get_errcnt(uint8_t channel);
 /* Breaks a3197s_get_errcnt()'s single counter into its component sources.
  * Diagnostic only, not sent over the IPC_MSG_STATUS wire. */

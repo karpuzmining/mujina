@@ -1974,9 +1974,8 @@ function renderChips(chips, perChip) {
     if (DETAIL_CACHE && Array.isArray(DETAIL_CACHE.chips)) {
       dChip = DETAIL_CACHE.chips.find(dc => Number(dc.chip) === idx || Number(dc.index) === idx) || DETAIL_CACHE.chips[idx];
     }
-    const tempVal = (c.temp_c != null && Number.isFinite(+c.temp_c))
-      ? +c.temp_c
-      : (dChip && dChip.temp_c != null && Number.isFinite(+dChip.temp_c) ? +dChip.temp_c : null);
+    const liveTemp = (v) => (v != null && Number.isFinite(+v) && +v > -200) ? +v : null;
+    const tempVal = liveTemp(c.temp_c) != null ? liveTemp(c.temp_c) : liveTemp(dChip && dChip.temp_c);
     const dhVal = (c.spd_dh != null && Number.isFinite(+c.spd_dh))
       ? +c.spd_dh
       : (dChip && dChip.spd_dh != null && Number.isFinite(+dChip.spd_dh) ? +dChip.spd_dh : null);
@@ -1990,6 +1989,11 @@ function renderChips(chips, perChip) {
       subRow.appendChild(mk('span', 'cttemp', ''));
     }
 
+    const lock = (c.pll_lock != null) ? c.pll_lock : (dChip && dChip.pll_lock);
+    const enumOk = (c.enum_ok != null) ? c.enum_ok : (dChip && dChip.enum_ok);
+    if (lock != null) subRow.appendChild(mk('span', 'cttemp', ' PLL ' + (+lock).toString(16)));
+    if (enumOk != null && +enumOk === 0) subRow.appendChild(mk('span', 'ctdh', ' enum'));
+    if ((c.reinit || (dChip && dChip.reinit)) > 0) subRow.appendChild(mk('span', 'ctdh', ' reinit'));
     if (dhVal != null && dhVal > 5) {
       const dhFormatted = (dhVal % 1 === 0 ? dhVal : dhVal.toFixed(1)) + '%';
       subRow.appendChild(mk('span', 'ctdh', 'DH ' + dhFormatted));
@@ -2010,9 +2014,10 @@ function renderChipTemps(chips, perChip) {
   grid.textContent = '';
   chips.forEach(c => {
     const t = c.temp_c;
-    const band = typeof t !== 'number' ? '' : t < 50 ? ' t-cool' : t < 70 ? ' t-normal' : t < 85 ? ' t-warm' : ' t-hot';
+    const known = typeof t === 'number' && t > -200;
+    const band = !known ? '' : t < 50 ? ' t-cool' : t < 70 ? ' t-normal' : t < 85 ? ' t-warm' : ' t-hot';
     const cell = mk('div', 'chip-cell' + band);
-    cell.append(mk('div', 'chip-idx', 'CHIP ' + Number(c.index)), mk('div', 'chip-temp', typeof t === 'number' ? t.toFixed(1) + '°' : '--'));
+    cell.append(mk('div', 'chip-idx', 'CHIP ' + Number(c.index)), mk('div', 'chip-temp', known ? t.toFixed(1) + '°' : '--'));
     grid.appendChild(cell);
   });
 }
@@ -2982,7 +2987,10 @@ async function loadLiveTuning() {
     if (health && LAST && LAST.boards && LAST.boards[0]) {
       const b = LAST.boards[0];
       const chips = b.chips || [];
-      const hot = chips.reduce((m, c) => Math.max(m, +c.temp_c || 0), 0);
+      const hot = chips.reduce((m, c) => {
+        const t = +c.temp_c;
+        return (Number.isFinite(t) && t > -200) ? Math.max(m, t) : m;
+      }, 0);
       const worst = chips.reduce((m, c) => Math.max(m, +c.spd_dh || 0), 0);
       health.textContent = (chips.length || '—') + '/' + (chips.length || '—') + ' chips, worst fail rate '
         + (worst ? worst.toFixed(1) + '%' : '—') + ', hottest chip ' + (hot ? hot.toFixed(1) + ' °C' : '—');

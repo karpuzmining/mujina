@@ -93,6 +93,14 @@ struct Nano3sChipStatus {
     nonce_data: u32,
     ghsspd: f32,
     spd_dh: f32,
+    /// Bit n set when PLL domain n reported lock.
+    pll_lock: u8,
+    /// 1 when this chip's UART id matched its index.
+    enum_ok: u8,
+    /// Reported UART chip id, or 0xff when the read failed.
+    enum_id: u8,
+    /// 1 when this status interval soft-reset the chip.
+    reinit: u8,
 }
 
 /// Mirrors `nano3s_status_t` (nano3s_ipc_shim.h) field-for-field. Carries a
@@ -138,6 +146,14 @@ pub(crate) struct Nano3sChipDetail {
     /// Speed-log error rate, percent. `fail / (pass + fail) * 100` from
     /// `A3197S_SPDLOG_FAILCNT` (0x430) and the pass count.
     pub spd_dh: f32,
+    /// Bit n set when PLL domain n reported lock.
+    pub pll_lock: u8,
+    /// 1 when this chip's UART id matched its index.
+    pub enum_ok: u8,
+    /// Reported UART chip id, or 0xff when the read failed.
+    pub enum_id: u8,
+    /// 1 when this status interval soft-reset the chip.
+    pub reinit: u8,
 }
 
 /// Full chain + per-chip detail snapshot -- everything the dashboard's
@@ -5581,6 +5597,10 @@ fn run_worker(
                         nonce_data: c.nonce_data,
                         ghsspd: c.ghsspd,
                         spd_dh: c.spd_dh,
+                        pll_lock: c.pll_lock,
+                        enum_ok: c.enum_ok,
+                        enum_id: c.enum_id,
+                        reinit: c.reinit,
                     }
                 })
                 .collect();

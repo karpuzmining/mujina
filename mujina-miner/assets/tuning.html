@@ -668,7 +668,7 @@
   <div class="sec" id="per-chip">Per-chip clocks<span class="sec-sub">12× A3197S, one shared rail</span></div>
   <div class="card">
     <div id="chipSim" class="sim-banner" hidden>SIMULATED DATA — not from hardware. The numbers below are a layout preview.</div>
-    <p class="hint">Temperature and PVT mV are on-die sensors. Freq is that die's PLL0. Err % is the speed-log fail rate (fail ÷ (pass + fail)); GH/s is the speed-log pass count × 0.256 / 1000. Offsets are added to every PLL domain. Absolute MHz is PLL0 only and is saved as an offset, so a later board clock change moves it unless you choose Keep. There is no per-chip voltage: all 12 dies share the series rail, and 3600 mV is rejected. Edits are locked while ChipTuner is judging a trial.</p>
+    <p class="hint">Temperature and PVT mV are on-die sensors. A chip with no reading is shown as a dash and is left out of the average. Freq is that die's PLL0. Lock is the four PLL domain lock bits (bit 0 is PLL0). Enum is the id the die reports; a mismatch means the address does not match the index. Reinit marks a die that was soft-reset after sitting at 100% error. Err % is the speed-log fail rate (fail ÷ (pass + fail)); GH/s is the speed-log pass count × 0.256 / 1000. Offsets are added to every PLL domain. Absolute MHz is PLL0 only and is saved as an offset, so a later board clock change moves it unless you choose Keep. There is no per-chip voltage: all 12 dies share the series rail, and 3600 mV is rejected. Edits are locked while ChipTuner is judging a trial.</p>
     <div class="row">
       <label for="chipPolicy">When the profile or board clock changes</label>
       <select id="chipPolicy" style="background:var(--panel2);color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:10px 12px;font:inherit;font-size:13px">
@@ -686,6 +686,9 @@
             <th>Freq</th>
             <th>Err %</th>
             <th>GH/s</th>
+            <th>Lock</th>
+            <th>Enum</th>
+            <th>Reinit</th>
             <th>Offset</th>
             <th>Absolute</th>
           </tr>
@@ -876,6 +879,9 @@ function renderChips(d, phase) {
     const volt = c.volt_mv > 0 ? c.volt_mv.toFixed(0) : '—';
     const err = c.spd_dh != null ? c.spd_dh.toFixed(1) : '—';
     const ghs = c.ghsspd != null ? c.ghsspd.toFixed(1) : '—';
+    const lock = c.pll_lock != null ? (+c.pll_lock).toString(16) : '—';
+    const enumerated = c.enum_ok ? 'ok' : (c.enum_id === 255 ? 'no reply' : (c.enum_id != null ? ('id ' + c.enum_id) : '—'));
+    const reinit = c.reinit ? 'yes' : '—';
     tr.innerHTML =
       '<td class="chip">' + i + '</td>' +
       '<td>' + temp + '</td>' +
@@ -883,6 +889,9 @@ function renderChips(d, phase) {
       '<td>' + (freq != null ? freq : '—') + '</td>' +
       '<td>' + err + '</td>' +
       '<td>' + ghs + '</td>' +
+      '<td>' + lock + '</td>' +
+      '<td>' + enumerated + '</td>' +
+      '<td>' + reinit + '</td>' +
       '<td><input type="number" class="off" data-i="' + i + '" step="1" min="-150" max="50" value="' + off + '"' + (chipTrial ? ' disabled' : '') + '></td>' +
       '<td><input type="number" class="abs" data-i="' + i + '" step="1" min="100" max="580" value="' + (base ? base + off : '') + '"' + (chipTrial ? ' disabled' : '') + '></td>';
     body.appendChild(tr);
@@ -920,7 +929,10 @@ async function loadChips() {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const detail = await r.json();
     renderChips(detail, phase);
-    const hot = (detail.chips || []).reduce((m, c) => Math.max(m, +c.temp_c || 0), 0);
+    const hot = (detail.chips || []).reduce((m, c) => {
+      const t = +c.temp_c;
+      return (Number.isFinite(t) && t > -200) ? Math.max(m, t) : m;
+    }, 0);
     const worst = (detail.chips || []).reduce((m, c) => Math.max(m, +c.spd_dh || 0), 0);
     const n = detail.asics_total || (detail.chips || []).length;
     if ($('diagSummary')) {

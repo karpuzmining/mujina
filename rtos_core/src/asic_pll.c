@@ -308,6 +308,27 @@ void asic_refresh_rolltime(uint8_t miner_id, uint16_t freq3)
 	a3197s_select_chip(miner_id, chip_select_id);
 }
 
+/* Select this chip, soft-reset it, and program its PLLs again. Used when
+ * a die sits at 100% SmartSpeed error while the rest of the chain hashes.
+ * pll_lock_check() only logs, and on a broadcast it samples chip 0, so a
+ * pair that never locked was left that way. */
+void asic_reinit_chip(uint8_t miner_id, uint16_t asic_id)
+{
+	const uint16_t *base = g_pll_state.set_pll[miner_id][0];
+	int16_t off = 0;
+	uint16_t saved = asic_get_chip_select();
+
+	if (asic_id < PLL_CHIP_OFFSET_MAX)
+		off = g_pll_chip_offset[miner_id][asic_id];
+
+	a3197s_select_chip(miner_id, asic_id);
+	a3197s_soft_reset(miner_id);
+	a3197s_set_pll_seq(miner_id, asic_id, 1,
+		pll_offset_freq(base[0], off), pll_offset_freq(base[1], off),
+		pll_offset_freq(base[2], off), pll_offset_freq(base[3], off));
+	a3197s_select_chip(miner_id, saved);
+}
+
 /* Moves the per-chip offsets toward target, at most PLL_RAMP_STEP_MHZ per
  * chip per step, one second apart (same pacing as asic_ramp_pll_freq()). */
 void asic_set_pll_chip_offsets(uint8_t miner_id, const int16_t target[PLL_CHIP_OFFSET_MAX])

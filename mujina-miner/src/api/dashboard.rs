@@ -411,10 +411,14 @@ fn board_json(b: &BoardTelemetry, series: Vec<f64>) -> Value {
                         json!({
                             "index": c.chip,
                             "ghs": c.ghsspd,
-                            "temp_c": c.temp_c,
+                            "temp_c": if c.temp_c > -200.0 { Some(c.temp_c) } else { None },
                             "volt_mv": c.volt_mv,
                             "spd_dh": c.spd_dh,
                             "pll_mhz": c.pll_freq[0],
+                            "pll_lock": c.pll_lock,
+                            "enum_ok": c.enum_ok,
+                            "enum_id": c.enum_id,
+                            "reinit": c.reinit,
                         })
                     })
                     .collect();

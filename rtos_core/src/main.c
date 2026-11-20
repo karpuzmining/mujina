@@ -2295,6 +2295,10 @@ static void *stage6_worker(void *arg)
 			struct ipc_status st;
 			double temp_sum = 0, temp_max = -1000;
 			int temp_n = 0;
+			int chain_alive = 0;
+			static uint8_t dead_ticks[IPC_STATUS_MAX_CHIPS];
+			/* 12 status intervals is 3 minutes at 100% error. */
+			const uint8_t dead_limit = 12;
 
 			memset(&st, 0, sizeof(st));
 
@@ -2340,6 +2344,42 @@ static void *stage6_worker(void *arg)
 				cs->nonce_data = cdata;
 
 				asic_get_spd_chip_stat(STAGE6_UART_CHANNEL, (uint16_t)chip, &cs->ghsspd, &cs->spd_dh);
+
+				cs->pll_lock = asic_get_pll_lock(STAGE6_UART_CHANNEL, (uint16_t)chip);
+				{
+					uint32_t enum_id = 0x3ff;
+					int enum_ret = asic_read_chip_id(STAGE6_UART_CHANNEL, (uint16_t)chip, &enum_id);
+
+					cs->enum_ok = (enum_ret == 0 && enum_id == (uint32_t)chip) ? 1 : 0;
+					cs->enum_id = enum_ret ? 0xff : (uint8_t)(enum_id & 0xff);
+				}
+				if (cs->ghsspd >= 10.0f)
+					chain_alive = 1;
+			}
+
+			/* A pair stuck at 100% error gets one soft reset and a fresh
+			 * PLL program. Only once the rest of the chain is hashing, so
+			 * a board that has not produced a speed log yet is left alone. */
+			if (chain_alive) {
+				for (chip = 0; chip < st.chip_count; chip++) {
+					struct ipc_chip_status *cs = &st.chips[chip];
+
+					if (cs->spd_dh >= 99.0f && cs->ghsspd < 1.0f) {
+						if (dead_ticks[chip] < 255)
+							dead_ticks[chip]++;
+						if (dead_ticks[chip] >= dead_limit) {
+							fprintf(ctx->fp,
+								"REINIT chip=%u spd_dh=%.1f ghsspd=%.1f pll_lock=0x%x enum_id=%u\n",
+								chip, cs->spd_dh, cs->ghsspd, cs->pll_lock, cs->enum_id);
+							fflush(ctx->fp);
+							asic_reinit_chip(STAGE6_UART_CHANNEL, (uint16_t)chip);
+							dead_ticks[chip] = 0;
+							cs->reinit = 1;
+						}
+					} else {
+						dead_ticks[chip] = 0;
+					}
+				}
 			}
 
 			st.asics_total = STAGE6_CHIP_COUNT;
