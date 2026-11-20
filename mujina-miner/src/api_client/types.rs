@@ -566,6 +566,9 @@ pub struct SourceTelemetry {
     /// Shares found locally that were below this pool's difficulty.
     #[serde(default)]
     pub shares_low_diff: u64,
+    /// Latest connect failure. Absent once the session is up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// Serialize an `Option<f64>` so that whole numbers appear without a

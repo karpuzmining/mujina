@@ -2200,13 +2200,15 @@ fn pool1_response() -> PoolConfigResponse {
     }
 }
 
-fn pool_link_state(weight: u16, connected: bool) -> &'static str {
+fn pool_link_state(weight: u16, connected: bool, failed: bool) -> &'static str {
     if connected {
         "connected"
     } else if weight == 0 {
         "standby"
-    } else {
+    } else if failed {
         "down"
+    } else {
+        "connecting"
     }
 }
 
@@ -2255,8 +2257,13 @@ async fn get_pools(State(state): State<SharedState>) -> Json<PoolsResponse> {
                 hashrate_1h: live.map(|s| s.hashrate_1h).unwrap_or(0),
                 reject_reasons: live.map(|s| s.reject_reasons.clone()).unwrap_or_default(),
                 shares_low_diff: live.map(|s| s.shares_low_diff).unwrap_or(0),
-                state: pool_link_state(pool.weight, connected).to_string(),
-                last_error: None,
+                state: pool_link_state(
+                    pool.weight,
+                    connected,
+                    live.and_then(|s| s.last_error.as_ref()).is_some(),
+                )
+                .to_string(),
+                last_error: live.and_then(|s| s.last_error.clone()),
                 latency_ms: None,
                 best_share: None,
                 best_share_alltime: None,
