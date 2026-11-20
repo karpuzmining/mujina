@@ -101,11 +101,12 @@
   .dot.bad { background: var(--red); box-shadow: 0 0 8px var(--red); }
 
   .sec { font-family: 'Orbitron', sans-serif; font-weight: 700; font-size: 12px;
-    letter-spacing: .18em; text-transform: uppercase; color: var(--dim);
+    letter-spacing: .18em; text-transform: uppercase; color: var(--mag);
+    text-shadow: 0 0 8px rgba(255,46,151,.45);
     margin: 28px 0 12px; display: flex; align-items: center; gap: 10px; }
   .sec:first-of-type { margin-top: 0; }
   .sec::after { content: ''; flex: 1; height: 1px; background: var(--line); }
-  .sec-sub { font-family: 'Share Tech Mono', monospace; text-transform: none; letter-spacing: 0; font-size: 11px; color: var(--dim); flex: none; }
+  .sec-sub { font-family: 'Share Tech Mono', monospace; text-transform: none; letter-spacing: 0; font-size: 11px; color: var(--mag); flex: none; text-shadow: none; }
 
   .card { background: var(--panel); border: 1px solid var(--line); padding: 18px; }
   .row { display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; }
@@ -192,7 +193,7 @@
   }
   body.theme-minimal h1 { color: #2d3e50 !important; }
   body.theme-minimal h1 .chev,
-  body.theme-minimal .sec { text-shadow: none !important; color: #2d3e50 !important; }
+  body.theme-minimal .sec, body.theme-minimal .sec-sub { text-shadow: none !important; color: var(--mag) !important; }
   body.theme-minimal .card {
     border-radius: 12px;
     background: rgba(255, 255, 255, 0.7) !important;
@@ -314,14 +315,14 @@
   </div>
   <nav class="menubar" aria-label="Main Menu">
     <a class="menubtn" href="/dashboard">Dashboard</a>
-    <a class="menubtn" href="/power">Power</a>
-    <a class="menubtn" href="/tuning">Tuning</a>
-    <a class="menubtn" href="/fan">Fan</a>
-    <a class="menubtn" href="/fan#curve">Fan Curve</a>
+    <a class="menubtn" href="/dashboard#power">Power</a>
+    <a class="menubtn" href="/dashboard#tuning">Tuning</a>
+    <a class="menubtn" href="/dashboard#fan">Fan</a>
+    <a class="menubtn" href="/dashboard#curve">Fan Curve</a>
     <a class="menubtn on" href="/pool">Pool</a>
     <a class="menubtn" href="/led">LED</a>
     <a class="menubtn" href="/firmware">Firmware</a>
-    <a class="menubtn" href="/display">Display</a>
+    <a class="menubtn" href="/dashboard#display">Display</a>
     <a class="menubtn" href="/info">Info</a>
   </nav>
 

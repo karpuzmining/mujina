@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet">
 <style>
-  :root { --cyan:#00f0ff; --bg:#05060c; --panel:#0a0f1c; --panel2:#0d1424; --line:#14243a; --dim:#4a6a86; --ink:#d6f7ff; --green:#1bff9c; --red:#ff3860; }
+  :root { --cyan:#00f0ff; --mag:#ff2e97; --bg:#05060c; --panel:#0a0f1c; --panel2:#0d1424; --line:#14243a; --dim:#4a6a86; --ink:#d6f7ff; --green:#1bff9c; --red:#ff3860; }
   * { box-sizing: border-box; } html, body { margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--ink); font-family: 'Share Tech Mono', ui-monospace, monospace; }
   .wrap { max-width: 1120px; margin: 0 auto; padding: 24px 20px 60px; }
@@ -17,7 +17,8 @@
   .menubar { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 20px; }
   .menubar .menubtn { background:#0a1120; border:1px solid var(--line); color:var(--cyan); font-family:'Orbitron',sans-serif; font-weight:700; font-size:11px; letter-spacing:.14em; text-transform:uppercase; padding:9px 14px; border-radius:4px; text-decoration:none; display:inline-flex; align-items:center; }
   .menubar .menubtn.on { border-color: var(--cyan); box-shadow: 0 0 10px rgba(0,240,255,.3); }
-  .sec { font-family:'Orbitron',sans-serif; font-weight:700; font-size:12px; letter-spacing:.18em; text-transform:uppercase; color:var(--dim); margin:28px 0 12px; display:flex; align-items:center; gap:10px; }
+  .sec { font-family:'Orbitron',sans-serif; font-weight:700; font-size:12px; letter-spacing:.18em; text-transform:uppercase; color:var(--mag); text-shadow:0 0 8px rgba(255,46,151,.45); margin:28px 0 12px; display:flex; align-items:center; gap:10px; }
+  .sec-sub { color:var(--mag); text-shadow:none; }
   .sec::after { content:''; flex:1; height:1px; background:var(--line); }
   .sec-sub { font-family:'Share Tech Mono',monospace; text-transform:none; letter-spacing:0; font-size:11px; color:var(--dim); flex:none; }
   .card { background:var(--panel); border:1px solid var(--line); padding:18px; max-width:560px; }
@@ -43,14 +44,14 @@
   </div>
   <nav class="menubar" aria-label="Main Menu">
     <a class="menubtn" href="/dashboard">Dashboard</a>
-    <a class="menubtn" href="/power">Power</a>
-    <a class="menubtn" href="/tuning">Tuning</a>
-    <a class="menubtn" href="/fan">Fan</a>
-    <a class="menubtn" href="/fan#curve">Fan Curve</a>
+    <a class="menubtn" href="/dashboard#power">Power</a>
+    <a class="menubtn" href="/dashboard#tuning">Tuning</a>
+    <a class="menubtn" href="/dashboard#fan">Fan</a>
+    <a class="menubtn" href="/dashboard#curve">Fan Curve</a>
     <a class="menubtn" href="/pool">Pool</a>
     <a class="menubtn" href="/led">LED</a>
     <a class="menubtn" href="/firmware">Firmware</a>
-    <a class="menubtn on" href="/display">Display</a>
+    <a class="menubtn on" href="/dashboard#display">Display</a>
     <a class="menubtn" href="/info">Info</a>
   </nav>
   <div class="sec">Theme<span class="sec-sub">synced with unit LCD</span></div>

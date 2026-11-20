@@ -102,11 +102,16 @@
   .dot.warn { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
 
   .sec { font-family: 'Orbitron', sans-serif; font-weight: 700; font-size: 12px;
-    letter-spacing: .18em; text-transform: uppercase; color: var(--dim);
-    margin: 28px 0 12px; display: flex; align-items: center; gap: 10px; }
+    letter-spacing: .18em; text-transform: uppercase; color: var(--mag);
+    text-shadow: 0 0 8px rgba(255,46,151,.45);
+    margin: 28px 0 12px; display: flex; align-items: center; gap: 10px; scroll-margin-top: 12px; }
   .sec:first-of-type { margin-top: 0; }
   .sec::after { content: ''; flex: 1; height: 1px; background: var(--line); }
-  .sec-sub { font-family: 'Share Tech Mono', monospace; text-transform: none; letter-spacing: 0; font-size: 11px; color: var(--dim); flex: none; }
+  .sec-sub { font-family: 'Share Tech Mono', monospace; text-transform: none; letter-spacing: 0; font-size: 11px; color: var(--mag); flex: none; text-shadow: none; }
+  .tune-head { display: flex; align-items: flex-start; gap: 10px; flex-wrap: wrap; margin: 0 0 6px; }
+  .board-pill { border: 1px solid var(--line); background: var(--panel); color: var(--cyan); padding: 8px 12px; font-family: 'Orbitron', sans-serif; font-size: 11px; letter-spacing: .12em; text-transform: uppercase; }
+  .jumps { display: flex; flex-wrap: wrap; gap: 6px; flex: 1 1 180px; }
+  .jumps a { border: 1px solid var(--line); background: var(--panel2); color: var(--ink); text-decoration: none; padding: 8px 10px; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
 
   .card { background: var(--panel); border: 1px solid var(--line); padding: 18px; }
   .card + .card { margin-top: 12px; }
@@ -290,7 +295,7 @@
   }
   body.theme-minimal h1 { color: #2d3e50 !important; }
   body.theme-minimal h1 .chev,
-  body.theme-minimal .sec { text-shadow: none !important; color: #2d3e50 !important; }
+  body.theme-minimal .sec, body.theme-minimal .sec-sub { text-shadow: none !important; color: var(--mag) !important; }
   body.theme-minimal .card {
     border-radius: 12px;
     background: rgba(255, 255, 255, 0.7) !important;
@@ -479,23 +484,34 @@
   </div>
   <nav class="menubar" aria-label="Main Menu">
     <a class="menubtn" href="/dashboard">Dashboard</a>
-    <a class="menubtn" href="/power">Power</a>
-    <a class="menubtn on" href="/tuning">Tuning</a>
-    <a class="menubtn" href="/fan">Fan</a>
-    <a class="menubtn" href="/fan#curve">Fan Curve</a>
+    <a class="menubtn" href="/dashboard#power">Power</a>
+    <a class="menubtn on" href="/dashboard#tuning">Tuning</a>
+    <a class="menubtn" href="/dashboard#fan">Fan</a>
+    <a class="menubtn" href="/dashboard#curve">Fan Curve</a>
     <a class="menubtn" href="/pool">Pool</a>
     <a class="menubtn" href="/led">LED</a>
     <a class="menubtn" href="/firmware">Firmware</a>
-    <a class="menubtn" href="/display">Display</a>
+    <a class="menubtn" href="/dashboard#display">Display</a>
     <a class="menubtn" href="/info">Info</a>
   </nav>
 
+  <div class="tune-head">
+    <div class="board-pill" id="tuneBoardName">board</div>
+    <nav class="jumps" aria-label="Sections">
+      <a href="#auto-tuner">Auto Tuner</a>
+      <a href="#live-tuning">Live Tuning</a>
+      <a href="#pd-input">USB-C PD</a>
+      <a href="#hashrate-autotune">Hashrate</a>
+      <a href="#fan-thermostat">Fan thermostat</a>
+      <a href="#per-chip">Per-chip</a>
+    </nav>
+  </div>
   <div class="boardtabs" id="tuneBoardTabs" hidden></div>
   <div class="note" id="powerLine" hidden></div>
   <div class="note" id="tuningNone" hidden>No tuning controls for this board.</div>
 
   <div id="ownSection" hidden>
-  <div class="sec">Auto Tuner<span class="sec-sub">profile, target, continuous</span></div>
+  <div class="sec" id="auto-tuner">Auto Tuner<span class="sec-sub">profile, target, continuous</span></div>
   <div class="card">
     <div id="ownCur">tuner status loading&hellip;</div>
     <div class="row">
@@ -542,7 +558,7 @@
   </div>
 
   <div id="manualSection" hidden>
-  <div class="sec">Live Tuning<span class="sec-sub">clock frequency and core voltage</span></div>
+  <div class="sec" id="live-tuning">Live Tuning<span class="sec-sub">clock frequency and core voltage</span></div>
   <div class="card">
     <div class="row" id="tunePresetRow">
       <label for="tunePreset">Mode</label>
@@ -572,7 +588,7 @@
     <div class="msg" id="tuneMsg"></div>
   </div>
 
-  <div class="sec">USB-C PD Input<span class="sec-sub">what the connected PSU is actually delivering</span></div>
+  <div class="sec" id="pd-input">USB-C PD Input<span class="sec-sub">what the connected PSU is actually delivering</span></div>
   <div class="card">
     <dl class="kv">
       <dt>Bus Voltage</dt><dd id="psuBusV">—</dd>
@@ -592,7 +608,7 @@
     <div class="msg" id="psuMsg"></div>
   </div>
 
-  <div class="sec">Hashrate Autotune<span class="sec-sub">searches frequency/voltage for the lowest power that sustains a target TH/s</span></div>
+  <div class="sec" id="hashrate-autotune">Hashrate Autotune<span class="sec-sub">searches frequency/voltage for the lowest power that sustains a target TH/s</span></div>
   <div class="card">
     <div class="toggle-row" id="toggleRow" style="margin-bottom:16px">
       <div style="display:flex;align-items:center;gap:10px">
@@ -620,7 +636,7 @@
     <p class="hint" style="margin-top:14px">Mutually exclusive with the Live Tuning card's Power Target / Temp Target on the main dashboard — enabling this disables both, and issuing a manual tune command disables this in turn. Levels beyond 1.00 extrapolate past HIGH's own calibration point, hard-clamped to this board's absolute frequency/voltage limits.</p>
   </div>
 
-  <div class="sec">Fan Chip Thermostat<span class="sec-sub">holds chip temp near a target instead of jumping straight to 100%</span></div>
+  <div class="sec" id="fan-thermostat">Fan Chip Thermostat<span class="sec-sub">holds chip temp near a target instead of jumping straight to 100%</span></div>
   <div class="card">
     <div class="row">
       <label for="fanThermTarget">Target Chip Temp (°C)</label>
@@ -1229,7 +1245,11 @@ setInterval(() => { if (!chipDemo()) { loadConn(); loadPsu(); loadAutotune(); } 
   async function boot() {
     try {
       const r = await fetch('/api/v0/system');
-      if (r.ok) SYS = await r.json();
+      if (r.ok) {
+        SYS = await r.json();
+        const board = SYS.boards && SYS.boards[0];
+        if (board && $('tuneBoardName')) $('tuneBoardName').textContent = board.name || 'board';
+      }
     } catch (e) {}
     try {
       const r = await fetch('/data');
