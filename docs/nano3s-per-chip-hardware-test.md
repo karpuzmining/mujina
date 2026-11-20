@@ -71,3 +71,39 @@ miner bundle that embeds `rtos_core/build/rtos_core.elf`).
     half-programmed PLL. The sequence either finishes or the boot path
     parks the chain again; do not resume a chip that was left between
     the PLL1 write and the PLL0 mux restore.
+
+## Rollback
+
+Take this path before the test build is installed, and again if the
+chain hangs or you want v5.1.0 back. The new `mujina-minerd` copies its
+embedded `rtos_core.elf` onto `/mntapp/release/rtt/rtos_core.elf` at
+startup and reboots, so replacing only the Linux binary is not enough
+unless that binary is the v5.1.0 miner (it embeds the v5.1.0 ELF).
+
+**Back to Mujina v5.1.0, keeping `/data/userconfig` (pool, Wi-Fi, tuning).**
+From a computer on the same network, upload the v5.1.0 OTA bundle.
+The miner applies it and reboots. On the next boot the v5.1.0 miner
+writes the v5.1.0 `rtos_core.elf` back.
+
+```text
+curl -X POST --data-binary @nano-mujina-v5.1.0-bundle.bin \
+  -H "Content-Type: application/octet-stream" \
+  http://<MINER_IP>/api/v0/firmware/bundle
+```
+
+That file is attached to
+[IxTechCrypto/mujina v5.1.0](https://github.com/IxTechCrypto/mujina/releases/tag/v5.1.0)
+(`nano-mujina-v5.1.0-bundle.bin`, 21,387,784 bytes). If the dashboard
+still answers, the same upload is **Firmware → bundle** in the web UI.
+
+**Back to Mujina v5.1.0 from USB, including an unbootable unit.**
+Hold the recovery pinhole, apply 28 V, and flash
+`nano-mujina-v5.1.0-release.kdimg` (129,232,128 bytes, same release)
+with Torii or the K230 burning tool, as in
+`docs/nano3s-install-guide.md`. This rewrites the app and data
+partitions from the v5.1.0 image. Pool and Wi-Fi settings that lived
+only in `/data` are replaced by whatever is in that image.
+
+**Back to stock Canaan firmware.** The Mujina OTA endpoint cannot do
+this. Use the same USB recovery burn with a Canaan image. That removes
+Mujina. An unbootable board uses that same recovery button path.
