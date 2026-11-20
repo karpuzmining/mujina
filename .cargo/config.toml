@@ -2,5 +2,9 @@
 target = "riscv64gc-unknown-linux-gnu"
 
 [target.riscv64gc-unknown-linux-gnu]
-linker = "riscv64-linux-gnu-gcc"
-rustflags = ["-L", "/home/grant/riscv64-sysroot/usr/lib/riscv64-linux-gnu"]
+linker = "/home/grant/nano3s-build/rv64gc-gcc"
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "target-cpu=generic-rv64",
+    "-L", "/home/grant/riscv64-sysroot/usr/lib/riscv64-linux-gnu",
+]

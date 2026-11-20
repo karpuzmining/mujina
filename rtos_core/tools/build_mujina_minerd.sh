@@ -43,4 +43,6 @@ strings "$BIN" | grep -c nano3s_ipc_ || { echo "[!] no nano3s_ipc_* symbols foun
 ls -lh "$BIN"
 riscv64-linux-gnu-strip --strip-all -o "$BIN.stripped" "$BIN"
 ls -lh "$BIN.stripped"
+echo "[*] Checking the ELF will start on the Nano 3S loader..."
+"$WORKSPACE_ROOT/scripts/check-nano3s-minerd-elf.sh" "$BIN.stripped"
 echo "[+] Built $BIN.stripped"
