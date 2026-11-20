@@ -1,15 +1,15 @@
 # Nano 3S multi-pool hardware checklist
 
-Test build `v5.1.0-multipool-test.2`. It is v5.1.0 plus in-process multi-pool, and the dashboard menus open their own pages. The RT-Smart core embedded in the miner is the v5.1.0 release `rtos_core.elf` (`2e88ff5f2b58acbe3761a1ab083ad3c46b89b296f7491f05ca1e0970717299d1`). Do not use this bundle to test the per-chip PLL changes; that is a different image.
+Test build `v5.1.0-multipool-test.3`. It is v5.1.0 plus in-process multi-pool, and the dashboard menus open their own pages. The RT-Smart core embedded in the miner is the v5.1.0 release `rtos_core.elf` (`2e88ff5f2b58acbe3761a1ab083ad3c46b89b296f7491f05ca1e0970717299d1`). Do not use this bundle to test the per-chip PLL changes; that is a different image.
 
-SHA-256 of `nano-mujina-v5.1.0-multipool-test.2-bundle.bin`:
+SHA-256 of `nano-mujina-v5.1.0-multipool-test.3-bundle.bin`:
 
-`ffee1ec7cb1cad4904dc5eecdd382bbb63d8e0a9534144f17406e694cc6d3297`
+`8f5afd422881364b6ca6fb6cd374a675a2fc707e3d2ca01b0e3179797b76f8c6`
 
 ## Install
 
 1. Boot the unit into the normal dashboard, not ROM boot mode. Boot mode only accepts a `.kdimg`.
-2. Open **Firmware** and upload `nano-mujina-v5.1.0-multipool-test.2-bundle.bin`.
+2. Open **Firmware** and upload `nano-mujina-v5.1.0-multipool-test.3-bundle.bin`.
 3. Wait until the dashboard is back. Confirm the build string on **Info**.
 
 ## Menus
@@ -30,7 +30,8 @@ Each item opens its own page. Old `/dashboard#...` links redirect there. There i
 4. Each pool row shows connected or down, difficulty, accepted, rejected, and effective hashrate for 10 min and 1 h.
 5. Set one weight to 0. That pool stays in the list as a backup and should not take hash time while the others are up.
 6. Remove a pool and save again. The removed pool drops off the live list without a reboot.
-7. `GET /api/v0/pool` still returns pool 1. `GET /api/v0/pools` returns every pool and never includes a `password` field.
+7. `GET /api/v0/pool` still returns pool 1. `GET /api/v0/pools` returns every pool and never includes a `password` field. Each pool's `reject_reasons` lists the pool's own error text and a count. The same line is under the pool card on `/pool`.
+8. `GET /api/v0/system` includes `rtos_core.embedded_sha256` (the elf baked into this miner) and `rtos_core.running_sha256` (the elf at `/mntapp/release/rtt/rtos_core.elf`). They should both be the v5.1.0 elf `2e88ff5f2b58acbe3761a1ab083ad3c46b89b296f7491f05ca1e0970717299d1` on this image.
 
 ## Failover
 
