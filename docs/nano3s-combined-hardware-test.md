@@ -1,12 +1,20 @@
 # Nano 3S combined test checklist
 
-Test build `v5.1.0-combined-test.1` on `nano3s-combined-test`. It is the multi-pool line plus per-chip clocks, the power sensor, and the dashboard popups.
+Test build `v5.1.0-combined-test.2` on `nano3s-combined-test`. It is the multi-pool line plus per-chip clocks, the power sensor, and the dashboard popups.
 
-SHA-256 of `nano-mujina-v5.1.0-combined-test.1-bundle.bin`:
+`v5.1.0-combined-test.1` does not start on the Nano. Its miner was linked for `/lib/ld-linux-riscv64-lp64d.so.1`. Use test.2.
 
-`4821ea60448e90f5e08234821555c32be548b448592ad9bd6d2114dfdbb82705`
+SHA-256 of `nano-mujina-v5.1.0-combined-test.2-bundle.bin`:
 
-Expected build id on **Info** and `GET /api/v0/system`: `45ecfd1`.
+`ba517cf943b40ecb0e4f7f4d2fa1b1803deda904766f73463a356f49d3e4e702`
+
+SHA-256 of the raw `mujina-minerd` asset (same bytes as inside the bundle):
+
+`06f1f3faacab1d15c53642a626a9ab808912b3fa1890a87db426094dbde80c98`
+
+Expected build id on **Info** and `GET /api/v0/system`: `0f6b45b`.
+
+The miner is statically linked, the same shape as v5.1.0 and multipool test.3: `readelf -l` has no interpreter and `readelf -d` has no NEEDED entries. `scripts/check-nano3s-minerd-elf.sh` checks that before a bundle is packed.
 
 `rtos_core.elf` SHA-256 (522320 bytes):
 
@@ -17,9 +25,9 @@ After the unit is running this image, `rtos_core.embedded_sha256` and `rtos_core
 ## Install
 
 1. Boot into the normal dashboard, not ROM boot mode. Boot mode only accepts a `.kdimg`.
-2. Open **Firmware** and upload `nano-mujina-v5.1.0-combined-test.1-bundle.bin`.
+2. Open **Firmware** and upload `nano-mujina-v5.1.0-combined-test.2-bundle.bin`. If the dashboard is down because test.1 is installed, copy the raw `mujina-minerd` asset over SSH to `/data/mujina-minerd`, mark it executable, and start it from `mujina_display_startup.sh`.
 3. The bundle applies and the unit reboots. This image also replaces `rtos_core.elf`, so after that reboot it writes `/sharefs/reboot_request` and reboots one more time. Wait through both before judging hashrate or the core hash.
-4. **Info** shows build `45ecfd1`.
+4. **Info** shows build `0f6b45b`.
 
 ## Menus
 
