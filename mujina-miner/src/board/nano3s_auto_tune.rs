@@ -518,6 +518,9 @@ pub(crate) fn default_fan_target_c(profile: Option<TuneProfile>, cap: f32) -> f3
     match profile {
         Some(TuneProfile::Efficient) => 68.0,
         Some(TuneProfile::Quiet) => 65.0,
+        // Max Hash used to sit at cap-2 (90 C) and the fan then cut duty
+        // while the die was still in the 80s. Hold 80 C.
+        Some(TuneProfile::MaxHash) => 80.0,
         _ => 90.0f32.min(cap - 2.0),
     }
 }
@@ -535,12 +538,21 @@ pub(crate) struct FanState {
     /// brief 100 % spike resumes near equilibrium (+8 %) instead of unwinding
     /// slowly from 100 % and chilling the die by 20 C.
     pre_full_duty: Option<f32>,
+    /// Lowest duty the loop may command. The fan curve raises this above 20 %.
+    floor: f32,
 }
 
 impl Default for FanState {
     fn default() -> Self {
         // Start from 100 %: a fan we have just taken over from auto ramps down.
-        Self { duty: 100.0, sent: None, hold_full: false, prev_temp: None, pre_full_duty: None }
+        Self {
+            duty: 100.0,
+            sent: None,
+            hold_full: false,
+            prev_temp: None,
+            pre_full_duty: None,
+            floor: FAN_DUTY_MIN,
+        }
     }
 }
 
@@ -591,6 +603,54 @@ fn plausible(temp: Option<f32>) -> Option<f32> {
 ///   - Within `4.5 C` below target, caps downward step rate to `-3 %` per tick
 ///     and holds a `28 %` floor (when target >= 80 C) so the fan settles at
 ///     equilibrium instead of dumping to 20 % and bouncing over cap.
+/// Hottest valid chip, ignoring the −273 °C PVT sentinel. When any chip
+/// has no PVT reading, add 5 °C so an unmeasured die is not treated as cold.
+pub(crate) fn control_temp_c(samples: &[f32]) -> Option<f32> {
+    let mut max = f32::MIN;
+    let mut n = 0u32;
+    let mut missing = false;
+    for &t in samples {
+        if t.is_finite() && t > 0.0 && t <= TEMP_PLAUSIBLE_MAX_C {
+            max = max.max(t);
+            n += 1;
+        } else if t.is_finite() && t < -200.0 {
+            missing = true;
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    Some(if missing { max + 5.0 } else { max })
+}
+
+/// Duty the saved curve asks for at `temp_c`. Below two points, 20 %.
+pub(crate) fn fan_curve_floor_percent(temp_c: f32, points: &[(f64, f64)]) -> u8 {
+    if points.len() < 2 || !temp_c.is_finite() {
+        return FAN_DUTY_MIN as u8;
+    }
+    let mut pts: Vec<(f32, f32)> = points
+        .iter()
+        .filter(|(t, d)| t.is_finite() && d.is_finite())
+        .map(|(t, d)| (*t as f32, *d as f32))
+        .collect();
+    pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    if pts.len() < 2 {
+        return FAN_DUTY_MIN as u8;
+    }
+    let duty = if temp_c <= pts[0].0 {
+        pts[0].1
+    } else if temp_c >= pts[pts.len() - 1].0 {
+        pts[pts.len() - 1].1
+    } else {
+        let i = pts.iter().position(|(t, _)| *t >= temp_c).unwrap_or(pts.len() - 1);
+        let (t0, d0) = pts[i - 1];
+        let (t1, d1) = pts[i];
+        let span = (t1 - t0).max(0.1);
+        d0 + (temp_c - t0) / span * (d1 - d0)
+    };
+    duty.clamp(FAN_DUTY_MIN, 100.0).round() as u8
+}
+
 pub(crate) fn fan_step(st: &mut FanState, temp: Option<f32>, cap: f32, target: f32, force_full: bool) -> Option<u8> {
     let t = plausible(temp);
     if force_full && !st.hold_full {
@@ -619,6 +679,7 @@ pub(crate) fn fan_step(st: &mut FanState, temp: Option<f32>, cap: f32, target: f
                     st.duty = (pre + 8.0).clamp(35.0, 80.0);
                 }
             }
+            let before = st.duty;
             if st.hold_full {
                 st.duty = 100.0;
             } else if t >= cap - 2.0 {
@@ -667,6 +728,11 @@ pub(crate) fn fan_step(st: &mut FanState, temp: Option<f32>, cap: f32, target: f
                 };
                 st.duty = (st.duty + step).clamp(floor, 100.0);
             }
+            // At or above the target the fan may only stay or rise.
+            if t >= target && st.duty < before {
+                st.duty = before;
+            }
+            st.duty = st.duty.max(st.floor);
         }
     }
     let d = st.duty_percent();
@@ -1060,6 +1126,11 @@ impl AutoTune {
     /// write to the harness (e.g. after recovering from emergency fan overrides).
     pub(crate) fn invalidate_fan_cache(&mut self) {
         self.fan.sent = None;
+    }
+
+    /// Lowest fan duty for this tick, from the saved curve at `temp_c`.
+    pub(crate) fn set_fan_floor(&mut self, percent: u8) {
+        self.fan.floor = (percent as f32).clamp(FAN_DUTY_MIN, 100.0);
     }
 
     /// One fan-loop step; at most one harness write per tick. `temp_max_c`
@@ -1511,7 +1582,14 @@ mod tests {
     // --- fan loop ------------------------------------------------------------
 
     fn st_at(duty: f32) -> FanState {
-        FanState { duty, sent: Some(duty.round() as u8), hold_full: false, prev_temp: None, pre_full_duty: None }
+        FanState {
+            duty,
+            sent: Some(duty.round() as u8),
+            hold_full: false,
+            prev_temp: None,
+            pre_full_duty: None,
+            floor: FAN_DUTY_MIN,
+        }
     }
 
     #[test]
@@ -1656,7 +1734,7 @@ mod tests {
         for (p, want) in [
             (TuneProfile::Quiet, 65.0),
             (TuneProfile::Balanced, 88.0), // cap 90.0 - 2.0 = 88.0 (optimal 90C clamped by Balanced cap)
-            (TuneProfile::MaxHash, 90.0),  // optimal 90.0C (cap 92 - 2 = 90.0)
+            (TuneProfile::MaxHash, 80.0),
         ] {
             let mut o = AutoTune::new();
             o.enable(p);
@@ -1672,6 +1750,33 @@ mod tests {
         let mut o = AutoTune::new();
         o.enable(TuneProfile::Efficient);
         assert_eq!(o.disable(), None);
+    }
+
+    #[test]
+    fn fan_does_not_fall_while_the_die_is_at_or_above_target() {
+        let mut st = st_at(48.0);
+        st.prev_temp = Some(91.2);
+        fan_step(&mut st, Some(81.8), 92.0, 80.0, false);
+        assert!(st.duty_percent() >= 48, "duty {}", st.duty_percent());
+    }
+
+    #[test]
+    fn missing_pvt_adds_a_margin_and_ignores_the_sentinel() {
+        let known = [76.8, 76.0, -273.0, -273.0, 85.1];
+        assert_eq!(control_temp_c(&known), Some(90.1));
+        assert_eq!(control_temp_c(&[76.8, 85.1]), Some(85.1));
+        assert_eq!(control_temp_c(&[-273.0, -273.0]), None);
+    }
+
+    #[test]
+    fn fan_curve_floor_holds_the_interpolated_duty() {
+        let points = [(40.0, 20.0), (70.0, 40.0), (80.0, 70.0)];
+        assert_eq!(fan_curve_floor_percent(80.0, &points), 70);
+        assert_eq!(fan_curve_floor_percent(75.0, &points), 55);
+        let mut st = st_at(30.0);
+        st.floor = 55.0;
+        fan_step(&mut st, Some(60.0), 92.0, 80.0, false);
+        assert!(st.duty_percent() >= 55, "duty {}", st.duty_percent());
     }
 
     #[test]
