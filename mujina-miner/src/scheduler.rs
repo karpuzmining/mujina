@@ -706,9 +706,12 @@ impl Scheduler {
             if let Some(source) = self.sources.get_mut(task_entry.source_id) {
                 source.low_diff = source.low_diff.saturating_add(1);
             }
-            trace!(
+            debug!(
+                source = %self.sources.get(task_entry.source_id).map(|s| s.name.as_str()).unwrap_or("unknown"),
+                job_id = %task_entry.template.id,
                 share_difficulty = share_d,
                 pool_difficulty = need,
+                nonce = format!("{:08x}", nonce),
                 "Share below pool difficulty (not submitted)"
             );
             return;
@@ -720,8 +723,19 @@ impl Scheduler {
 
             // Submit share to originating source
             if let Some(source) = self.sources.get(task_entry.source_id) {
+                let version = share.version.to_consensus() as u32;
                 let source_share = SourceShare::from((share, task_entry.template.id.clone()));
 
+                debug!(
+                    source = %source.name,
+                    job_id = %task_entry.template.id,
+                    share_difficulty = share_d,
+                    pool_difficulty = need,
+                    nonce = format!("{:08x}", nonce),
+                    submitted_nonce = format!("{:08x}", nonce.swap_bytes()),
+                    version = format!("{version:08x}"),
+                    "Submitting share"
+                );
                 if let Err(e) = source
                     .command_tx
                     .send(SourceCommand::SubmitShare(source_share))
@@ -1521,6 +1535,30 @@ mod tests {
         assert!(!share_meets_pool_difficulty(94.0, 10.0));
         assert!(share_meets_pool_difficulty(94.0, 94.0));
         assert!(share_meets_pool_difficulty(94.0, 200.0));
+    }
+
+    /// HydraPool (p2poolv2) parses the submit nonce as a hex integer and
+    /// stores that integer little-endian in the header. The bytes we
+    /// hashed must be those bytes. A reversed nonce is a different header,
+    /// which the pool reports as "Low difficulty share".
+    #[test]
+    fn submitted_nonce_matches_hydra_header_bytes() {
+        let chip_nonce = 0x7552_034c_u32;
+        let hashed = chip_nonce.swap_bytes().to_le_bytes();
+        let submitted = chip_nonce.swap_bytes();
+        let pool = u32::from_str_radix(&format!("{submitted:08x}"), 16)
+            .unwrap()
+            .to_le_bytes();
+        assert_eq!(hashed, pool);
+    }
+
+    /// Diff 34 is the HydraPool vardiff from the live reject report.
+    /// A share the local hash scores under that line must not be submitted.
+    #[test]
+    fn share_under_diff_34_is_not_submitted() {
+        assert!(!share_meets_pool_difficulty(34.0, 33.9));
+        assert!(share_meets_pool_difficulty(34.0, 34.0));
+        assert!(share_meets_pool_difficulty(34.0, 2000.0));
     }
 
     #[test]
