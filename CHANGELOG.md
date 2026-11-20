@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Multi-pool time-slicing (`pool_config`, `pool_alloc`, `pool_director`, `scheduler`)**: up to four stratum pools, weighted 60 s slots on the single Nano 3S chain, failover in list order, and `GET`/`PUT /api/v0/pools` applied in-process. `GET`/`PATCH /api/v0/pool` remain pool 1. Passwords are not returned. An existing `pool.conf` migrates to pool 1 at 100%.
+
 ## v5.1.0 (2026-11-17)
 - **Core 1 Freeze Recovery, Silence Escalation & Stall Resilience (`nano3s.rs`, `nano3s_tuner_core.rs`, `nano3s_ipc_shim`)**:
   - Implemented Core 1 status age and absence monitoring (`nano3s_ipc_has_received_status`, `nano3s_ipc_status_age_ms`). When Core 1 stops sending telemetry (>60s) or has never sent status (>180s), Core 0 immediately forces fan to 100% and skips AutoTune iterations.
