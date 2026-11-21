@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>MUJINA // POWER</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<style>
+  :root { --cyan:#00f0ff; --mag:#ff2e97; --amber:#ffb000; --green:#1bff9c; --red:#ff3860; --bg:#05060c; --panel:#0a0f1c; --panel2:#0d1424; --line:#14243a; --dim:#4a6a86; --ink:#d6f7ff; }
+  * { box-sizing: border-box; } html, body { margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--ink); font-family: 'Share Tech Mono', ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 24px 20px 60px; }
+  h1 { font-family: 'Orbitron', sans-serif; font-weight: 900; margin: 0; font-size: 22px; letter-spacing: .16em; text-transform: uppercase; }
+  h1 .chev { color: var(--cyan); }
+  .top { display: flex; align-items: baseline; justify-content: space-between; border-bottom: 1px solid var(--line); padding-bottom: 14px; margin-bottom: 14px; flex-wrap: wrap; gap: 10px; }
+  .menubar { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 20px; }
+  .menubar .menubtn { background:#0a1120; border:1px solid var(--line); color:var(--cyan); font-family:'Orbitron',sans-serif; font-weight:700; font-size:11px; letter-spacing:.14em; text-transform:uppercase; padding:9px 14px; border-radius:4px; text-decoration:none; display:inline-flex; align-items:center; }
+  .menubar .menubtn.on { border-color: var(--cyan); box-shadow: 0 0 10px rgba(0,240,255,.3); }
+  .sec { font-family:'Orbitron',sans-serif; font-weight:700; font-size:12px; letter-spacing:.18em; text-transform:uppercase; color:var(--mag); text-shadow:0 0 8px rgba(255,46,151,.45); margin:28px 0 12px; display:flex; align-items:center; gap:10px; }
+  .sec-sub { color:var(--mag); text-shadow:none; }
+  .sec::after { content:''; flex:1; height:1px; background:var(--line); }
+  .sec-sub { font-family:'Share Tech Mono',monospace; text-transform:none; letter-spacing:0; font-size:11px; color:var(--dim); flex:none; }
+  .card { background:var(--panel); border:1px solid var(--line); padding:18px; }
+  .row { display:flex; flex-direction:column; gap:6px; margin-bottom:16px; }
+  .row label { font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--dim); }
+  .row label small { text-transform:none; letter-spacing:0; }
+  .row input, .row select { background:var(--panel2); color:var(--ink); border:1px solid var(--line); border-radius:4px; padding:10px 12px; font:inherit; font-size:13px; }
+  .btn { background:var(--panel2); border:1px solid var(--line); color:var(--ink); padding:11px 18px; font-family:'Orbitron',sans-serif; font-weight:700; font-size:11px; letter-spacing:.1em; text-transform:uppercase; cursor:pointer; border-radius:4px; }
+  .btn.pri { border-color:var(--cyan); color:var(--cyan); }
+  .msg { margin-top:12px; font-size:12px; color:var(--dim); }
+  .msg.ok { color:var(--green); } .msg.err { color:var(--red); }
+  .note { font-size:12px; color:var(--dim); line-height:1.5; }
+  .status-strip { display:flex; gap:8px; align-items:center; font-size:12px; color:var(--dim); }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--dim); display:inline-block; }
+  .dot.ok { background:var(--green); } .dot.bad { background:var(--red); }
+  body.theme-minimal { --cyan:#0066cc; --bg:#eef2fa; --panel:rgba(255,255,255,.7); --panel2:rgba(255,255,255,.5); --line:rgba(0,0,0,.12); --dim:#6b7a90; --ink:#2d3e50; background:#eef2fa; color:#2d3e50; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  body.theme-parasite { --cyan:#fff; --bg:#000; --panel:#000; --panel2:#111; --line:#fff; --dim:#aaa; --ink:#fff; background:#000; color:#fff; }
+  body.theme-parasite * { font-family:"Courier New",Courier,monospace !important; text-shadow:none !important; box-shadow:none !important; }
+</style>
+<script src="/auth.js"></script>
+</head>
+<body>
+<script>(function(){var t='cyberpunk';try{t=localStorage.getItem('mujina-theme')||t;}catch(e){}if(t==='apple')t='minimal';if(['cyberpunk','minimal','parasite'].indexOf(t)<0)t='cyberpunk';document.body.className='theme-'+t;})();</script>
+<div class="wrap">
+  <div class="top">
+    <h1><span class="chev">//</span>MUJINA <span style="color:var(--dim);font-weight:400">/ POWER</span></h1>
+    <div class="status-strip"><span class="dot" id="connDot"></span><span id="connText">connecting…</span></div>
+  </div>
+  <nav class="menubar" aria-label="Main Menu">
+    <a class="menubtn" href="/dashboard">Dashboard</a>
+    <a class="menubtn on" href="/dashboard#power">Power</a>
+    <a class="menubtn" href="/dashboard#tuning">Tuning</a>
+    <a class="menubtn" href="/dashboard#fan">Fan</a>
+    <a class="menubtn" href="/dashboard#curve">Fan Curve</a>
+    <a class="menubtn" href="/pool">Pool</a>
+    <a class="menubtn" href="/led">LED</a>
+    <a class="menubtn" href="/firmware">Firmware</a>
+    <a class="menubtn" href="/dashboard#display">Display</a>
+    <a class="menubtn" href="/info">Info</a>
+  </nav>
+
+  <div class="sec">Power Controls<span class="sec-sub">Idle the chain, restart the miner or reboot the device</span></div>
+  <div class="card">
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <button class="btn pri" id="pauseBtn" type="button" hidden>PAUSE MINING</button>
+      <button class="btn" id="rebootBtn" type="button" hidden style="border-color:var(--mag);color:var(--mag)">REBOOT DEVICE</button>
+      <button class="btn" id="restartBtn" type="button" hidden style="border-color:var(--mag);color:var(--mag)">RESTART MINER</button>
+    </div>
+    <small style="color:var(--dim);display:block;margin-top:10px">Pause idles the chain live (no reboot, ~5-10s to take effect, safe while mining). Reboot restarts the whole device; Restart miner restarts only the mining process.</small>
+    <div class="msg" id="powerMsg"></div>
+  </div>
+
+  <div class="sec" id="psuDeliverySec">Power Delivery &amp; Overclock<span class="sec-sub">Input power supply limits and continuous VRM headroom</span></div>
+  <div class="card" id="psuDeliveryCard">
+    <div class="note" id="psuCurStatus">Detecting power supply contract…</div>
+    <div class="row" style="margin-top:10px">
+      <label for="psuModeSelect">Power Profile</label>
+      <select id="psuModeSelect" autocomplete="off">
+        <option value="stock">Standard USB-PD (112W Safe · 80% duty)</option>
+        <option value="aggressive">Aggressive PD (130W · Canaan High Match)</option>
+        <option value="custom">Mean Well / Custom DC (Overclock Bypass)</option>
+      </select>
+    </div>
+    <div class="row" id="psuCustomRow" hidden>
+      <label for="psuCustomInput">Board Power Ceiling <small>Watts (50–140W)</small></label>
+      <input type="number" id="psuCustomInput" name="psu_power_w" min="50" max="140" step="1" value="135" autocomplete="off">
+    </div>
+    <div id="psuOverclockWarning" hidden style="margin-top:12px;padding:10px 12px;border-radius:8px;background:rgba(255,170,0,0.12);border:1px solid rgba(255,170,0,0.3);color:var(--amber);font-size:12px;line-height:1.4">
+      ⚠️ <strong>Overclock / Headroom Warning:</strong> Exceeds the standard 80% USB-PD continuous duty rating. Requires a high-grade 140W+ GaN adapter or a dedicated Mean Well DC power supply (e.g. 24–28V via XT30). Board VRM ceiling (140W) and thermal trip backstops remain permanently enforced.
+    </div>
+    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:14px">
+      <button class="btn pri" id="psuApplyBtn" type="button">Apply Power Profile</button>
+    </div>
+    <div class="msg" id="psuMsg"></div>
+  </div>
+</div>
+<script>
+function $(id) { return document.getElementById(id); }
+function show(id, on) { const el = $(id); if (el) el.hidden = !on; }
+function say(id, text, ok) { const m = $(id); if (!m) return; m.textContent = text; m.className = ok === true ? 'msg ok' : ok === false ? 'msg err' : 'msg'; }
+let NAME = null, PAUSED = false, pauseBusy = false, WRITE_UNTIL = 0;
+function lock() { WRITE_UNTIL = Date.now() + 6000; document.querySelectorAll('button').forEach(b => { b.disabled = true; }); setTimeout(() => document.querySelectorAll('button').forEach(b => { if (!b.dataset.dead) b.disabled = false; }), 6000); }
+function busy(id) { if (Date.now() < WRITE_UNTIL) { say(id, 'wait a few seconds between commands', false); return true; } return false; }
+async function send(method, url, body) {
+  const r = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: body == null ? undefined : JSON.stringify(body) });
+  if (!r.ok) throw new Error('HTTP ' + r.status + (await r.text().then(t => t ? ': ' + t.slice(0, 160) : '').catch(() => '')));
+  return r;
+}
+function paintPause() {
+  const btn = $('pauseBtn');
+  btn.textContent = PAUSED ? 'RESUME MINING' : 'PAUSE MINING';
+  btn.classList.toggle('pri', !PAUSED);
+  btn.style.borderColor = PAUSED ? 'var(--amber)' : '';
+  btn.style.color = PAUSED ? 'var(--amber)' : '';
+}
+async function togglePause() {
+  if (!NAME) { say('powerMsg', 'no board detected yet', false); return; }
+  if (busy('powerMsg')) return;
+  const want = !PAUSED;
+  pauseBusy = true;
+  say('powerMsg', want ? 'pausing…' : 'resuming…');
+  lock();
+  try {
+    await send('PATCH', '/api/v0/boards/' + encodeURIComponent(NAME) + '/pause', { paused: want });
+    PAUSED = want;
+    paintPause();
+    say('powerMsg', want ? 'paused ✓ — chain idle, takes ~5-10s to fully settle' : 'resuming ✓ — hashrate recovers over ~15-30s', true);
+  } catch (e) { say('powerMsg', (want ? 'pause' : 'resume') + ' failed (' + e.message + ')', false); }
+  pauseBusy = false;
+}
+async function powerAction(path, btnId, confirmText, doneText) {
+  if (!confirm(confirmText)) return;
+  lock();
+  const b = $(btnId); b.dataset.dead = '1'; b.disabled = true;
+  say('powerMsg', doneText, true);
+  try { await fetch(path, { method: 'POST' }); } catch (e) { /* connection drops while the device restarts */ }
+  setTimeout(() => { delete b.dataset.dead; b.disabled = false; }, 60000);
+}
+function syncPsuMode() {
+  const mode = $('psuModeSelect').value;
+  const over = mode !== 'stock';
+  show('psuCustomRow', mode === 'custom');
+  show('psuOverclockWarning', over);
+}
+async function loadPsu() {
+  if (!NAME) return;
+  try {
+    const r = await fetch('/api/v0/boards/' + encodeURIComponent(NAME) + '/psu');
+    if (!r.ok) { show('psuDeliverySec', false); show('psuDeliveryCard', false); return; }
+    const d = await r.json();
+    show('psuDeliverySec', true); show('psuDeliveryCard', true);
+    const bus = d.bus_v != null ? d.bus_v.toFixed(1) + ' V' : 'unknown';
+    const detected = d.detected_ceiling_w != null ? d.detected_ceiling_w + ' W' : 'none';
+    const eff = d.effective_ceiling_w != null ? (typeof d.effective_ceiling_w === 'number' ? d.effective_ceiling_w.toFixed(0) : d.effective_ceiling_w) + ' W' : '112 W';
+    $('psuCurStatus').innerHTML = 'Rail: <strong>' + bus + '</strong> · Detected PD: <strong>' + detected + '</strong> · Active Ceiling: <strong>' + eff + '</strong>';
+    const ov = d.override_max_w;
+    if (ov == null) $('psuModeSelect').value = 'stock';
+    else if (ov === 130) $('psuModeSelect').value = 'aggressive';
+    else { $('psuModeSelect').value = 'custom'; $('psuCustomInput').value = ov; }
+    syncPsuMode();
+  } catch (e) { show('psuDeliverySec', false); show('psuDeliveryCard', false); }
+}
+async function applyPsu() {
+  if (!NAME || busy('psuMsg')) return;
+  const mode = $('psuModeSelect').value;
+  let target = null;
+  if (mode === 'aggressive') target = 130.0;
+  else if (mode === 'custom') {
+    const val = parseFloat($('psuCustomInput').value);
+    if (isNaN(val) || val < 50 || val > 140) { say('psuMsg', 'Board power ceiling must be between 50 and 140 W', false); return; }
+    target = val;
+  }
+  say('psuMsg', 'Applying power profile…');
+  lock();
+  try {
+    await send('PATCH', '/api/v0/boards/' + encodeURIComponent(NAME) + '/psu', { override_max_w: target });
+    const label = mode === 'stock' ? 'Standard 112W Safe PD' : mode === 'aggressive' ? 'Aggressive 130W' : target + 'W Custom Ceiling';
+    say('psuMsg', 'Power profile saved ✓ (' + label + ')', true);
+    setTimeout(loadPsu, 1500);
+  } catch (e) { say('psuMsg', 'Failed: ' + e.message, false); }
+}
+async function boot() {
+  try {
+    const r = await fetch('/api/v0/system');
+    if (r.ok) {
+      const sys = await r.json();
+      const dev = sys.device || {};
+      NAME = (sys.boards && sys.boards[0] && sys.boards[0].name) || 'nano3s-0';
+      show('rebootBtn', !!dev.can_reboot);
+      show('restartBtn', !!dev.can_restart_miner);
+      $('connDot').className = 'dot ok'; $('connText').textContent = 'live';
+    }
+  } catch (e) { $('connDot').className = 'dot bad'; $('connText').textContent = 'offline'; }
+  try {
+    const r = await fetch('/nano3s-detail');
+    if (r.ok) {
+      const d = await r.json();
+      if (typeof d.paused === 'boolean') { PAUSED = d.paused; show('pauseBtn', true); paintPause(); }
+    }
+  } catch (e) {}
+  loadPsu();
+}
+$('pauseBtn').addEventListener('click', togglePause);
+$('rebootBtn').addEventListener('click', () => powerAction('/api/v0/reboot', 'rebootBtn', 'Reboot the device now? It will be offline for roughly 30-60 seconds; mining resumes automatically.', 'rebooting — device will be unreachable shortly…'));
+$('restartBtn').addEventListener('click', () => powerAction('/api/v0/restart', 'restartBtn', 'Restart the miner process now? Hashing pauses briefly.', 'restarting miner…'));
+$('psuModeSelect').addEventListener('change', syncPsuMode);
+$('psuApplyBtn').addEventListener('click', applyPsu);
+boot();
+setInterval(async () => {
+  if (pauseBusy) return;
+  try {
+    const r = await fetch('/nano3s-detail');
+    if (!r.ok) return;
+    const d = await r.json();
+    if (typeof d.paused === 'boolean') { PAUSED = d.paused; show('pauseBtn', true); paintPause(); }
+  } catch (e) {}
+}, 5000);
+</script>
+</body>
+</html>

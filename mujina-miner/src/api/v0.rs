@@ -19,15 +19,19 @@ use tokio::sync::oneshot;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::commands::SchedulerCommand;
-use crate::board::nano3s_auto_tune::{AutoTuneRequest, AutoTuneStatus, MAX_DOMAIN_MHZ, NANO3S_ENVELOPE};
 use super::server::SharedState;
 use crate::api_client::types::{
     AutotuneHashrateRequest, AutotuneHashrateResponse, BoardFanRequest, BoardLedRequest,
     DisplayPatchRequest, DisplayState,
     BoardChipClocksRequest, BoardLedState, BoardPauseRequest, BoardPowerTargetRequest, BoardTelemetry,
-    BoardTempTargetRequest, BoardTuningRequest, FanCurvePoint, FanCurveRequest, FanCurveResponse,
+    BoardFanStatus, BoardTempTargetRequest, BoardTuningRequest, BoardTuningState, FanCurvePoint,
+    FanCurveRequest, FanCurveResponse,
     FirmwareBundleResponse, FirmwareUploadResponse, MinerPatchRequest, MinerTelemetry,
-    PoolConfigRequest, PoolConfigResponse, PsuOverrideRequest, PsuStatusResponse, SourceTelemetry,
+    PoolConfigRequest, PoolConfigResponse, PoolStatus, PoolsPutRequest, PoolsResponse,
+    PsuOverrideRequest, PsuStatusResponse, SourceTelemetry,
+};
+use crate::board::nano3s_auto_tune::{
+    AutoTuneRequest, AutoTuneStatus, MAX_DOMAIN_MHZ, NANO3S_ENVELOPE,
 };
 
 /// Upper bound on a firmware upload body -- generous headroom over the
@@ -49,22 +53,26 @@ pub fn routes() -> OpenApiRouter<SharedState> {
         .routes(routes!(get_miner, patch_miner))
         .routes(routes!(get_boards))
         .routes(routes!(get_board))
-        .routes(routes!(patch_board_tuning))
+        .routes(routes!(get_board_tuning, patch_board_tuning))
         .routes(routes!(patch_board_chip_clocks))
         .routes(routes!(patch_board_power_target))
         .routes(routes!(patch_board_temp_target))
         .routes(routes!(get_board_psu, patch_board_psu))
-        .routes(routes!(get_board_autotune_hashrate, patch_board_autotune_hashrate))
+        .routes(routes!(
+            get_board_autotune_hashrate,
+            patch_board_autotune_hashrate
+        ))
         .routes(routes!(get_board_auto_tune, patch_board_auto_tune))
         .routes(routes!(get_board_tuner, patch_board_tuner))
         .routes(routes!(get_system))
-        .routes(routes!(patch_board_fan))
+        .routes(routes!(get_board_fan, patch_board_fan))
         .routes(routes!(get_board_fan_curve, patch_board_fan_curve))
         .routes(routes!(patch_board_pause))
         .routes(routes!(get_board_led, patch_board_led))
         .routes(routes!(get_display, patch_display))
         .routes(routes!(post_reboot))
         .routes(routes!(get_pool, patch_pool))
+        .routes(routes!(get_pools, put_pools))
         .routes(routes!(post_firmware_upload))
         .routes(routes!(post_firmware_bundle))
         .routes(routes!(get_sources))
@@ -210,7 +218,7 @@ fn validate_board_tuning(req: &BoardTuningRequest) -> Result<(), StatusCode> {
     }
     // Same range check as the dedicated power-target endpoint.
     if let Some(w) = req.power_target_w
-        && !(20.0..=137.0).contains(&w)
+        && !(20.0..=power_target_max_w()).contains(&w)
     {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -230,6 +238,48 @@ fn validate_board_tuning(req: &BoardTuningRequest) -> Result<(), StatusCode> {
 /// `nano3s` Cargo feature return 501). At least one of `pll_freq_mhz`/
 /// `voltage_mv`/`power_target_w`/`temp_target_c` must be set; values are
 /// range-checked before being applied.
+#[utoipa::path(
+    get,
+    path = "/boards/{name}/tuning",
+    tag = "boards",
+    params(("name" = String, Path, description = "Board name")),
+    responses(
+        (status = OK, description = "Saved live tuning", body = BoardTuningState),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = NOT_IMPLEMENTED, description = "This build has no saved tuning"),
+    ),
+)]
+async fn get_board_tuning(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+) -> Result<Json<BoardTuningState>, StatusCode> {
+    let known = state
+        .board_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .boards()
+        .into_iter()
+        .any(|b| b.name == name);
+    if !known {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    #[cfg(feature = "nano3s")]
+    {
+        let s = crate::board::nano3s::saved_tuning();
+        return Ok(Json(BoardTuningState {
+            pll_freq_mhz: s.pll_freq_mhz,
+            voltage_mv: s.voltage_mv,
+            power_target_w: s.power_target_w,
+            temp_target_c: s.temp_target_c,
+            live_preset: s.live_preset,
+        }));
+    }
+    #[cfg(not(feature = "nano3s"))]
+    {
+        Err(StatusCode::NOT_IMPLEMENTED)
+    }
+}
+
 #[utoipa::path(
     patch,
     path = "/boards/{name}/tuning",
@@ -280,11 +330,13 @@ async fn patch_board_tuning(
     }
 }
 
-/// Set per-chip clock offsets (MHz), layered on the board's base clock.
+/// Set per-chip clocks, as offsets or as absolute PLL0 MHz.
 ///
-/// `offset_mhz` must hold one in-range value per chip. Applied live with a
-/// 10 MHz/s ramp and persisted across reboots. Needs an rtos_core build
-/// with per-chip clock support.
+/// Exactly one of `offset_mhz` / `freq_mhz` may be set; `policy` may be
+/// set alone or with either. Values outside the shared ChipTuner window,
+/// or that would push a domain outside 100..=580 MHz, are rejected. A
+/// write is refused with 409 while ChipTuner is judging a trial. 3600 mV
+/// is not a chip setting. Needs an rtos_core build with per-chip clocks.
 #[utoipa::path(
     patch,
     path = "/boards/{name}/chip-clocks",
@@ -294,8 +346,9 @@ async fn patch_board_tuning(
     ),
     request_body = BoardChipClocksRequest,
     responses(
-        (status = OK, description = "Offsets queued"),
-        (status = BAD_REQUEST, description = "Wrong count, or an offset outside the allowed range"),
+        (status = OK, description = "Chip clocks or policy queued"),
+        (status = BAD_REQUEST, description = "Wrong count, both clock fields, or a value outside the allowed range"),
+        (status = CONFLICT, description = "ChipTuner is judging a trial"),
         (status = NOT_FOUND, description = "Board not found"),
         (status = NOT_IMPLEMENTED, description = "This build's board driver doesn't support per-chip clocks"),
     ),
@@ -318,12 +371,39 @@ async fn patch_board_chip_clocks(
 
     #[cfg(feature = "nano3s")]
     {
-        use crate::board::nano3s::{CHIP_COUNT, CHIP_OFFSET_RANGE_MHZ};
-        let offsets: [i16; CHIP_COUNT] =
-            req.offset_mhz.try_into().map_err(|_| StatusCode::BAD_REQUEST)?;
-        if !offsets.iter().all(|o| CHIP_OFFSET_RANGE_MHZ.contains(o)) {
+        use crate::board::a3197s::{ChipClockPolicy, ChipClocks, resolve_chip_clocks};
+        use crate::board::nano3s::CHIP_COUNT;
+        use crate::board::nano3s_auto_tune::read_status;
+
+        if req.offset_mhz.is_some() && req.freq_mhz.is_some() {
             return Err(StatusCode::BAD_REQUEST);
         }
+        if let Some(policy) = req.policy.as_deref() {
+            let policy = ChipClockPolicy::parse(policy).ok_or(StatusCode::BAD_REQUEST)?;
+            crate::board::nano3s::write_chip_clock_policy(policy)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        }
+        let clocks = if let Some(offsets) = req.offset_mhz {
+            let offsets: [i16; CHIP_COUNT] =
+                offsets.try_into().map_err(|_| StatusCode::BAD_REQUEST)?;
+            ChipClocks::Offsets(offsets)
+        } else if let Some(freq) = req.freq_mhz {
+            let freq: [u32; CHIP_COUNT] = freq.try_into().map_err(|_| StatusCode::BAD_REQUEST)?;
+            ChipClocks::Absolute(freq)
+        } else if req.policy.is_some() {
+            return Ok(StatusCode::OK);
+        } else {
+            return Err(StatusCode::BAD_REQUEST);
+        };
+        if read_status()
+            .per_chip
+            .as_ref()
+            .is_some_and(|s| s.phase == "trial")
+        {
+            return Err(StatusCode::CONFLICT);
+        }
+        let offsets = resolve_chip_clocks(crate::board::nano3s::commanded_pll_freq(), clocks)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
         crate::board::nano3s::write_chip_offset_command(offsets)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         Ok(StatusCode::OK)
@@ -370,7 +450,7 @@ async fn patch_board_power_target(
     }
     // Range check before the value reaches the power-target loop.
     if let Some(w) = req.target_w
-        && !(20.0..=137.0).contains(&w)
+        && !(20.0..=power_target_max_w()).contains(&w)
     {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -448,8 +528,8 @@ async fn patch_board_temp_target(
 }
 
 /// Read the current USB-C PD power-contract state -- live INA226 bus
-/// voltage, HUSB238A attach status, the auto-detected contract ceiling,
-/// any manual override, and the ceiling actually being enforced.
+/// voltage, the auto-detected contract ceiling, any manual override,
+/// the ceiling actually being enforced, and the last I2C2 recovery.
 #[utoipa::path(
     get,
     path = "/boards/{name}/psu",
@@ -488,6 +568,13 @@ async fn get_board_psu(
             detected_ceiling_w,
             override_max_w,
             effective_ceiling_w,
+            psu_bypass: crate::board::nano3s::psu_bypass_enabled(),
+            power_sensor: if crate::board::nano3s::power_sensor_ok() {
+                "ok".into()
+            } else {
+                "unavailable".into()
+            },
+            i2c_recovery: crate::board::nano3s::power_i2c_recovery().into(),
         }))
     }
     #[cfg(not(feature = "nano3s"))]
@@ -529,16 +616,33 @@ async fn patch_board_psu(
     if !known {
         return Err(StatusCode::NOT_FOUND);
     }
+    #[cfg(feature = "nano3s")]
+    let bypass_after = req
+        .psu_bypass
+        .unwrap_or_else(crate::board::nano3s::psu_bypass_enabled);
+    #[cfg(not(feature = "nano3s"))]
+    let bypass_after = false;
+    let override_max = if bypass_after { 400.0 } else { 140.0 };
     if let Some(w) = req.override_max_w
-        && !(15.0..=140.0).contains(&w)
+        && !(15.0..=override_max).contains(&w)
     {
         return Err(StatusCode::BAD_REQUEST);
+    }
+    if req.psu_bypass.is_none() && req.override_max_w.is_none() {
+        // Stock path: `{override_max_w: null}` clears the override.
     }
 
     #[cfg(feature = "nano3s")]
     {
-        crate::board::nano3s::write_psu_override_command(req.override_max_w)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if let Some(on) = req.psu_bypass {
+            crate::board::nano3s::set_psu_bypass(on)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        }
+        // A bypass-only body must not clear a saved watt override.
+        if req.psu_bypass.is_none() || req.override_max_w.is_some() {
+            crate::board::nano3s::write_psu_override_command(req.override_max_w)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        }
         Ok(StatusCode::OK)
     }
     #[cfg(not(feature = "nano3s"))]
@@ -807,10 +911,14 @@ async fn get_system(State(state): State<SharedState>) -> Json<serde_json::Value>
         .collect();
     #[cfg(feature = "nano3s")]
     let info = {
-        let (_bus_v, _attached, detected_w, override_w, effective_w) = crate::board::nano3s::read_psu_status();
+        let (_bus_v, _attached, detected_w, override_w, effective_w) =
+            crate::board::nano3s::read_psu_status();
         let contract_w = override_w.or(detected_w);
         let ceiling = Some(effective_w);
-        let chips = crate::board::nano3s::get_detail_snapshot().map(|d| d.chips.len() as u32).filter(|n| *n > 0).unwrap_or(super::system::NANO3S_CHIPS);
+        let chips = crate::board::nano3s::get_detail_snapshot()
+            .map(|d| d.chips.len() as u32)
+            .filter(|n| *n > 0)
+            .unwrap_or(super::system::NANO3S_CHIPS);
         SystemInfo {
             mode: "embedded",
             platform: "nano3s-k230".into(),
@@ -820,10 +928,16 @@ async fn get_system(State(state): State<SharedState>) -> Json<serde_json::Value>
             device_model: Some("Avalon Nano 3S".into()),
             can_reboot: true,
             can_restart_miner: false,
-            pool_apply: "reboot",
+            pool_apply: "live",
             shared_rail: true,
             ceiling_w: ceiling,
             psu_contract_w: contract_w,
+            psu_bypass: crate::board::nano3s::psu_bypass_enabled(),
+            immersion: crate::board::nano3s::immersion_enabled(),
+            power_sensor: if crate::board::nano3s::power_sensor_ok() { "ok" } else { "unavailable" },
+            power_w: None,
+            efficiency_jth: None,
+            power_source: None,
             boards: names
                 .into_iter()
                 .map(|(name, model)| SystemBoard {
@@ -845,13 +959,24 @@ async fn get_system(State(state): State<SharedState>) -> Json<serde_json::Value>
         device_model: None,
         can_reboot: false,
         can_restart_miner: false,
-        pool_apply: "restart",
+        pool_apply: "live",
         shared_rail: false,
         ceiling_w: None,
         psu_contract_w: None,
+        psu_bypass: false,
+        immersion: false,
+        power_sensor: "unavailable",
+        power_w: None,
+        efficiency_jth: None,
+        power_source: None,
         boards: names
             .into_iter()
-            .map(|(name, model)| SystemBoard { name, model: Some(model), chips: 0, caps: BoardCaps::generic() })
+            .map(|(name, model)| SystemBoard {
+                name,
+                model: Some(model),
+                chips: 0,
+                caps: BoardCaps::generic(),
+            })
             .collect(),
     };
     Json(build_system(&info))
@@ -861,6 +986,46 @@ async fn get_system(State(state): State<SharedState>) -> Json<serde_json::Value>
 ///
 /// Fan commands never touch `power_en`, so they can be sent at any time
 /// without affecting the mining chain.
+#[utoipa::path(
+    get,
+    path = "/boards/{name}/fan",
+    tag = "boards",
+    params(("name" = String, Path, description = "Board name")),
+    responses(
+        (status = OK, description = "Saved fan mode", body = BoardFanStatus),
+        (status = NOT_FOUND, description = "Board not found"),
+        (status = NOT_IMPLEMENTED, description = "This build has no fan control"),
+    ),
+)]
+async fn get_board_fan(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+) -> Result<Json<BoardFanStatus>, StatusCode> {
+    let known = state
+        .board_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .boards()
+        .into_iter()
+        .any(|b| b.name == name);
+    if !known {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    #[cfg(feature = "nano3s")]
+    {
+        let (mode, duty) = crate::board::nano3s::fan_mode_saved();
+        return Ok(Json(BoardFanStatus {
+            mode,
+            manual_duty_percent: duty,
+            immersion: crate::board::nano3s::immersion_enabled(),
+        }));
+    }
+    #[cfg(not(feature = "nano3s"))]
+    {
+        Err(StatusCode::NOT_IMPLEMENTED)
+    }
+}
+
 #[utoipa::path(
     patch,
     path = "/boards/{name}/fan",
@@ -891,7 +1056,11 @@ async fn patch_board_fan(
     if !known {
         return Err(StatusCode::NOT_FOUND);
     }
-    if req.mode.is_none() && req.manual_duty_percent.is_none() && req.chip_temp_target_c.is_none() {
+    if req.mode.is_none()
+        && req.manual_duty_percent.is_none()
+        && req.chip_temp_target_c.is_none()
+        && req.immersion.is_none()
+    {
         return Err(StatusCode::BAD_REQUEST);
     }
     if let Some(t) = req.chip_temp_target_c
@@ -924,6 +1093,10 @@ async fn patch_board_fan(
         }
         if let Some(t) = req.chip_temp_target_c {
             crate::board::nano3s::write_fan_control_command(&format!("fan_chip_temp_target:{t}"))
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        }
+        if let Some(on) = req.immersion {
+            crate::board::nano3s::set_immersion(on)
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         }
         Ok(StatusCode::OK)
@@ -1021,6 +1194,11 @@ async fn patch_board_fan_curve(
         if !(0.0..=150.0).contains(&p.temp_c) || !(0.0..=100.0).contains(&p.duty_pct) {
             return Err(StatusCode::BAD_REQUEST);
         }
+    }
+    let mut temps: Vec<f64> = req.points.iter().map(|p| p.temp_c).collect();
+    temps.sort_by(f64::total_cmp);
+    if temps.windows(2).any(|w| w[1] <= w[0]) {
+        return Err(StatusCode::BAD_REQUEST);
     }
 
     #[cfg(feature = "nano3s")]
@@ -1165,7 +1343,13 @@ async fn patch_board_led(
     #[cfg(feature = "nano3s")]
     {
         crate::board::nano3s::write_led_command(req.effect, req.color, req.brightness, req.speed)
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+            .map_err(|e| {
+                if e.starts_with("failed to save") {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    StatusCode::BAD_REQUEST
+                }
+            })?;
         Ok(StatusCode::OK)
     }
     #[cfg(not(feature = "nano3s"))]
@@ -1240,7 +1424,11 @@ fn staged_firmware_path(live_path: &FsPath) -> PathBuf {
 /// shelling out to system tools (i2cset, reboot, etc.) for one-off system
 /// queries rather than linking libc/statvfs directly.
 fn free_space_bytes(mount_point: &FsPath) -> Option<u64> {
-    let out = std::process::Command::new("df").arg("-k").arg(mount_point).output().ok()?;
+    let out = std::process::Command::new("df")
+        .arg("-k")
+        .arg(mount_point)
+        .output()
+        .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let fields: Vec<&str> = text.lines().nth(1)?.split_whitespace().collect();
     // `df -k` columns: Filesystem, 1K-blocks, Used, Available, Use%, Mounted.
@@ -1416,7 +1604,8 @@ impl<'a> SectionValidator<'a> {
 
             if !self.found_ipc {
                 if data.len() >= Self::TAIL_CAP {
-                    self.tail.copy_from_slice(&data[data.len() - Self::TAIL_CAP..]);
+                    self.tail
+                        .copy_from_slice(&data[data.len() - Self::TAIL_CAP..]);
                     self.tail_len = Self::TAIL_CAP;
                 } else {
                     let combined = self.tail_len + data.len();
@@ -1474,7 +1663,10 @@ fn check_free_space(
         Some(_) => Ok(()),
         None => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("{target}: couldn't determine free space on {}", mount_point.display()),
+            format!(
+                "{target}: couldn't determine free space on {}",
+                mount_point.display()
+            ),
         )),
     }
 }
@@ -1504,12 +1696,14 @@ fn finalize_staged_file(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(staged_path, std::fs::Permissions::from_mode(0o755)).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("{target}: failed to chmod {}: {e}", staged_path.display()),
-            )
-        })?;
+        std::fs::set_permissions(staged_path, std::fs::Permissions::from_mode(0o755)).map_err(
+            |e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("{target}: failed to chmod {}: {e}", staged_path.display()),
+                )
+            },
+        )?;
     }
     Ok(())
 }
@@ -1660,7 +1854,12 @@ where
         }
         check_free_space(&target, &mount_point, len, free_space)?;
     } else {
-        check_free_space(&target, &mount_point, FIRMWARE_MIN_UPLOAD_BYTES as u64, free_space)?;
+        check_free_space(
+            &target,
+            &mount_point,
+            FIRMWARE_MIN_UPLOAD_BYTES as u64,
+            free_space,
+        )?;
     }
 
     let mut guard = StagedCleanupGuard::new();
@@ -1741,7 +1940,9 @@ fn trigger_system_reboot() {
         let _ = std::process::Command::new("/bin/sync").status();
         let _ = std::process::Command::new("sync").status();
         // Execute immediate hardware reboot
-        let res = std::process::Command::new("/sbin/reboot").arg("-f").status();
+        let res = std::process::Command::new("/sbin/reboot")
+            .arg("-f")
+            .status();
         if res.is_err() {
             let _ = std::process::Command::new("reboot").arg("-f").status();
         }
@@ -1782,7 +1983,9 @@ const BUNDLE_MAGIC: &[u8; 8] = b"MJBUNDL1";
         (status = INTERNAL_SERVER_ERROR, description = "Write, chmod, or rename failed"),
     ),
 )]
-async fn post_firmware_bundle(body: Body) -> Result<Json<FirmwareBundleResponse>, (StatusCode, String)> {
+async fn post_firmware_bundle(
+    body: Body,
+) -> Result<Json<FirmwareBundleResponse>, (StatusCode, String)> {
     handle_firmware_bundle_with(
         body,
         &FIRMWARE_UPLOAD_LOCK,
@@ -1913,71 +2116,219 @@ where
 
     Ok(Json(FirmwareBundleResponse {
         ok: true,
-        applied: staged.iter().map(|(target, _, _)| (*target).to_string()).collect(),
+        applied: staged
+            .iter()
+            .map(|(target, _, _)| (*target).to_string())
+            .collect(),
         detail: "swapped in, rebooting now".to_string(),
     }))
 }
 
-/// Return the currently persisted pool configuration.
+/// Pool 1, for clients that predate `GET /api/v0/pools`.
 ///
-/// This is what will apply on the miner's *next* restart, not necessarily
-/// what the running process connected with at its own last startup -- see
-/// `GET /api/v0/sources` for the live connection's actual URL.
+/// The password is never returned.
 #[utoipa::path(
     get,
     path = "/pool",
     tag = "miner",
     responses(
-        (status = OK, description = "Currently persisted pool config", body = PoolConfigResponse),
+        (status = OK, description = "Pool 1", body = PoolConfigResponse),
     ),
 )]
 async fn get_pool() -> Json<PoolConfigResponse> {
-    let cfg = crate::pool_config::load();
-    Json(PoolConfigResponse {
-        url: cfg.url,
-        user: cfg.user,
-        password_set: cfg.pass.is_some(),
-    })
+    Json(pool1_response())
 }
 
-/// Update the persisted pool configuration.
-///
-/// Saved to `/data/userconfig/pool.conf` immediately; takes effect on the
-/// miner's next startup since the stratum client has no hot-reload path.
-/// Applying it requires a full device reboot (`POST /api/v0/reboot`), not
-/// just restarting the `mujina-minerd` process -- killing and relaunching
-/// the process in place leaves the RT-Smart core's IPC handle stale
-/// (hashrate stuck at 0 even though the API looks healthy), so this API
-/// deliberately does not offer a lighter process-only restart.
+/// Update pool 1 and apply it immediately. Other pools and their weights
+/// are left as they are. A process restart is not used: it would leave
+/// the Core 1 IPC handle stale.
 #[utoipa::path(
     patch,
     path = "/pool",
     tag = "miner",
     request_body = PoolConfigRequest,
     responses(
-        (status = OK, description = "Pool config saved", body = PoolConfigResponse),
+        (status = OK, description = "Pool 1 saved and applied", body = PoolConfigResponse),
         (status = BAD_REQUEST, description = "No fields set, or url isn't a stratum+tcp://\
             or stratum+ssl:// URL"),
         (status = INTERNAL_SERVER_ERROR, description = "Failed to write the config file"),
     ),
 )]
-async fn patch_pool(Json(req): Json<PoolConfigRequest>) -> Result<Json<PoolConfigResponse>, StatusCode> {
+async fn patch_pool(
+    State(state): State<SharedState>,
+    Json(req): Json<PoolConfigRequest>,
+) -> Result<Json<PoolConfigResponse>, StatusCode> {
     if req.url.is_none() && req.user.is_none() && req.password.is_none() {
         return Err(StatusCode::BAD_REQUEST);
     }
     if let Some(url) = &req.url
-        && !(url.starts_with("stratum+tcp://") || url.starts_with("stratum+ssl://"))
+        && !crate::pool_config::stratum_url(url)
     {
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let cfg = crate::pool_config::save_merged(req.url.as_deref(), req.user.as_deref(), req.password.as_deref())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(PoolConfigResponse {
+    let mut pools = crate::pool_config::load_pools();
+    if pools.is_empty() {
+        let url = req.url.clone().ok_or(StatusCode::BAD_REQUEST)?;
+        pools.push(crate::pool_config::PoolEntry {
+            url,
+            user: req.user.unwrap_or_default(),
+            pass: req.password.unwrap_or_default(),
+            weight: 100,
+        });
+    } else {
+        if let Some(url) = req.url {
+            pools[0].url = url;
+        }
+        if let Some(user) = req.user {
+            pools[0].user = user;
+        }
+        if let Some(pass) = req.password {
+            pools[0].pass = pass;
+        }
+    }
+    crate::pool_config::save_pools(&pools).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let _ = state.pool_reload_tx.send(pools).await;
+    Ok(Json(pool1_response()))
+}
+
+fn pool1_response() -> PoolConfigResponse {
+    let pools = crate::pool_config::load_pools();
+    if let Some(pool) = pools.first() {
+        return PoolConfigResponse {
+            url: Some(pool.url.clone()),
+            user: Some(pool.user.clone()),
+            password_set: !pool.pass.is_empty(),
+        };
+    }
+    let cfg = crate::pool_config::load();
+    PoolConfigResponse {
         url: cfg.url,
         user: cfg.user,
         password_set: cfg.pass.is_some(),
-    }))
+    }
+}
+
+fn pool_link_state(weight: u16, connected: bool, failed: bool) -> &'static str {
+    if connected {
+        "connected"
+    } else if weight == 0 {
+        "standby"
+    } else if failed {
+        "down"
+    } else {
+        "connecting"
+    }
+}
+
+fn power_target_max_w() -> f64 {
+    #[cfg(feature = "nano3s")]
+    {
+        if crate::board::nano3s::psu_bypass_enabled() {
+            400.0
+        } else {
+            137.0
+        }
+    }
+    #[cfg(not(feature = "nano3s"))]
+    {
+        137.0
+    }
+}
+
+/// Every configured pool, plus live status. Passwords are never returned;
+/// `password_set` says whether one is stored.
+#[utoipa::path(
+    get,
+    path = "/pools",
+    tag = "miner",
+    responses(
+        (status = OK, description = "Configured pools and live status", body = PoolsResponse),
+    ),
+)]
+async fn get_pools(State(state): State<SharedState>) -> Json<PoolsResponse> {
+    let telemetry = state.miner_telemetry();
+    let pools = crate::pool_config::load_pools()
+        .into_iter()
+        .map(|pool| {
+            let live = telemetry.sources.iter().find(|s| s.url.as_deref() == Some(pool.url.as_str()));
+            let connected = live.map(|s| s.connected).unwrap_or(false);
+            PoolStatus {
+                url: pool.url,
+                user: pool.user,
+                password_set: !pool.pass.is_empty(),
+                weight: pool.weight,
+                connected,
+                difficulty: live.and_then(|s| s.difficulty),
+                accepted: live.map(|s| s.accepted).unwrap_or(0),
+                rejected: live.map(|s| s.rejected).unwrap_or(0),
+                hashrate_10m: live.map(|s| s.hashrate_10m).unwrap_or(0),
+                hashrate_1h: live.map(|s| s.hashrate_1h).unwrap_or(0),
+                reject_reasons: live.map(|s| s.reject_reasons.clone()).unwrap_or_default(),
+                shares_low_diff: live.map(|s| s.shares_low_diff).unwrap_or(0),
+                state: pool_link_state(
+                    pool.weight,
+                    connected,
+                    live.and_then(|s| s.last_error.as_ref()).is_some(),
+                )
+                .to_string(),
+                last_error: live.and_then(|s| s.last_error.clone()),
+                latency_ms: None,
+                best_share: None,
+                best_share_alltime: None,
+            }
+        })
+        .collect();
+    Json(PoolsResponse { pools })
+}
+
+/// Replace the pool set and apply it immediately, in this process.
+///
+/// At most 4 pools. Weights are percents and must sum to 100. A weight of
+/// 0 keeps the pool as a failover backup. URLs must be `stratum+tcp://` or
+/// `stratum+ssl://`. Omitting `password` keeps the stored password when
+/// the url and user are unchanged.
+#[utoipa::path(
+    put,
+    path = "/pools",
+    tag = "miner",
+    request_body = PoolsPutRequest,
+    responses(
+        (status = OK, description = "Pools saved and applied", body = PoolsResponse),
+        (status = BAD_REQUEST, description = "More than 4 pools, weights do not sum to 100, \
+            or a URL is not stratum+tcp:// or stratum+ssl://"),
+        (status = INTERNAL_SERVER_ERROR, description = "Failed to write the config file"),
+    ),
+)]
+async fn put_pools(
+    State(state): State<SharedState>,
+    Json(req): Json<PoolsPutRequest>,
+) -> Result<Json<PoolsResponse>, (StatusCode, String)> {
+    let existing = crate::pool_config::load_pools();
+    let mut pools = Vec::with_capacity(req.pools.len());
+    for put in &req.pools {
+        let pass = match &put.password {
+            Some(password) => password.clone(),
+            None => existing
+                .iter()
+                .find(|e| e.url == put.url && e.user == put.user)
+                .map(|e| e.pass.clone())
+                .unwrap_or_default(),
+        };
+        pools.push(crate::pool_config::PoolEntry {
+            url: put.url.clone(),
+            user: put.user.clone(),
+            pass,
+            weight: put.weight,
+        });
+    }
+    if let Err(reason) = crate::pool_config::validate(&pools) {
+        return Err((StatusCode::BAD_REQUEST, reason.to_string()));
+    }
+    crate::pool_config::save_pools(&pools)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let _ = state.pool_reload_tx.send(pools).await;
+    Ok(get_pools(State(state)).await)
 }
 
 /// Return the current LCD visual theme and page state.
@@ -2326,7 +2677,10 @@ mod tests {
         // Place "nano3s_ipc_" near the middle and split right inside it,
         // plus test 1-byte / 3-byte splits around the symbol.
         let sym_offset = 1000;
-        let minerd = make_elf(FIRMWARE_MIN_UPLOAD_BYTES, Some((b"nano3s_ipc_init", sym_offset)));
+        let minerd = make_elf(
+            FIRMWARE_MIN_UPLOAD_BYTES,
+            Some((b"nano3s_ipc_init", sym_offset)),
+        );
         let bundle = make_bundle(Some(&minerd), None);
         // Bundle header is 8 (magic) + 4 (len) = 12 bytes before section 1.
         let abs_sym = 12 + sym_offset;
@@ -2466,7 +2820,10 @@ mod tests {
             .await
             .unwrap_err();
             assert_eq!(status2, StatusCode::CONFLICT);
-            assert!(msg2.contains("already in progress"), "unexpected msg: {msg2}");
+            assert!(
+                msg2.contains("already in progress"),
+                "unexpected msg: {msg2}"
+            );
         }
 
         // Once the first upload finishes and drops the guard, the next upload succeeds.
@@ -2482,10 +2839,7 @@ mod tests {
         assert!(res.0.ok);
     }
 
-    fn tuning_req(
-        pll_freq_mhz: Option<[u32; 4]>,
-        voltage_mv: Option<u32>,
-    ) -> BoardTuningRequest {
+    fn tuning_req(pll_freq_mhz: Option<[u32; 4]>, voltage_mv: Option<u32>) -> BoardTuningRequest {
         BoardTuningRequest {
             pll_freq_mhz,
             voltage_mv,
@@ -2506,13 +2860,13 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            validate_board_tuning(&tuning_req(None, Some(NANO3S_ENVELOPE.max_voltage_mv as u32))),
+            validate_board_tuning(&tuning_req(
+                None,
+                Some(NANO3S_ENVELOPE.max_voltage_mv as u32)
+            )),
             Ok(())
         );
-        assert_eq!(
-            validate_board_tuning(&tuning_req(None, Some(3605))),
-            Ok(())
-        );
+        assert_eq!(validate_board_tuning(&tuning_req(None, Some(3605))), Ok(()));
     }
 
     #[test]
@@ -2541,7 +2895,10 @@ mod tests {
             Err(StatusCode::BAD_REQUEST)
         );
         assert_eq!(
-            validate_board_tuning(&tuning_req(None, Some(NANO3S_ENVELOPE.max_voltage_mv as u32 + 1))),
+            validate_board_tuning(&tuning_req(
+                None,
+                Some(NANO3S_ENVELOPE.max_voltage_mv as u32 + 1)
+            )),
             Err(StatusCode::BAD_REQUEST)
         );
         // Forbidden voltage grid point (3600 mV).
@@ -2551,5 +2908,121 @@ mod tests {
                 Err(StatusCode::BAD_REQUEST)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn pools_api_rejects_a_bad_set_and_hides_the_password() {
+        use http_body_util::BodyExt;
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = LOCK.lock().await;
+        let dir = std::env::temp_dir().join(format!(
+            "mujina-pools-api-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The config path is process-global. The mutex above keeps this
+        // test from overlapping itself; nothing else reads MUJINA_USERCONFIG.
+        unsafe { std::env::set_var("MUJINA_USERCONFIG", &dir) };
+
+        let (miner_tx, miner_rx) = tokio::sync::watch::channel(MinerTelemetry::default());
+        let _miner_tx = miner_tx;
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel(4);
+        let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel(4);
+        let app = super::super::server::build_router(
+            miner_rx,
+            std::sync::Arc::new(std::sync::Mutex::new(super::super::registry::BoardRegistry::new())),
+            cmd_tx,
+            None,
+            reload_tx,
+        );
+
+        let bad = serde_json::json!({
+            "pools": [
+                {"url": "http://nope", "user": "a.worker", "password": "secret", "weight": 100}
+            ]
+        });
+        let resp = tower::ServiceExt::oneshot(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri("/api/v0/pools")
+                .header("content-type", "application/json")
+                .body(Body::from(bad.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let five: Vec<_> = (0..5)
+            .map(|i| {
+                serde_json::json!({
+                    "url": format!("stratum+tcp://p{i}.example:3333"),
+                    "user": "a.worker",
+                    "weight": 20
+                })
+            })
+            .collect();
+        let resp = tower::ServiceExt::oneshot(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri("/api/v0/pools")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"pools": five}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let ok = serde_json::json!({
+            "pools": [
+                {"url": "stratum+tcp://a.example:3333", "user": "a.worker", "password": "secret", "weight": 60},
+                {"url": "stratum+ssl://b.example:3333", "user": "b.worker", "password": "other", "weight": 40}
+            ]
+        });
+        let resp = tower::ServiceExt::oneshot(
+            app.clone(),
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri("/api/v0/pools")
+                .header("content-type", "application/json")
+                .body(Body::from(ok.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["pools"][0].get("password").is_none());
+        assert_eq!(json["pools"][0]["password_set"], true);
+        assert_eq!(json["pools"][0]["weight"], 60);
+        assert_eq!(json["pools"][1]["weight"], 40);
+        let applied = reload_rx.recv().await.expect("director notified");
+        assert_eq!(applied.len(), 2);
+        assert_eq!(applied[0].pass, "secret");
+
+        let legacy = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::builder()
+                .uri("/api/v0/pool")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(legacy.status(), StatusCode::OK);
+        let body = legacy.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["url"], "stratum+tcp://a.example:3333");
+        assert!(json.get("password").is_none());
+        assert_eq!(json["password_set"], true);
+
+        unsafe { std::env::remove_var("MUJINA_USERCONFIG") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

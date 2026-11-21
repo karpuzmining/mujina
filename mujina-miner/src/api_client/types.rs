@@ -63,6 +63,9 @@ pub struct PowerMeasurement {
     pub voltage_v: Option<f32>,
     pub current_a: Option<f32>,
     pub power_w: Option<f32>,
+    /// `measured` (INA226 input rail), `derived`, or `estimated` (chip V²×f model).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Per-thread telemetry.
@@ -120,12 +123,37 @@ pub struct BoardTuningRequest {
     pub temp_target_c: Option<f64>,
 }
 
-/// Request body for `PATCH /api/v0/boards/{name}/chip-clocks`: one clock
-/// offset per chip in MHz, added to every PLL domain of that chip on top of
-/// the board's base clock. All zero = uniform clocks.
+/// Saved Live Tuning, from `tuning.conf`. `live_preset` is the selector
+/// value (`210,230,250,270`, `338,358,378,398`, `420,440,460,480`, or `custom`).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct BoardTuningState {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pll_freq_mhz: Option<[u32; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voltage_mv: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub power_target_w: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temp_target_c: Option<f64>,
+    pub live_preset: String,
+}
+
+/// Request body for `PATCH /api/v0/boards/{name}/chip-clocks`.
+///
+/// Send `offset_mhz` or `freq_mhz`, not both. `freq_mhz` is absolute PLL0
+/// MHz per chip and is stored as an offset from the board's current PLL0.
+/// `policy` is `clear` (default, and the upgrade default) or `keep`.
+/// `clear` drops chip clocks when the profile or the board VF changes.
+/// `keep` leaves them. Per-chip voltage is not accepted: the twelve dies
+/// share one rail.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
 pub struct BoardChipClocksRequest {
-    pub offset_mhz: Vec<i16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset_mhz: Option<Vec<i16>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freq_mhz: Option<Vec<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
 }
 
 /// Request body for `PATCH /api/v0/boards/{name}/power-target`.
@@ -182,6 +210,19 @@ pub struct BoardFanRequest {
     /// can be set in the same request or on its own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chip_temp_target_c: Option<f64>,
+    /// Immersion: fans at 0 %, curve off, fan-missing faults suppressed.
+    /// Default off. Chip over-temperature shutdown stays on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub immersion: Option<bool>,
+}
+
+/// `GET /api/v0/boards/{name}/fan`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct BoardFanStatus {
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manual_duty_percent: Option<u8>,
+    pub immersion: bool,
 }
 
 /// One point on the fan curve: at `temp_c` outlet temperature, run the
@@ -227,6 +268,10 @@ pub struct FanCurveResponse {
 pub struct PsuOverrideRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub override_max_w: Option<f64>,
+    /// Lift PD wattage tiers and the 137 W trip. Default off.
+    /// Chip over-temperature shutdown and the 3912 mV rail maximum stay on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub psu_bypass: Option<bool>,
 }
 
 /// Response body for `GET /api/v0/boards/{name}/psu`.
@@ -236,8 +281,8 @@ pub struct PsuStatusResponse {
     /// `null` if the sensor couldn't be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bus_v: Option<f64>,
-    /// HUSB238A ATTACH bit -- whether a PD contract is currently
-    /// established. `null` if the chip couldn't be read.
+    /// Not reported. The device at I2C 0x42 is not an HUSB238, so
+    /// register 0x01 bit 6 is not an attach flag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attached: Option<bool>,
     /// Power ceiling classified from `bus_v` alone (see
@@ -250,7 +295,25 @@ pub struct PsuStatusResponse {
     pub override_max_w: Option<f64>,
     /// The ceiling actually enforced by the power-target safety trip:
     /// `min(POWER_TARGET_SAFETY_W, (override_max_w or detected_ceiling_w) - margin)`.
+    /// Not enforced while `psu_bypass` is true.
     pub effective_ceiling_w: f64,
+    /// PD tiers and the 137 W trip are not applied while this is true.
+    /// The 137 W measured-power trip stays on either way.
+    pub psu_bypass: bool,
+    /// `ok` when the INA226 answered with at least 8 V, otherwise `unavailable`.
+    #[serde(default = "sensor_unavailable")]
+    pub power_sensor: String,
+    /// Last I2C2 recovery: `none`, `skipped` (SDA was high), `clocked`, or `failed`.
+    #[serde(default = "recovery_none")]
+    pub i2c_recovery: String,
+}
+
+fn recovery_none() -> String {
+    "none".into()
+}
+
+fn sensor_unavailable() -> String {
+    "unavailable".into()
 }
 
 /// Request body for `PATCH /api/v0/boards/{name}/autotune-hashrate`.
@@ -363,6 +426,73 @@ pub struct PoolConfigResponse {
     pub password_set: bool,
 }
 
+/// One pool in `PUT /api/v0/pools`. `password` is omitted to keep the
+/// password already stored for the same url and user.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct PoolPut {
+    pub url: String,
+    pub user: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    pub weight: u16,
+}
+
+/// One pool reject string and how many times the pool returned it.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+pub struct RejectReason {
+    pub reason: String,
+    pub count: u64,
+}
+
+/// One pool in `GET /api/v0/pools`. The password is never returned.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct PoolStatus {
+    pub url: String,
+    pub user: String,
+    pub password_set: bool,
+    pub weight: u16,
+    pub connected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub difficulty: Option<f64>,
+    pub accepted: u64,
+    pub rejected: u64,
+    /// Pool error text, most recent distinct strings, and their counts.
+    #[serde(default)]
+    pub reject_reasons: Vec<RejectReason>,
+    /// Effective hashrate, hashes/s, over the last 10 minutes.
+    pub hashrate_10m: u64,
+    /// Effective hashrate, hashes/s, over the last hour.
+    pub hashrate_1h: u64,
+    /// Shares found locally that were below this pool's difficulty.
+    #[serde(default)]
+    pub shares_low_diff: u64,
+    /// `connected`, `connecting`, `standby`, or `down`.
+    #[serde(default)]
+    pub state: String,
+    /// Why the pool is not connected, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Rolling median stratum round-trip, milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u32>,
+    /// Best difficulty the pool has accepted this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub best_share: Option<f64>,
+    /// Best accepted difficulty kept across reboots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub best_share_alltime: Option<f64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct PoolsPutRequest {
+    pub pools: Vec<PoolPut>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct PoolsResponse {
+    pub pools: Vec<PoolStatus>,
+}
+
 /// Response body for `POST /api/v0/firmware/{target}`.
 ///
 /// By the time this is returned, the binary is already swapped in and a
@@ -421,6 +551,31 @@ pub struct SourceTelemetry {
         serialize_with = "serialize_opt_f64_as_integer_when_whole"
     )]
     pub difficulty: Option<f64>,
+    /// The stratum session is up.
+    #[serde(default)]
+    pub connected: bool,
+    /// Configured percent of hash time.
+    #[serde(default)]
+    pub weight: u16,
+    #[serde(default)]
+    pub accepted: u64,
+    #[serde(default)]
+    pub rejected: u64,
+    /// Pool error text and how many times it was returned.
+    #[serde(default)]
+    pub reject_reasons: Vec<crate::api_client::types::RejectReason>,
+    /// Effective hashes/s over the last 10 minutes.
+    #[serde(default)]
+    pub hashrate_10m: u64,
+    /// Effective hashes/s over the last hour.
+    #[serde(default)]
+    pub hashrate_1h: u64,
+    /// Shares found locally that were below this pool's difficulty.
+    #[serde(default)]
+    pub shares_low_diff: u64,
+    /// Latest connect failure. Absent once the session is up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// Serialize an `Option<f64>` so that whole numbers appear without a

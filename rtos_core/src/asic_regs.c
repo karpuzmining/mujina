@@ -61,7 +61,8 @@ int a3197s_read_fifo(uint8_t channel, uint32_t reg_addr, uint32_t *data_recv, ui
 		 * UART RX FIFO. Core registers still soft-reset on failure. */
 		if (reg_addr != REG_SS_CORE_DIST && reg_addr != REG_PLL0_FREQ &&
 		    reg_addr != REG_PLL1_FREQ && reg_addr != REG_PLL2_FREQ &&
-		    reg_addr != REG_PLL3_FREQ && reg_addr != REG_PVT_RESULT) {
+		    reg_addr != REG_PLL3_FREQ && reg_addr != REG_PVT_RESULT &&
+		    reg_addr != REG_UART_STATUS) {
 			a3197s_soft_reset(channel);
 		}
 	}

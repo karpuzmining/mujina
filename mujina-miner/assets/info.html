@@ -6,7 +6,9 @@
 <title>MUJINA // INFO</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<script>if(/[?&]embed=1/.test(location.search))document.documentElement.classList.add('embed');</script>
 <style>
+  html.embed .menubar, html.embed .top { display: none !important; }
   :root {
     --cyan: #00f0ff;
     --mag: #ff2e97;
@@ -268,7 +270,7 @@
     <a class="menubtn" href="/dashboard#tuning">Tuning</a>
     <a class="menubtn" href="/dashboard#fan">Fan</a>
     <a class="menubtn" href="/dashboard#curve">Fan Curve</a>
-    <a class="menubtn" href="/dashboard#pool">Pool</a>
+    <a class="menubtn" href="/pool">Pool</a>
     <a class="menubtn" href="/led">LED</a>
     <a class="menubtn" href="/firmware">Firmware</a>
     <a class="menubtn" href="/dashboard#display">Display</a>
@@ -354,20 +356,25 @@ function render(d) {
   html += '<div class="table-wrap"><table><thead><tr>';
   html += '<th>Chip</th><th>Temp °C</th><th>Volt (sense)</th><th>PLL Domains (engine count)</th>';
   html += '<th>D0 MHz</th><th>D1 MHz</th><th>D2 MHz</th><th>D3 MHz</th>';
-  html += '<th>ghsspd</th><th>spd_dh</th>';
+  html += '<th>ghsspd</th><th>spd_dh</th><th>Lock</th><th>Enum</th><th>Reinit</th>';
   html += '<th>Timeout</th><th>Heartbeat</th><th>Data</th>';
   html += '</tr></thead><tbody>';
   (d.chips || []).forEach(c => {
     const cntTotal = (c.pll_cnt || []).reduce((a, b) => a + b, 0);
     const dhColor = c.spd_dh > 20 ? 'var(--red)' : (c.spd_dh > 10 ? 'var(--amber)' : 'var(--green)');
     html += '<tr>';
+    const tempTxt = (typeof c.temp_c === 'number' && c.temp_c > -200) ? f1(c.temp_c) : '—';
+    const enumTxt = c.enum_ok ? 'ok' : (c.enum_id === 255 ? 'no reply' : (c.enum_id != null ? ('id ' + c.enum_id) : '—'));
     html += `<td class="chip-name">chip${c.chip}</td>`;
-    html += `<td>${f1(c.temp_c)}</td>`;
+    html += `<td>${tempTxt}</td>`;
     html += `<td>${f1(c.volt_mv)}</td>`;
     html += `<td><div class="domain-cell">${domainBar(c.pll_cnt || [], cntTotal)}${(c.pll_cnt||[]).join('/')}</div></td>`;
     (c.pll_freq || []).forEach(f => { html += `<td>${n(f)}</td>`; });
     html += `<td>${f1(c.ghsspd)}<small style="color:var(--dim)"> GH/s</small></td>`;
     html += `<td style="color:${dhColor}">${f2(c.spd_dh)}%</td>`;
+    html += `<td>${c.pll_lock != null ? (+c.pll_lock).toString(16) : '—'}</td>`;
+    html += `<td>${enumTxt}</td>`;
+    html += `<td>${c.reinit ? 'yes' : '—'}</td>`;
     html += `<td>${n(c.nonce_timeout)}</td>`;
     html += `<td>${n(c.nonce_heartbeat)}</td>`;
     html += `<td>${n(c.nonce_data)}</td>`;

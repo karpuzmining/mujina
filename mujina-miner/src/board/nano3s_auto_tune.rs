@@ -518,6 +518,9 @@ pub(crate) fn default_fan_target_c(profile: Option<TuneProfile>, cap: f32) -> f3
     match profile {
         Some(TuneProfile::Efficient) => 68.0,
         Some(TuneProfile::Quiet) => 65.0,
+        // Max Hash used to sit at cap-2 (90 C) and the fan then cut duty
+        // while the die was still in the 80s. Hold 80 C.
+        Some(TuneProfile::MaxHash) => 80.0,
         _ => 90.0f32.min(cap - 2.0),
     }
 }
@@ -535,12 +538,21 @@ pub(crate) struct FanState {
     /// brief 100 % spike resumes near equilibrium (+8 %) instead of unwinding
     /// slowly from 100 % and chilling the die by 20 C.
     pre_full_duty: Option<f32>,
+    /// Lowest duty the loop may command. The fan curve raises this above 20 %.
+    floor: f32,
 }
 
 impl Default for FanState {
     fn default() -> Self {
         // Start from 100 %: a fan we have just taken over from auto ramps down.
-        Self { duty: 100.0, sent: None, hold_full: false, prev_temp: None, pre_full_duty: None }
+        Self {
+            duty: 100.0,
+            sent: None,
+            hold_full: false,
+            prev_temp: None,
+            pre_full_duty: None,
+            floor: FAN_DUTY_MIN,
+        }
     }
 }
 
@@ -591,6 +603,60 @@ fn plausible(temp: Option<f32>) -> Option<f32> {
 ///   - Within `4.5 C` below target, caps downward step rate to `-3 %` per tick
 ///     and holds a `28 %` floor (when target >= 80 C) so the fan settles at
 ///     equilibrium instead of dumping to 20 % and bouncing over cap.
+/// A PVT sample the API and the fan may treat as a real temperature.
+/// −273 is the sensor's "no reading" sentinel.
+pub(crate) fn reported_temp_c(t: f32) -> Option<f32> {
+    (t.is_finite() && t > 0.0 && t <= TEMP_PLAUSIBLE_MAX_C).then_some(t)
+}
+
+/// Hottest valid chip, ignoring the −273 °C PVT sentinel. When any chip
+/// has no PVT reading, add 5 °C so an unmeasured die is not treated as cold.
+pub(crate) fn control_temp_c(samples: &[f32]) -> Option<f32> {
+    let mut max = f32::MIN;
+    let mut n = 0u32;
+    let mut missing = false;
+    for &t in samples {
+        if t.is_finite() && t > 0.0 && t <= TEMP_PLAUSIBLE_MAX_C {
+            max = max.max(t);
+            n += 1;
+        } else if t.is_finite() && t < -200.0 {
+            missing = true;
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    Some(if missing { max + 5.0 } else { max })
+}
+
+/// Duty the saved curve asks for at `temp_c`. Below two points, 20 %.
+pub(crate) fn fan_curve_floor_percent(temp_c: f32, points: &[(f64, f64)]) -> u8 {
+    if points.len() < 2 || !temp_c.is_finite() {
+        return FAN_DUTY_MIN as u8;
+    }
+    let mut pts: Vec<(f32, f32)> = points
+        .iter()
+        .filter(|(t, d)| t.is_finite() && d.is_finite())
+        .map(|(t, d)| (*t as f32, *d as f32))
+        .collect();
+    pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    if pts.len() < 2 {
+        return FAN_DUTY_MIN as u8;
+    }
+    let duty = if temp_c <= pts[0].0 {
+        pts[0].1
+    } else if temp_c >= pts[pts.len() - 1].0 {
+        pts[pts.len() - 1].1
+    } else {
+        let i = pts.iter().position(|(t, _)| *t >= temp_c).unwrap_or(pts.len() - 1);
+        let (t0, d0) = pts[i - 1];
+        let (t1, d1) = pts[i];
+        let span = (t1 - t0).max(0.1);
+        d0 + (temp_c - t0) / span * (d1 - d0)
+    };
+    duty.clamp(FAN_DUTY_MIN, 100.0).round() as u8
+}
+
 pub(crate) fn fan_step(st: &mut FanState, temp: Option<f32>, cap: f32, target: f32, force_full: bool) -> Option<u8> {
     let t = plausible(temp);
     if force_full && !st.hold_full {
@@ -619,6 +685,7 @@ pub(crate) fn fan_step(st: &mut FanState, temp: Option<f32>, cap: f32, target: f
                     st.duty = (pre + 8.0).clamp(35.0, 80.0);
                 }
             }
+            let before = st.duty;
             if st.hold_full {
                 st.duty = 100.0;
             } else if t >= cap - 2.0 {
@@ -667,6 +734,11 @@ pub(crate) fn fan_step(st: &mut FanState, temp: Option<f32>, cap: f32, target: f
                 };
                 st.duty = (st.duty + step).clamp(floor, 100.0);
             }
+            // At or above the target the fan may only stay or rise.
+            if t >= target && st.duty < before {
+                st.duty = before;
+            }
+            st.duty = st.duty.max(st.floor);
         }
     }
     let d = st.duty_percent();
@@ -812,8 +884,11 @@ pub(crate) enum AutoTuneCmd {
     SetVoltage(i32),
     /// Text for `/tmp/harness_control`.
     Fan(&'static str),
-    /// `fan:manual,<duty>` from the chip-temp fan loop.
+    /// User manual duty (`PATCH /fan` mode=manual). Auto-tune does not emit this.
     FanManual(u8),
+    /// Chip-temperature setpoint for the harness auto fan. Leaves the curve
+    /// and the over-temp escalation running.
+    FanTarget(f32),
     /// Power-cycle and re-enumerate the hash chain after a persistent stall.
     ReinitChain,
     /// Escalate to a rate-limited hardware reboot after unrecoverable stall.
@@ -938,6 +1013,9 @@ pub(crate) struct AutoTune {
     fan_target_override: Option<f32>,
     fan_force_pending: bool,
     fan_restore_pending: bool,
+    /// Last chip-temp target published to the harness. `None` until the
+    /// next tick should send `fan_chip_temp_target`.
+    fan_target_sent: Option<f32>,
     manual_fan_duty: Option<u8>,
     chip_status: Option<ChipTuneStatus>,
 }
@@ -965,6 +1043,7 @@ impl AutoTune {
             fan_target_override: None,
             fan_force_pending: false,
             fan_restore_pending: false,
+            fan_target_sent: None,
             manual_fan_duty: None,
             chip_status: None,
         }
@@ -1039,11 +1118,15 @@ impl AutoTune {
 
     /// `None` restores the default (profile temp cap - 5 C).
     pub(crate) fn set_fan_target(&mut self, c: Option<f32>) {
+        let before = self.fan_target_c();
         let valid = c.filter(|c| FAN_TARGET_RANGE_C.contains(c));
         if valid.is_some() && self.manual_fan_duty.take().is_some() {
             self.fan.sent = None;
         }
         self.fan_target_override = valid;
+        if (before - self.fan_target_c()).abs() > 0.05 {
+            self.fan_target_sent = None;
+        }
     }
 
     /// Effective fan target: the override (never within 2 C of the cap) or
@@ -1060,6 +1143,11 @@ impl AutoTune {
     /// write to the harness (e.g. after recovering from emergency fan overrides).
     pub(crate) fn invalidate_fan_cache(&mut self) {
         self.fan.sent = None;
+    }
+
+    /// Lowest fan duty for this tick, from the saved curve at `temp_c`.
+    pub(crate) fn set_fan_floor(&mut self, percent: u8) {
+        self.fan.floor = (percent as f32).clamp(FAN_DUTY_MIN, 100.0);
     }
 
     /// One fan-loop step; at most one harness write per tick. `temp_max_c`
@@ -1090,7 +1178,15 @@ impl AutoTune {
             return None;
         }
         let target = self.fan_target_c();
-        fan_step(&mut self.fan, temp_max_c, cap, target, force).map(AutoTuneCmd::FanManual)
+        // The duty stays inside the tuner (curve floor, no step-down at the
+        // target). Publishing it as `fan:manual` puts the harness in manual
+        // and suspends both its curve and its over-temp escalation.
+        let _ = fan_step(&mut self.fan, temp_max_c, cap, target, force);
+        if self.fan_target_sent.is_none_or(|sent| (sent - target).abs() > 0.05) {
+            self.fan_target_sent = Some(target);
+            return Some(AutoTuneCmd::FanTarget(target));
+        }
+        None
     }
 
     /// The running choice's search memory (see [`SearchMemory`]).
@@ -1173,6 +1269,7 @@ impl AutoTune {
             Some(d) => FanState { duty: d as f32, sent: Some(d), ..FanState::default() },
             None => FanState::default(),
         };
+        self.fan_target_sent = None;
         self.fan_force_pending = false;
         self.fan_restore_pending = false;
     }
@@ -1181,7 +1278,7 @@ impl AutoTune {
     /// back to auto if this tuner ever took it over.
     pub(crate) fn disable(&mut self) -> Option<AutoTuneCmd> {
         let restore = (self.manual_fan_duty.is_none()
-            && (self.fan.sent.is_some() || self.tuner.fan_forced()))
+            && (self.fan_target_sent.is_some() || self.fan.sent.is_some() || self.tuner.fan_forced()))
             .then_some(AutoTuneCmd::Fan("fan:auto,"));
         self.fan = match self.manual_fan_duty {
             Some(d) => FanState { duty: d as f32, sent: Some(d), ..FanState::default() },
@@ -1511,7 +1608,14 @@ mod tests {
     // --- fan loop ------------------------------------------------------------
 
     fn st_at(duty: f32) -> FanState {
-        FanState { duty, sent: Some(duty.round() as u8), hold_full: false, prev_temp: None, pre_full_duty: None }
+        FanState {
+            duty,
+            sent: Some(duty.round() as u8),
+            hold_full: false,
+            prev_temp: None,
+            pre_full_duty: None,
+            floor: FAN_DUTY_MIN,
+        }
     }
 
     #[test]
@@ -1656,7 +1760,7 @@ mod tests {
         for (p, want) in [
             (TuneProfile::Quiet, 65.0),
             (TuneProfile::Balanced, 88.0), // cap 90.0 - 2.0 = 88.0 (optimal 90C clamped by Balanced cap)
-            (TuneProfile::MaxHash, 90.0),  // optimal 90.0C (cap 92 - 2 = 90.0)
+            (TuneProfile::MaxHash, 80.0),
         ] {
             let mut o = AutoTune::new();
             o.enable(p);
@@ -1664,7 +1768,7 @@ mod tests {
             assert_eq!(o.fan_target_c(), expect);
             assert_eq!(expect, want, "{p:?}");
         }
-        assert_eq!(o.fan_tick(Some(75.0)), Some(AutoTuneCmd::FanManual(100)));
+        assert_eq!(o.fan_tick(Some(75.0)), Some(AutoTuneCmd::FanTarget(68.0)));
         assert_eq!(o.fan_tick(Some(75.0)), None);
         assert_eq!(o.disable(), Some(AutoTuneCmd::Fan("fan:auto,")));
         assert_eq!(o.fan_tick(Some(90.0)), None);
@@ -1672,6 +1776,49 @@ mod tests {
         let mut o = AutoTune::new();
         o.enable(TuneProfile::Efficient);
         assert_eq!(o.disable(), None);
+    }
+
+    #[test]
+    fn fan_does_not_fall_while_the_die_is_at_or_above_target() {
+        let mut st = st_at(48.0);
+        st.prev_temp = Some(91.2);
+        fan_step(&mut st, Some(81.8), 92.0, 80.0, false);
+        assert!(st.duty_percent() >= 48, "duty {}", st.duty_percent());
+    }
+
+    #[test]
+    fn missing_pvt_adds_a_margin_and_ignores_the_sentinel() {
+        let known = [76.8, 76.0, -273.0, -273.0, 85.1];
+        assert_eq!(control_temp_c(&known), Some(90.1));
+        assert_eq!(control_temp_c(&[76.8, 85.1]), Some(85.1));
+        assert_eq!(control_temp_c(&[-273.0, -273.0]), None);
+        assert_eq!(reported_temp_c(-273.0), None);
+        assert_eq!(reported_temp_c(0.0), None);
+        assert_eq!(reported_temp_c(85.1), Some(85.1));
+    }
+
+    #[test]
+    fn fan_curve_floor_holds_the_interpolated_duty() {
+        let points = [(40.0, 20.0), (70.0, 40.0), (80.0, 70.0)];
+        assert_eq!(fan_curve_floor_percent(80.0, &points), 70);
+        assert_eq!(fan_curve_floor_percent(75.0, &points), 55);
+        let mut st = st_at(30.0);
+        st.floor = 55.0;
+        fan_step(&mut st, Some(60.0), 92.0, 80.0, false);
+        assert!(st.duty_percent() >= 55, "duty {}", st.duty_percent());
+    }
+
+    #[test]
+    fn auto_tune_does_not_put_the_fan_in_manual() {
+        let mut o = AutoTune::new();
+        o.enable(TuneProfile::MaxHash);
+        o.seed_fan_duty(Some(20));
+        match o.fan_tick(Some(71.0)) {
+            Some(AutoTuneCmd::FanTarget(c)) => assert!((c - 80.0).abs() < 0.1),
+            other => panic!("expected a chip-temp target, got {other:?}"),
+        }
+        assert!(o.manual_fan().is_none());
+        assert_eq!(o.fan_tick(Some(82.0)), None);
     }
 
     #[test]
@@ -1684,13 +1831,13 @@ mod tests {
         // Mild over-cap (81 C < 83 C): core asks for SetFanMinPercent(45),
         // fan_tick ramps smoothly (< 100) instead of slamming 100 %.
         assert!(o.evaluate(&fan_metrics(81.0)).is_empty());
-        assert!(matches!(
-            o.fan_tick(Some(81.0)),
-            Some(AutoTuneCmd::FanManual(d)) if d >= 45 && d < 100
-        ));
-        // Severe over-cap (83.5 C >= 83 C): forces 100 % and holds until < 75 C.
+        assert!(!matches!(o.fan_tick(Some(81.0)), Some(AutoTuneCmd::FanManual(_))));
+        assert!(o.fan.duty_percent() >= 45 && o.fan.duty_percent() < 100);
+        // Severe over-cap (83.5 C >= 83 C): the internal duty goes to 100.
+        // The harness stays in auto, so its own escalation is what runs.
         assert!(o.evaluate(&fan_metrics(83.5)).is_empty());
-        assert_eq!(o.fan_tick(Some(83.5)), Some(AutoTuneCmd::FanManual(100)));
+        assert!(!matches!(o.fan_tick(Some(83.5)), Some(AutoTuneCmd::FanManual(_))));
+        assert_eq!(o.fan.duty_percent(), 100);
         // 76 C: under the cap but inside the release band -> stays 100.
         assert_eq!(o.fan_tick(Some(76.0)), None);
         assert_eq!(o.fan.duty_percent(), 100);
@@ -1730,7 +1877,7 @@ mod tests {
 
         let mut o = AutoTune::new();
         o.enable(TuneProfile::Balanced);
-        assert!(matches!(o.fan_tick(Some(75.0)), Some(AutoTuneCmd::FanManual(d)) if d < 100));
+        assert!(matches!(o.fan_tick(Some(75.0)), Some(AutoTuneCmd::FanTarget(_))));
 
         // Manual override pauses the auto-tune fan loop across cool ticks
         // and returns FanManual(100) to re-assert the harness file.
@@ -1747,7 +1894,7 @@ mod tests {
         assert_eq!(o.fan_tick(Some(60.0)), None);
         assert_eq!(o.set_manual_fan(None), None);
         assert_eq!(o.manual_fan(), None);
-        assert!(matches!(o.fan_tick(Some(60.0)), Some(AutoTuneCmd::FanManual(_))));
+        assert!(matches!(o.fan_tick(Some(60.0)), Some(AutoTuneCmd::FanTarget(_))));
         assert_eq!(o.disable(), Some(AutoTuneCmd::Fan("fan:auto,")));
 
         // Setting a chip-temp fan target also clears manual mode.
@@ -1755,19 +1902,15 @@ mod tests {
         assert_eq!(o.set_manual_fan(Some(80)), Some(AutoTuneCmd::FanManual(80)));
         o.set_fan_target(Some(75.0));
         assert_eq!(o.manual_fan(), None);
-        assert!(matches!(o.fan_tick(Some(60.0)), Some(AutoTuneCmd::FanManual(_))));
+        assert!(matches!(o.fan_tick(Some(60.0)), Some(AutoTuneCmd::FanTarget(c)) if (c - 75.0).abs() < 0.1));
     }
 
     #[test]
     fn manual_fan_override_resends_duty_after_race_with_fan_tick() {
         let mut o = AutoTune::new();
         o.enable(TuneProfile::Balanced);
-        // Simulate fan_tick overwriting /tmp/harness_control in the same worker
-        // iteration after write_fan_control_command wrote fan:manual,100.
-        assert!(matches!(
-            o.fan_tick(Some(75.0)),
-            Some(AutoTuneCmd::FanManual(d)) if d < 100
-        ));
+        // The automatic tick publishes a temperature target, not a manual duty.
+        assert!(matches!(o.fan_tick(Some(75.0)), Some(AutoTuneCmd::FanTarget(_))));
         // When run_worker syncs MANUAL_FAN_DUTY on the next check, set_manual_fan
         // must emit FanManual(100) so /tmp/harness_control is re-asserted rather
         // than leaving the harness stuck at the stale auto-tuner duty.

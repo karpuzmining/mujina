@@ -31,6 +31,10 @@ typedef struct {
 	uint32_t nonce_data;
 	float    ghsspd;
 	float    spd_dh;
+	uint8_t  pll_lock;
+	uint8_t  enum_ok;
+	uint8_t  enum_id;
+	uint8_t  reinit;
 } nano3s_chip_status_t;
 
 /* Mirrors struct ipc_status (ipc_protocol.h) field-for-field, including

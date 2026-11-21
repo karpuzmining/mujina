@@ -57,6 +57,13 @@ pub(crate) struct SystemInfo {
     pub shared_rail: bool,
     pub ceiling_w: Option<f64>,
     pub psu_contract_w: Option<f64>,
+    pub psu_bypass: bool,
+    pub immersion: bool,
+    /// `ok` when the INA226 input meter answered, otherwise `unavailable`.
+    pub power_sensor: &'static str,
+    pub power_w: Option<f64>,
+    pub efficiency_jth: Option<f64>,
+    pub power_source: Option<&'static str>,
     pub boards: Vec<SystemBoard>,
 }
 
@@ -75,6 +82,34 @@ pub(crate) fn ceiling_if_known(psu_contract_w: Option<f64>, auto_tune_ceiling: f
     psu_contract_w.filter(|w| w.is_finite()).map(|_| auto_tune_ceiling as f64)
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// SHA-256 of the elf this miner was built with. Present only in a Nano 3S
+/// riscv64 build, which is the one that embeds `rtos_core.elf`.
+fn embedded_rtos_sha256() -> Option<String> {
+    #[cfg(all(feature = "nano3s", target_arch = "riscv64"))]
+    {
+        const ELF: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../rtos_core/build/rtos_core.elf"
+        ));
+        Some(sha256_hex(ELF))
+    }
+    #[cfg(not(all(feature = "nano3s", target_arch = "riscv64")))]
+    {
+        None
+    }
+}
+
+/// SHA-256 of the elf Core 1 actually loads, if that file is on this machine.
+fn running_rtos_sha256() -> Option<String> {
+    let bytes = std::fs::read("/mntapp/release/rtt/rtos_core.elf").ok()?;
+    Some(sha256_hex(&bytes))
+}
+
 pub(crate) fn build_system(i: &SystemInfo) -> Value {
     json!({
         "api": 1,
@@ -91,11 +126,27 @@ pub(crate) fn build_system(i: &SystemInfo) -> Value {
             "can_reboot": i.can_reboot,
             "can_restart_miner": i.can_restart_miner,
         },
-        "pool": { "endpoint": "/api/v0/pool", "apply": i.pool_apply },
+        "pool": {
+            "endpoint": "/api/v0/pool",
+            "pools": "/api/v0/pools",
+            "apply": i.pool_apply,
+        },
         "power": {
             "shared_rail": i.shared_rail,
             "ceiling_w": i.ceiling_w,
             "psu_contract_w": i.psu_contract_w,
+            "psu_bypass": i.psu_bypass,
+            "power_w": i.power_w,
+            "efficiency_jth": i.efficiency_jth,
+            "power_source": i.power_source,
+            "power_sensor": i.power_sensor,
+        },
+        "psu_bypass": i.psu_bypass,
+        "immersion": i.immersion,
+        "fan": { "immersion": i.immersion },
+        "rtos_core": {
+            "embedded_sha256": embedded_rtos_sha256(),
+            "running_sha256": running_rtos_sha256(),
         },
         "boards": i.boards.iter().map(|b| json!({
             "name": b.name,
@@ -127,10 +178,16 @@ mod tests {
             device_model: Some("Avalon Nano 3S".into()),
             can_reboot: true,
             can_restart_miner: false,
-            pool_apply: "reboot",
+            pool_apply: "live",
             shared_rail: true,
             ceiling_w: Some(112.0),
             psu_contract_w: Some(140.0),
+            psu_bypass: false,
+            immersion: false,
+            power_sensor: "unavailable",
+            power_w: None,
+            efficiency_jth: None,
+            power_source: None,
             boards: vec![SystemBoard {
                 name: "nano3s-0".into(),
                 model: Some("Avalon Nano 3S".into()),
@@ -153,8 +210,17 @@ mod tests {
         assert_eq!(v["device"]["model"], "Avalon Nano 3S");
         assert_eq!(v["device"]["can_reboot"], true);
         assert_eq!(v["device"]["can_restart_miner"], false);
-        assert_eq!(v["pool"], json!({ "endpoint": "/api/v0/pool", "apply": "reboot" }));
-        assert_eq!(v["power"], json!({ "shared_rail": true, "ceiling_w": 112.0, "psu_contract_w": 140.0 }));
+        assert_eq!(v["pool"], json!({ "endpoint": "/api/v0/pool", "pools": "/api/v0/pools", "apply": "live" }));
+        assert!(v["rtos_core"]["embedded_sha256"].is_null());
+        assert!(v["rtos_core"]["running_sha256"].is_null());
+        assert_eq!(v["psu_bypass"], false);
+        assert_eq!(v["immersion"], false);
+        assert_eq!(v["fan"]["immersion"], false);
+        assert_eq!(v["power"]["power_sensor"], "unavailable");
+        assert_eq!(v["power"]["shared_rail"], true);
+        assert_eq!(v["power"]["ceiling_w"], 112.0);
+        assert_eq!(v["power"]["psu_contract_w"], 140.0);
+        assert_eq!(v["power"]["psu_bypass"], false);
         let b = &v["boards"][0];
         assert_eq!(b["name"], "nano3s-0");
         assert_eq!(b["caps"]["chip_grid"], "per_chip");

@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- **Multi-pool time-slicing (`pool_config`, `pool_alloc`, `pool_director`, `scheduler`)**: up to four stratum pools, weighted 60 s slots on the single Nano 3S chain, failover in list order, and `GET`/`PUT /api/v0/pools` applied in-process. `GET`/`PATCH /api/v0/pool` remain pool 1. Passwords are not returned. An existing `pool.conf` migrates to pool 1 at 100%.
+- **A3197S PLL sequence and CPM table (`rtos_core`, `a3197s.rs`)**:
+  - Replaced the PLL program order with Canaan's `a3197s_set_pll_seq` (MIT, `canaan_sdk_for_linux` v1.1.2-alpha, commit `07fe73f`): SmartSpeed pre, PLL0 lock check, PLL1–3, ROLLTIME, switch to PLL1, PLL1 lock check, mux, PLL0, mux restore, SmartSpeed enable. Each step re-selects the chip.
+  - Shipped the official 349-row CPM table (15–600 MHz) and dropped the unscanned extrapolated tail. Ceiling lookup of 100–580 MHz is unchanged. `correct_freq()` is ported and tested but not applied, because it would move saved clocks such as 230 MHz to 229 MHz.
+  - Clamped every programmed domain to 100–580 MHz so a request can never write a zero PLL word. 3600 mV stays forbidden.
+  - PVT temperature uses Canaan's Horner polynomial (−50..200 °C, else −273). PVT voltage uses the official linear decode and the 14 mV floor.
+- **Per-chip tuning (`nano3s`, API, `/tuning`)**:
+  - `PATCH /api/v0/boards/{name}/chip-clocks` accepts `offset_mhz` or absolute `freq_mhz` (stored as an offset from PLL0) and `policy` `clear` (default, unchanged on upgrade) or `keep`. `keep` retains manual offsets when the profile or board VF changes. ChipTuner's offset window is the same −150..+50 MHz. Edits during a ChipTuner trial return 409.
+  - ChipTuner reads each die's PVT temperature: a die at ≥95 °C is stepped down, a die at ≥92 °C is not stepped up, and a step-up that reaches 97 °C is reverted immediately. The retune trigger uses the hottest die, not only the board max.
+  - The tuning page shows a per-chip table of temperature, PVT mV, frequency, speed-log error rate, and speed-log GH/s. Open `/tuning?demo=1` for a labeled simulated table.
+
 ## v5.1.0 (2026-11-17)
 - **Core 1 Freeze Recovery, Silence Escalation & Stall Resilience (`nano3s.rs`, `nano3s_tuner_core.rs`, `nano3s_ipc_shim`)**:
   - Implemented Core 1 status age and absence monitoring (`nano3s_ipc_has_received_status`, `nano3s_ipc_status_age_ms`). When Core 1 stops sending telemetry (>60s) or has never sent status (>180s), Core 0 immediately forces fan to 100% and skips AutoTune iterations.

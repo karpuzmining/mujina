@@ -105,6 +105,14 @@ struct ipc_chip_status {
 	 * instead of the chain sum. */
 	float    ghsspd;          /* measured hashrate, GH/s */
 	float    spd_dh;          /* SmartSpeed fail rate, % */
+	/* Bit n set when PLL domain n's lock bit was set. */
+	uint8_t  pll_lock;
+	/* 1 when REG_UART_STATUS bits[9:0] equal this chip's index. */
+	uint8_t  enum_ok;
+	/* Reported chip id, or 0xff when the status read failed. */
+	uint8_t  enum_id;
+	/* 1 when this status interval soft-reset and reprogrammed the chip. */
+	uint8_t  reinit;
 };
 
 struct ipc_status {

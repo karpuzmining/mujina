@@ -320,6 +320,9 @@ impl StratumV1Source {
                 if let Some(state) = &mut self.state {
                     state.share_difficulty = Some(difficulty);
                 }
+                // The job already in the scheduler was built with the previous
+                // target. Tell it the new pool difficulty before the next notify.
+                let _ = self.event_tx.try_send(SourceEvent::PoolDifficulty(diff));
             }
 
             ClientEvent::VersionMaskSet(mask) => {
@@ -331,6 +334,10 @@ impl StratumV1Source {
 
             ClientEvent::ShareAccepted { job_id, nonce } => {
                 SHARES_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+                let _ = self.event_tx.try_send(SourceEvent::ShareResult {
+                    accepted: true,
+                    reason: None,
+                });
                 if !self.first_share_logged {
                     self.first_share_logged = true;
                     info!(
@@ -353,6 +360,10 @@ impl StratumV1Source {
 
             ClientEvent::ShareRejected { job_id, reason } => {
                 SHARES_REJECTED.fetch_add(1, Ordering::Relaxed);
+                let _ = self.event_tx.try_send(SourceEvent::ShareResult {
+                    accepted: false,
+                    reason: Some(reason.clone()),
+                });
                 warn!(job_id = %job_id, reason = %reason, "Share rejected by pool");
             }
 
@@ -377,11 +388,25 @@ impl StratumV1Source {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No protocol state (not subscribed)"))?;
 
-        // Extract extranonce2 from share (if present)
-        let extranonce2 = share
-            .extranonce2
-            .map(Vec::from)
-            .unwrap_or_else(|| vec![0; state.extranonce2_size]);
+        // This connection's negotiated width. A share whose extranonce2
+        // was built for a different pool (4 bytes on an 8-byte Hydra
+        // session, or the reverse) must not be submitted: the pool
+        // inserts the bytes as-is, the merkle root changes, and the
+        // result is a low-difficulty reject.
+        let extranonce2 = match share.extranonce2 {
+            Some(en2) => {
+                let bytes = Vec::from(en2);
+                if bytes.len() != state.extranonce2_size {
+                    anyhow::bail!(
+                        "extranonce2 is {} bytes but this connection negotiated {}",
+                        bytes.len(),
+                        state.extranonce2_size
+                    );
+                }
+                bytes
+            }
+            None => vec![0; state.extranonce2_size],
+        };
 
         // Extract version bits if version rolling was authorized
         // Always include version_bits parameter when pool authorized rolling,
@@ -590,6 +615,7 @@ impl StratumV1Source {
                             return ConnectOutcome::Fatal(e.into());
                         }
                         warn!(error = %e, "Failed to connect");
+                        let _ = self.event_tx.try_send(SourceEvent::LinkError(Some(e.to_string())));
                         return ConnectOutcome::Disconnected;
                     }
                 }
@@ -993,8 +1019,9 @@ mod tests {
         // Validate ntime
         assert_eq!(params.ntime, *submit::NTIME, "ntime mismatch");
 
-        // Validate nonce
-        assert_eq!(params.nonce, *submit::NONCE, "nonce mismatch");
+        // The pool parses this hex as an integer and stores it
+        // little-endian. The captured header nonce is the other endian.
+        assert_eq!(params.nonce, submit::NONCE.swap_bytes(), "nonce mismatch");
 
         // Validate version_bits (should be rolled bits only, masked)
         // The capture shows version_bits = 0x00b44000
@@ -1033,6 +1060,55 @@ mod tests {
             params.version_bits, None,
             "version_bits should be None without version rolling"
         );
+    }
+
+    /// HydraPool negotiates an 8-byte extranonce2 and mask 0x1fffe000.
+    /// A second connection with a 4-byte extranonce2 must not accept the
+    /// first connection's share, and the version bits Hydra rebuilds must
+    /// equal the version this connection hashed.
+    #[test]
+    fn each_connection_keeps_its_own_extranonce_and_version_mask() {
+        let mask = 0x1fff_e000u32;
+        let base = 0x2000_0000u32;
+        let hydra_en2 = [
+            0x78u8, 0x56, 0x34, 0x12, 0xf0, 0xde, 0xbc, 0x9a,
+        ];
+        let hydra = source_with_state(vec![0xaa, 0xbb, 0xcc, 0xdd], 8, Some(34), Some(mask));
+        let atlas = source_with_state(vec![0x11, 0x22, 0x33, 0x44], 4, Some(2000), Some(mask));
+
+        let mut versions = [base; 8];
+        versions[1] = base | mask;
+        let mut idx = 2usize;
+        for bit in 15..=28u32 {
+            if idx >= 8 {
+                break;
+            }
+            if (mask >> bit) & 1 == 1 {
+                versions[idx] = base | (1u32 << bit);
+                idx += 1;
+            }
+        }
+
+        for version in versions {
+            let share = Share {
+                job_id: "hydra-job".to_string(),
+                nonce: 0x7552_034c,
+                time: 1_700_000_000,
+                version: Version::from_consensus(version as i32),
+                extranonce2: Some(extranonce2_from_bytes(&hydra_en2)),
+            };
+            let params = hydra
+                .share_to_submit_params(share.clone())
+                .expect("hydra width matches");
+            assert_eq!(params.extranonce2, hydra_en2);
+            let bits = params.version_bits.expect("hydra authorized rolling");
+            let rebuilt = (base & !mask) | (bits & mask);
+            assert_eq!(rebuilt, version);
+            assert!(
+                atlas.share_to_submit_params(share).is_err(),
+                "a 4-byte connection must not submit an 8-byte extranonce2"
+            );
+        }
     }
 
     /// Test share_to_submit_params uses default extranonce2 when not provided.
@@ -1102,8 +1178,10 @@ mod tests {
         // params[3] = ntime (hex)
         assert_eq!(json[3].as_str().unwrap(), submit::NTIME_STRING);
 
-        // params[4] = nonce (hex)
-        assert_eq!(json[4].as_str().unwrap(), submit::NONCE_STRING);
+        // params[4] = nonce (hex). Byte-swapped from the captured header
+        // nonce so the pool's integer-then-little-endian store matches it.
+        let submitted_nonce = format!("{:08x}", submit::NONCE.swap_bytes());
+        assert_eq!(json[4].as_str().unwrap(), submitted_nonce);
 
         // params[5] = version_bits (hex)
         assert_eq!(json[5].as_str().unwrap(), submit::VERSION_STRING);

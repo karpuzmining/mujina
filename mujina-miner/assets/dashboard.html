@@ -203,8 +203,20 @@
     .freq::before { background: var(--mag); box-shadow: 0 0 10px var(--mag); }
     .freq .val { color: var(--mag); text-shadow: 0 0 10px rgba(255,46,151,.5); }
     .pool::before { background: var(--lime); box-shadow: 0 0 10px var(--lime); }
-    .pool .val { color: var(--lime); text-shadow: 0 0 10px rgba(200,255,0,.4); font-size: 15px; word-break: break-all; line-height: 1.35; }
-    .poolmeta { display: flex; gap: 26px; margin-top: 12px; flex-wrap: wrap; }
+    .pool .val { color: var(--lime); text-shadow: 0 0 10px rgba(200,255,0,.4); font-size: 15px; line-height: 1.35;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .poolrow { display: grid; gap: 12px; margin-top: 12px; }
+    .poolrow[data-pool-count="1"] { grid-template-columns: 1fr 1fr; }
+    .poolrow[data-pool-count="2"] { grid-template-columns: 1fr 1fr; }
+    .poolrow[data-pool-count="3"] { grid-template-columns: repeat(3, 1fr); }
+    .poolrow[data-pool-count="4"] { grid-template-columns: repeat(4, 1fr); }
+    a.poolcard { display: block; text-decoration: none; color: inherit; min-width: 0; cursor: pointer; }
+    .poolstate { margin-top: 6px; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--lime); }
+    .pool.down { opacity: 0.78; }
+    .pool.down .poolstate, .pool.down .val { color: var(--red, #ff3355); text-shadow: none; }
+    .pool.standby .poolstate { color: var(--amber); }
+    .poolmeta small { display: block; font-family: 'Share Tech Mono', monospace; font-size: 10px; letter-spacing: 0; text-transform: none; color: var(--dim); font-weight: 400; }
+    .poolmeta { display: flex; gap: 14px 18px; margin-top: 12px; flex-wrap: wrap; }
     .poolmeta span { font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--lime); opacity: .75; }
     .poolmeta b {
       display: block; font-family: 'Orbitron', sans-serif; font-weight: 700; font-size: 16px; margin-top: 2px;
@@ -247,6 +259,13 @@
     .chartlegend .sw-solid { box-shadow: 0 0 6px var(--cyan); }
     .chartlegend .sw-dash { border-top: 2px dashed rgba(0,240,255,.55); opacity: .85; }
     
+
+    .curve-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+    .curve-table th { text-align: left; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--dim); font-weight: 400; padding: 0 4px 6px; }
+    .curve-table td { padding: 4px; vertical-align: middle; }
+    .curve-table input { width: 100%; min-width: 0; box-sizing: border-box; background: #05070e; border: 1px solid var(--line); color: var(--ink); font: inherit; font-size: 16px; padding: 8px; border-radius: 4px; }
+    .curve-table .x { width: 44px; padding: 8px 0; }
+    #curvePreview { max-width: 100%; }
     .sec {
       display: flex; align-items: center; gap: 10px; font-family: 'Orbitron', sans-serif; font-weight: 700;
       font-size: 12px; letter-spacing: .16em; text-transform: uppercase; color: var(--cyan);
@@ -472,6 +491,10 @@
       .heroside { padding-left: 0; border-left: none; border-top: 1px solid rgba(0,240,255,.18); padding-top: 12px; }
       .span2 { grid-column: span 2; }
       .pool .val { font-size: 14px; }
+      .poolrow[data-pool-count="1"],
+      .poolrow[data-pool-count="2"],
+      .poolrow[data-pool-count="3"] { grid-template-columns: 1fr; }
+      .poolrow[data-pool-count="4"] { grid-template-columns: 1fr 1fr; }
       .dual .dcell+.dcell { margin-left: 10px; padding-left: 10px; }
       .span4 { grid-column: span 2; }
       .board-summary-grid { grid-template-columns: 1fr; }
@@ -513,6 +536,8 @@
     }
     .menubar .menubtn.on { border-color: var(--cyan); box-shadow: 0 0 10px rgba(0,240,255,.3); }
     .menusheet .sheet { width: min(640px, 96vw); position: relative; }
+    .menusheet .sheet.frame { width: min(960px, 96vw); height: min(88vh, 920px); display: flex; flex-direction: column; }
+    .menusheet .sheet.frame iframe { flex: 1; width: 100%; border: 0; background: #05070e; min-height: 240px; }
     .menusheet .sheetclose { position: sticky; top: 0; float: right; z-index: 2; margin: 0 0 8px 8px; }
     .menusheet .sheet .sec:first-of-type { margin-top: 4px; }
     #ownCur { font-size: 13px; color: var(--ink); line-height: 1.5; margin-bottom: 12px; overflow-wrap: anywhere; }
@@ -1068,6 +1093,8 @@
     </div>
     <div style="display:flex;align-items:center;gap:12px">
       <span class="modebadge" id="modeBadge" style="display:none"></span>
+      <span class="modebadge" id="psuBypassBadge" style="display:none;border-color:var(--amber);color:var(--amber)">PSU bypass</span>
+      <span class="modebadge" id="immersionBadge" style="display:none;border-color:var(--purple);color:var(--purple)">Immersion</span>
     </div>
   </div>
 
@@ -1077,11 +1104,11 @@
     <button type="button" class="menubtn" data-menu="tuning" style="display:none">Tuning</button>
     <button type="button" class="menubtn" data-menu="fan" style="display:none">Fan</button>
     <button type="button" class="menubtn" data-menu="curve" style="display:none">Fan Curve</button>
-    <button type="button" class="menubtn" data-menu="pool" style="display:none">Pool</button>
-    <a class="menubtn" data-menu="led" href="/led">LED</a>
-    <a class="menubtn" data-menu="firmware" href="/firmware" style="display:none">Firmware</a>
+    <a class="menubtn" data-menu="pool" href="/pool" style="display:none">Pool</a>
+    <button type="button" class="menubtn" data-menu="led">LED</button>
+    <button type="button" class="menubtn" data-menu="firmware" style="display:none">Firmware</button>
     <button type="button" class="menubtn" data-menu="display">Display</button>
-    <a class="menubtn" data-menu="info" href="/info">Info</a>
+    <button type="button" class="menubtn" data-menu="info">Info</button>
   </div>
   <div class="sysnotice" id="sysNotice" style="display:none"></div>
 
@@ -1112,6 +1139,7 @@
   <!-- PSU Delivery & Overclock -->
   <div class="sec" id="psuDeliverySec" style="margin-top:18px">Power Delivery & Overclock<span class="sec-sub">Input power supply limits & continuous VRM headroom</span></div>
   <div class="card" id="psuDeliveryCard" style="max-width:560px">
+    <div class="note" id="livePower">Power reading…</div>
     <div class="note" id="psuCurStatus">Detecting power supply contract…</div>
     <div class="row" style="margin-top:10px">
       <label for="psuModeSelect">Power Profile</label>
@@ -1141,6 +1169,7 @@
     <div class="sheet">
       <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
       <h2>Tuning</h2>
+      <p class="note"><a id="tuneHealth" href="/tuning#diagnostics">Board health</a></p>
       <div class="boardtabs" id="tuneBoardTabs" style="display:none;margin:10px 0 14px 0"></div>
       <div class="note" id="powerLine" style="display:none"></div>
       <div class="note" id="tuningNone" style="display:none">No tuning controls for this board.</div>
@@ -1230,6 +1259,18 @@
   </div>
   </div>
 
+    <div class="card" id="psuBypassCard" style="max-width:560px;margin-top:16px">
+      <label style="display:flex;gap:10px;align-items:center">
+        <input type="checkbox" id="psuBypassToggle">
+        <span>PSU bypass</span>
+      </label>
+      <p class="note">Lifts the USB-C PD wattage tiers. The 137 W trip, chip over-temperature shutdown and the 3912 mV rail limit stay on. The stock adapter can overheat.</p>
+      <div class="msg" id="psuBypassMsg"></div>
+    </div>
+    <div style="margin-top:16px">
+      <a class="btn pri" id="advancedTuning" href="/tuning" style="display:inline-flex;width:100%;justify-content:center">Advanced tuning</a>
+      <p class="note" style="margin-top:8px">Opens the full tuning page: profiles, live clocks, and per-chip settings.</p>
+    </div>
     </div>
   </div>
 
@@ -1237,6 +1278,14 @@
     <div class="sheet">
       <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
       <h2>Fan</h2>
+      <div class="card" style="max-width:560px;margin-bottom:12px">
+        <label style="display:flex;gap:10px;align-items:center">
+          <input type="checkbox" id="immersionToggle">
+          <span>Immersion mode</span>
+        </label>
+        <p class="note">Fans stay at 0% and fan-missing faults are ignored. Only enable when the miner is submerged in dielectric fluid.</p>
+        <div class="msg" id="immersionMsg"></div>
+      </div>
       <div class="boardtabs" id="fanBoardTabs" style="display:none;margin:10px 0 14px 0"></div>
   <div id="fanSection" style="display:none">
   <!-- Fan Control -->
@@ -1268,51 +1317,25 @@
       <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
       <h2>Fan Curve</h2>
   <div id="curveSection" style="display:none">
-  <!-- Fan Curve -->
-  <div class="sec">Fan Curve<span class="sec-sub">Outlet-temp → duty% baseline, used in Auto mode — saved immediately, applied within ~1s</span></div>
-  <div class="card" style="max-width:560px">
-    <svg id="curvePreview" viewBox="0 0 300 120" style="width:100%;height:120px;display:block;margin-bottom:10px;background:var(--panel2);border:1px solid var(--line);border-radius:6px">
+  <div class="sec">Fan Curve<span class="sec-sub">Outlet temp to fan %, saved immediately</span></div>
+  <div class="card" style="max-width:100%">
+    <svg id="curvePreview" viewBox="0 0 300 120" style="width:100%;height:96px;display:block;margin-bottom:10px;background:var(--panel2);border:1px solid var(--line);border-radius:6px">
       <g id="curveGrid" stroke="var(--line)" stroke-width="1"></g>
       <polyline id="curveLine" fill="none" stroke="var(--cyan)" stroke-width="2"></polyline>
       <g id="curveDots" fill="var(--cyan)"></g>
     </svg>
-    <div id="curvePoints"></div>
-    <div style="display:flex;gap:10px;justify-content:space-between;margin-top:10px">
-      <button class="btn" id="curveAddPoint">+ Add Point</button>
-      <button class="btn pri wbtn" id="curveApply">Save Curve</button>
+    <table class="curve-table">
+      <thead><tr><th>Outlet °C</th><th>Fan %</th><th></th></tr></thead>
+      <tbody id="curvePoints"></tbody>
+    </table>
+    <div style="display:flex;gap:10px;justify-content:space-between;margin-top:10px;flex-wrap:wrap">
+      <button class="btn" id="curveAddPoint" type="button">+ Add Point</button>
+      <button class="btn pri wbtn" id="curveApply" type="button">Save Curve</button>
     </div>
+    <p class="note">Temperatures must increase. Fan duty is 0–100%. Two to eight points.</p>
     <div class="msg" id="curveMsg"></div>
   </div>
   </div>
-
-    </div>
-  </div>
-
-  <div class="modal menusheet" id="menu-pool">
-    <div class="sheet">
-      <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
-      <h2>Pool</h2>
-  <div class="sec" id="pool">Pool Settings<span class="sec-sub" id="poolApplyNote">saved immediately</span></div>
-  <div class="card" id="poolCard" style="max-width:560px">
-    <div class="prow">
-      <label for="poolUrl">Pool URL</label>
-      <input type="text" id="poolUrl" name="pool_url" placeholder="stratum+tcp://pool.example.com:3333" autocomplete="off" autocapitalize="off" spellcheck="false">
-    </div>
-    <div class="prow">
-      <label for="poolUser">Worker <small>(usually address.workername)</small></label>
-      <input type="text" id="poolUser" name="pool_user" placeholder="bc1q....worker1" autocomplete="off" autocapitalize="off" spellcheck="false">
-    </div>
-    <div class="prow">
-      <label for="poolPass">Password <small>(blank keeps current; most pools ignore it)</small></label>
-      <input type="password" id="poolPass" name="pool_password" placeholder="unchanged" autocomplete="new-password">
-    </div>
-    <div class="pacts">
-      <button class="btn pri wbtn" id="poolSave">Save</button>
-      <button class="btn" id="poolReboot" data-apply="restart" style="display:none;border-color:var(--mag);color:var(--mag)">Restart now</button>
-    </div>
-    <div class="msg" id="poolMsg"></div>
-  </div>
-
     </div>
   </div>
 
@@ -1334,7 +1357,26 @@
     </div>
   </div>
 
-  <div class="sec">Fleet Overview<span class="sec-sub" id="fleetsub"></span></div>
+  <div class="modal menusheet" id="menu-led">
+    <div class="sheet frame">
+      <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
+      <iframe title="LED" src="/led?embed=1"></iframe>
+    </div>
+  </div>
+  <div class="modal menusheet" id="menu-firmware">
+    <div class="sheet frame">
+      <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
+      <iframe title="Firmware" src="/firmware?embed=1"></iframe>
+    </div>
+  </div>
+  <div class="modal menusheet" id="menu-info">
+    <div class="sheet frame">
+      <button type="button" class="btn sheetclose" data-close="1">&#10005; Close</button>
+      <iframe title="Info" src="/info?embed=1"></iframe>
+    </div>
+  </div>
+
+<div class="sec">Fleet Overview<span class="sec-sub" id="fleetsub"></span></div>
   
   <!-- Fleet Board Summary Cards -->
   <div class="board-summary-grid" id="boardSummaryGrid" style="display:none"></div>
@@ -1381,16 +1423,8 @@
     <div class="card"><div class="label">Boards Online</div><div class="val" id="fboards">—</div></div>
     <div class="card"><div class="label">Total Power</div><div class="val" id="fpower">—</div></div>
     <div class="card fan"><div class="label">Avg Fan</div><div class="val" id="ffan">—</div></div>
-    <div class="card pool span2">
-      <div class="label">Pool</div>
-      <div class="val" id="poolval">—</div>
-      <div class="poolmeta">
-        <span>Shares<b id="shares">—</b></span>
-        <span>Difficulty<b id="diff">—</b></span>
-        <span>Best Share<b id="bestdiff" style="color:var(--lime)">—</b></span>
-      </div>
-    </div>
   </div>
+  <div class="poolrow" id="poolRow" data-pool-count="1"></div>
 
   <div class="chartcard">
     <div class="label">Fleet Hashrate History // Multi-Board Line &amp; Stacked Graph (Hover to inspect)</div>
@@ -1415,77 +1449,6 @@
     </div>
   </div>
 
-  <div class="sec">Board Diagnostics<span class="sec-sub" id="boardsub"></span></div>
-  <div class="boardtabs" id="boardTabs" style="display:none"></div>
-
-  <div class="grid">
-    <div class="card hero hr">
-      <div class="label" id="boardhrlabel">Hashrate</div>
-      <div class="herobody">
-        <div class="heromain"><div class="val" id="hr">—</div></div>
-        <div class="heroside" id="chipcard" style="display:none">
-          <div class="chip-toolbar">
-            <div class="chiplabel">ASIC Health Grid Matrix</div>
-            <div class="chipfilters" id="chipFilterBtns">
-              <button class="cfilterbtn active" data-filter="all">All</button>
-              <button class="cfilterbtn" data-filter="lazy">Lazy</button>
-            </div>
-          </div>
-          <div id="chips"></div>
-        </div>
-      </div>
-    </div>
-    <div class="card freq span2">
-      <div class="dual">
-        <div class="dcell"><div class="label">Frequency</div><div class="val" id="freq">—</div></div>
-        <div class="dcell"><div class="label">Core Voltage</div><div class="val" id="corev">—</div></div>
-      </div>
-    </div>
-    <div class="card temp span2">
-      <div class="dual">
-        <div class="dcell" id="tcAsic"><div class="label">ASIC Temp</div><div class="val" id="asic">—</div></div>
-        <div class="dcell" id="tcVr"><div class="label">VR Temp</div><div class="val" id="vrtemp">—</div></div>
-        <div class="dcell" id="tcOutlet"><div class="label">Outlet Temp</div><div class="val" id="outlet" title="External board NTC thermistor, positioned near the exhaust -- not on the ASIC chain itself. No inlet sensor exists on this hardware.">—</div></div>
-        <div class="dcell"><div class="label">Fail Rate</div><div class="val" id="vr">—</div></div>
-      </div>
-    </div>
-
-    <div class="card eff"><div class="label">Efficiency</div><div class="val" id="eff">—</div></div>
-    <div class="card"><div class="label">ASIC Core Power</div><div class="val" id="corew">—</div></div>
-    <div class="card"><div class="label">Core Current</div><div class="val" id="corea">—</div></div>
-    <div class="card"><div class="label">Input Voltage</div><div class="val" id="inputv">—</div></div>
-
-    <div class="card fan"><div class="label">Fan</div><div class="val" id="fan">—</div></div>
-    <div class="card span2">
-      <div class="label">Board</div>
-      <div class="val" id="boardmeta" style="font-size:15px">—</div>
-    </div>
-
-    <!-- Prominent Auto-Tuner Live Terminal Console -->
-    <div class="card span4" id="tunerCard" style="margin-top:4px;display:none">
-      <div class="label">// AUTO-TUNER LIVE ACTIVITY &amp; CALIBRATION LOG</div>
-      <div class="at-console">
-        <div class="at-console-header">
-          <span class="at-title">Status: <span id="at-phase-label">HOLDING</span></span>
-          <span class="at-best-badge" id="atbest">No calibration point established yet</span>
-        </div>
-        <div id="at-per-chip" style="font-size:11px;color:var(--dim);margin:4px 0;padding:2px 0"></div>
-        <div class="at-feed" id="atlist">—</div>
-      </div>
-    </div>
-  </div>
-
-  <div class="chartcard">
-    <div class="label">Board Hashrate History // GH/s (Hover to inspect)</div>
-    <div class="chartwrap">
-      <canvas id="chart"></canvas>
-    </div>
-    <div class="chartlegend">
-      <span class="lg"><i class="sw sw-solid"></i>Board Hashrate</span>
-      <span class="lg"><i class="sw sw-dash"></i>Moving Avg (10)</span>
-    </div>
-  </div>
-
   <div class="status" id="status">
     <span id="statusleft"><span class="dot off"></span>connecting…</span>
     <span id="statusuptime">—</span>
@@ -1500,7 +1463,7 @@ const fx = (v, u, d = 2) => v == null ? '—' : (+v).toFixed(d) + ' <small>' + u
 function show(e, on) { if (typeof e === 'string') e = $(e); if (e) e.style.display = on ? '' : 'none'; }
 function mk(tag, cls, text) { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; }
 function safeUrl(u) { return typeof u === 'string' && u.charAt(0) === '/' && u.charAt(1) !== '/'; }
-function setMsg(id, text, ok) { const m = $(id); m.textContent = text; m.className = ok ? 'msg ok' : 'msg'; }
+function setMsg(id, text, ok) { const m = $(id); if (!m) return; m.textContent = text; m.className = ok ? 'msg ok' : 'msg'; }
 
 let SYS = null;                 // last good /api/v0/system document
 let LAST = null, ACTIVE_NAME = null, CHIP_FILTER = 'all';
@@ -1788,6 +1751,10 @@ function applySystem() {
     const dev = SYS.device || {};
     badge.textContent = String(SYS.mode || '?').toUpperCase() + ' · ' + (dev.model || SYS.platform || '');
     show(badge, true);
+    show('psuBypassBadge', !!SYS.psu_bypass);
+    show('immersionBadge', !!SYS.immersion);
+    if ($('psuBypassToggle')) $('psuBypassToggle').checked = !!SYS.psu_bypass;
+    if ($('immersionToggle')) $('immersionToggle').checked = !!SYS.immersion;
     const fw = SYS.firmware || {};
     $('statuspath').textContent = (fw.name || 'mujina-minerd') + ' ' + (fw.version || '') + (fw.build ? ' (' + fw.build + ')' : '');
     show('rebootBtn', !!dev.can_reboot);
@@ -1797,21 +1764,31 @@ function applySystem() {
     if (pw.psu_contract_w != null) parts.push('PSU contract ' + pw.psu_contract_w + ' W');
     if (pw.ceiling_w != null) parts.push('power ceiling ' + pw.ceiling_w + ' W');
     if (pw.shared_rail) parts.push('shared rail');
-    $('powerLine').textContent = parts.join(' · ');
-    show('powerLine', parts.length > 0);
+    if ($('powerLine')) {
+      $('powerLine').textContent = parts.join(' · ');
+      show('powerLine', parts.length > 0);
+    }
     const how = (SYS.pool && SYS.pool.apply) || 'restart';
-    $('poolApplyNote').textContent = how === 'live' ? 'saved immediately and applied live'
-      : how === 'reboot' ? 'saved immediately, applied after a device reboot'
-      : 'saved immediately, applied after the miner restarts';
+    if ($('poolApplyNote')) {
+      $('poolApplyNote').textContent = how === 'live' ? 'saved immediately and applied live'
+        : how === 'reboot' ? 'saved immediately, applied after a device reboot'
+        : 'saved immediately, applied after the miner restarts';
+    }
     const pr = $('poolReboot');
-    pr.textContent = how === 'reboot' ? 'Reboot now' : 'Restart now';
-    pr.dataset.apply = how;
+    if (pr) {
+      pr.textContent = how === 'reboot' ? 'Reboot now' : 'Restart now';
+      pr.dataset.apply = how;
+    }
   } else {
     show(badge, false);
     show('rebootBtn', false); show('restartBtn', false);
   }
   show('pauseBtn', PAUSE_AVAILABLE);
   applyBoardCaps();
+  if (SYS && !window.__liveTuneLoaded) {
+    window.__liveTuneLoaded = true;
+    loadLiveTuning();
+  }
 }
 
 // Per-board visibility, driven by the selected board's caps.
@@ -1827,7 +1804,7 @@ function applyBoardCaps() {
     : !!(LAST && LAST.boards && LAST.boards.some(x => x.outlet_c != null));
   show('fcOutlet', anyOutlet);
   const tuner = !!(caps && safeUrl(caps.tuner)), manual = !!(caps && safeUrl(caps.manual_tuning));
-  show('ownSection', tuner);
+  if ($('ownSection')) show('ownSection', tuner);
   show('tunerCard', tuner);
   const pcElem = $('at-per-chip');
   const contChk = $('ownContinuous');
@@ -1837,19 +1814,24 @@ function applyBoardCaps() {
   } else {
     if (contChk) { contChk.disabled = false; syncContinuousUI(); }
   }
-  show('manualSection', manual);
-  show('tuningNone', !!SYS && !tuner && !manual);
+  if ($('manualSection')) show('manualSection', manual);
+  if ($('tuningNone')) show('tuningNone', !!SYS && !tuner && !manual);
   const nano = hasCeiling();
-  show('tunePresetRow', nano); show('tunePowerRow', nano); $('tuneFreq').min = nano ? 100 : 50; $('tuneFreq').max = nano ? 520 : 1200;
-  $('tuneVolt').min = nano ? 3300 : 500; $('tuneVolt').max = nano ? 3912 : 1600;
+  if ($('tuneFreq') && $('tuneVolt')) {
+    show('tunePresetRow', nano); show('tunePowerRow', nano);
+    $('tuneFreq').min = nano ? 100 : 50; $('tuneFreq').max = nano ? 520 : 1200;
+    $('tuneVolt').min = nano ? 3300 : 500; $('tuneVolt').max = nano ? 3912 : 1600;
+  }
   const fan = caps ? caps.fan : 'none';
-  show('fanSection', !!SYS && fan && fan !== 'none');
-  $('fanNote').textContent = fan === 'harness'
-    ? 'Controlled by the device harness: Auto follows the fan curve (and escalates to 100% if a chip runs too hot); Manual holds a fixed duty.'
-    : 'Board fan: Auto lets the board regulate temperature; Manual holds a fixed duty.';
-  show('curveSection', !!(caps && caps.fan_curve));
-  if (caps && caps.fan_curve && CURVE_FOR !== name) { CURVE_FOR = name; loadCurve(); }
-  if (b && nano === false && TUNE_FOR !== name) {
+  if ($('fanNote')) {
+    show('fanSection', !!SYS && fan && fan !== 'none');
+    $('fanNote').textContent = fan === 'harness'
+      ? 'Controlled by the device harness: Auto follows the fan curve (and escalates to 100% if a chip runs too hot); Manual holds a fixed duty.'
+      : 'Board fan: Auto lets the board regulate temperature; Manual holds a fixed duty.';
+    show('curveSection', !!(caps && caps.fan_curve));
+    if (caps && caps.fan_curve && $('curvePoints') && CURVE_FOR !== name) { CURVE_FOR = name; loadCurve(); }
+  }
+  if ($('tuneFreq') && b && nano === false && TUNE_FOR !== name) {
     TUNE_FOR = name;
     if (b.freq_mhz != null) $('tuneFreq').value = Math.round(b.freq_mhz);
     if (b.core_v != null) $('tuneVolt').value = Math.round(b.core_v * 1000);
@@ -1960,6 +1942,7 @@ function renderChips(chips, perChip) {
   let list = chips;
   if (CHIP_FILTER === 'lazy') list = chips.filter(c => (c.ghs || 0) < peak * 0.75);
   const root = $('chips');
+  if (!root) return;
   root.textContent = '';
   if (!list.length) { const n = mk('div', null, 'No chips match filter.'); n.style.cssText = 'font-size:11px;color:var(--dim);padding:10px 0'; root.appendChild(n); return; }
   const grid = mk('div', 'chipgrid');
@@ -1991,9 +1974,8 @@ function renderChips(chips, perChip) {
     if (DETAIL_CACHE && Array.isArray(DETAIL_CACHE.chips)) {
       dChip = DETAIL_CACHE.chips.find(dc => Number(dc.chip) === idx || Number(dc.index) === idx) || DETAIL_CACHE.chips[idx];
     }
-    const tempVal = (c.temp_c != null && Number.isFinite(+c.temp_c))
-      ? +c.temp_c
-      : (dChip && dChip.temp_c != null && Number.isFinite(+dChip.temp_c) ? +dChip.temp_c : null);
+    const liveTemp = (v) => (v != null && Number.isFinite(+v) && +v > -200) ? +v : null;
+    const tempVal = liveTemp(c.temp_c) != null ? liveTemp(c.temp_c) : liveTemp(dChip && dChip.temp_c);
     const dhVal = (c.spd_dh != null && Number.isFinite(+c.spd_dh))
       ? +c.spd_dh
       : (dChip && dChip.spd_dh != null && Number.isFinite(+dChip.spd_dh) ? +dChip.spd_dh : null);
@@ -2007,6 +1989,11 @@ function renderChips(chips, perChip) {
       subRow.appendChild(mk('span', 'cttemp', ''));
     }
 
+    const lock = (c.pll_lock != null) ? c.pll_lock : (dChip && dChip.pll_lock);
+    const enumOk = (c.enum_ok != null) ? c.enum_ok : (dChip && dChip.enum_ok);
+    if (lock != null) subRow.appendChild(mk('span', 'cttemp', ' PLL ' + (+lock).toString(16)));
+    if (enumOk != null && +enumOk === 0) subRow.appendChild(mk('span', 'ctdh', ' enum'));
+    if ((c.reinit || (dChip && dChip.reinit)) > 0) subRow.appendChild(mk('span', 'ctdh', ' reinit'));
     if (dhVal != null && dhVal > 5) {
       const dhFormatted = (dhVal % 1 === 0 ? dhVal : dhVal.toFixed(1)) + '%';
       subRow.appendChild(mk('span', 'ctdh', 'DH ' + dhFormatted));
@@ -2027,9 +2014,10 @@ function renderChipTemps(chips, perChip) {
   grid.textContent = '';
   chips.forEach(c => {
     const t = c.temp_c;
-    const band = typeof t !== 'number' ? '' : t < 50 ? ' t-cool' : t < 70 ? ' t-normal' : t < 85 ? ' t-warm' : ' t-hot';
+    const known = typeof t === 'number' && t > -200;
+    const band = !known ? '' : t < 50 ? ' t-cool' : t < 70 ? ' t-normal' : t < 85 ? ' t-warm' : ' t-hot';
     const cell = mk('div', 'chip-cell' + band);
-    cell.append(mk('div', 'chip-idx', 'CHIP ' + Number(c.index)), mk('div', 'chip-temp', typeof t === 'number' ? t.toFixed(1) + '°' : '--'));
+    cell.append(mk('div', 'chip-idx', 'CHIP ' + Number(c.index)), mk('div', 'chip-temp', known ? t.toFixed(1) + '°' : '--'));
     grid.appendChild(cell);
   });
 }
@@ -2107,6 +2095,7 @@ function renderTabs(boards) {
   renderModalBoardTabs('tuneBoardTabs');
   renderModalBoardTabs('fanBoardTabs');
   const root = $('boardTabs');
+  if (!root) return;
   root.textContent = '';
   if (boards.length < 2) return;
   boards.forEach((b, i) => {
@@ -2122,6 +2111,9 @@ function renderTabs(boards) {
 function checkAlerts(d) {
   const banner = $('alertBanner'), text = $('alertText');
   const alerts = [];
+  if (d.fleet && d.fleet.power_sensor === 'unavailable') {
+    alerts.push('Power sensor unavailable — voltage is held, limits stay in force');
+  }
   (d.boards || []).forEach(b => {
     const limit = tempLimitC(b.freq_mhz);
     const alertAt = limit != null ? limit - 3 : 70;
@@ -2208,6 +2200,80 @@ function drawHeroSparkline(series) {
   areaPath.setAttribute('d', dArea);
 }
 
+function poolHost(url) {
+  return String(url || '').replace(/^stratum\+(tcp|ssl):\/\//i, '').replace(/^stratum:\/\//i, '');
+}
+function fmtHs(h) {
+  if (h == null) return '—';
+  const n = +h;
+  if (!isFinite(n) || n <= 0) return '—';
+  if (n >= 1e12) return (n / 1e12).toFixed(2) + ' TH/s';
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + ' GH/s';
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + ' MH/s';
+  return Math.round(n) + ' H/s';
+}
+function fmtShare(v) {
+  if (v == null || v === '') return '—';
+  const n = +v;
+  if (!isFinite(n)) return String(v);
+  if (n >= 1e12) return (n / 1e12).toFixed(2) + 'T';
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'G';
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(2) + 'K';
+  return (n % 1) ? n.toFixed(1) : String(Math.round(n));
+}
+function poolCard(p) {
+  const host = poolHost(p.url) || '—';
+  const state = p.state || (p.connected ? 'connected' : (p.weight === 0 ? 'standby' : 'down'));
+  const a = document.createElement('a');
+  a.className = 'card pool poolcard ' + (state === 'down' ? 'down' : state === 'standby' ? 'standby' : '');
+  a.href = '/pool';
+  a.title = p.url || host;
+  const label = mk('div', 'label', 'Pool');
+  const val = mk('div', 'val', host);
+  const st = mk('div', 'poolstate', state + (p.last_error && state !== 'connected' ? ' · ' + p.last_error : ''));
+  const meta = mk('div', 'poolmeta');
+  const cell = (name, value, extra) => {
+    const s = mk('span', null, name);
+    const b = mk('b', null, value);
+    if (extra) b.appendChild(mk('small', null, extra));
+    s.appendChild(b);
+    return s;
+  };
+  const best = fmtShare(p.best_share);
+  const all = p.best_share_alltime != null ? 'all-time ' + fmtShare(p.best_share_alltime) : '';
+  meta.append(
+    cell('Weight', (p.weight != null ? p.weight : '—') + (p.weight != null ? '%' : '')),
+    cell('Hashrate', fmtHs(p.hashrate_10m)),
+    cell('Latency', p.latency_ms != null ? p.latency_ms + ' ms' : '—'),
+    cell('Accepted', p.accepted != null ? String(p.accepted) : '—'),
+    cell('Rejected', p.rejected != null ? String(p.rejected) : '—'),
+    cell('Difficulty', p.difficulty != null ? fmtShare(p.difficulty) : '—'),
+    cell('Best', best, all)
+  );
+  a.append(label, val, st, meta);
+  return a;
+}
+async function renderPools() {
+  const row = $('poolRow');
+  if (!row) return;
+  let pools = [];
+  try {
+    const r = await fetch('/api/v0/pools');
+    if (r.ok) {
+      const d = await r.json();
+      pools = (d.pools || []).slice(0, 4);
+    }
+  } catch (e) { /* keep the last row */ }
+  if (!pools.length && row.childElementCount) return;
+  row.dataset.poolCount = String(Math.max(1, pools.length));
+  row.textContent = '';
+  if (!pools.length) {
+    row.appendChild(poolCard({ url: 'no pool', state: 'down', weight: 0 }));
+    return;
+  }
+  pools.forEach(p => row.appendChild(poolCard(p)));
+}
 function renderFleet(d) {
   const f = d.fleet;
   $('fleetsub').textContent = f.boards_online + ' BOARD' + (f.boards_online === 1 ? '' : 'S') + ' REPORTING';
@@ -2219,14 +2285,21 @@ function renderFleet(d) {
   $('fasic').innerHTML = fx(f.avg_asic_c, '°C', 1);
   $('foutlet').innerHTML = fx(f.avg_outlet_c, '°C', 1);
   $('fvr').innerHTML = fx(f.avg_fail_rate_pct, '%', 2);
-  $('feff').innerHTML = fx(f.efficiency_jth, 'J/TH', 2);
   $('fboards').textContent = f.boards_online;
-  $('fpower').innerHTML = fx(f.total_power_w, 'W', 1);
+  const est = d.fleet.power_source === 'estimated';
+  const mark = est ? '~' : '';
+  $('fpower').innerHTML = f.total_power_w == null ? '—' : mark + fx(f.total_power_w, 'W', 1) + (est ? ' <small>estimated</small>' : '');
+  $('fpower').title = est ? 'Estimated from chip voltage and frequency (V²·f). The INA226 did not answer. Scale it with a wall meter. Voltage and frequency are held.' : 'Input-rail power';
+  $('feff').innerHTML = f.efficiency_jth == null ? '—' : mark + fx(f.efficiency_jth, 'J/TH', 2);
+  $('feff').title = $('fpower').title;
+  const live = $('livePower');
+  if (live) {
+    const w = f.total_power_w == null ? '—' : (mark + (typeof f.total_power_w === 'number' ? f.total_power_w.toFixed(1) : f.total_power_w) + ' W');
+    const j = f.efficiency_jth == null ? '—' : (mark + (typeof f.efficiency_jth === 'number' ? f.efficiency_jth.toFixed(2) : f.efficiency_jth) + ' J/TH');
+    live.textContent = 'Input ' + w + ' · ' + j + (est ? ' (estimated)' : d.fleet.power_sensor === 'unavailable' ? ' (sensor unavailable)' : ' (measured)');
+  }
   $('ffan').innerHTML = (f.avg_fan_rpm != null) ? Math.round(f.avg_fan_rpm) + ' <small>RPM</small>' : '—';
-  $('poolval').textContent = d.pool_url || d.pool_name || '—';
-  $('shares').textContent = (d.shares != null) ? d.shares : '—';
-  $('diff').textContent = (d.difficulty != null) ? d.difficulty : '—';
-  $('bestdiff').textContent = (d.best_diff != null) ? d.best_diff : '—';
+  renderPools();
   renderBoardSummaryCards(d.boards);
   drawFleetChart('fleetChart', d.boards, f.series || []);
   drawHeroSparkline(f.series || []);
@@ -2234,6 +2307,7 @@ function renderFleet(d) {
 }
 
 function renderBoard(b) {
+  if (!$('hr')) { renderChipTemps(b && b.chips, true); return; }
   const online = !!b;
   $('boardhrlabel').textContent = online ? ('Hashrate — ' + (b.board_name || 'board')) : 'Hashrate';
   if (!online) { $('hr').innerHTML = '<span class="na">offline</span>'; renderChips(null, false); renderChipTemps(null, false); return; }
@@ -2295,10 +2369,12 @@ async function pollDetail() {
       if (!pauseBusy) {
         PAUSED = nd.paused;
         const btn = $('pauseBtn');
-        btn.textContent = PAUSED ? 'RESUME MINING' : 'PAUSE MINING';
-        btn.classList.toggle('pri', !PAUSED);
-        btn.style.borderColor = PAUSED ? 'var(--amber)' : '';
-        btn.style.color = PAUSED ? 'var(--amber)' : '';
+        if (btn) {
+          btn.textContent = PAUSED ? 'RESUME MINING' : 'PAUSE MINING';
+          btn.classList.toggle('pri', !PAUSED);
+          btn.style.borderColor = PAUSED ? 'var(--amber)' : '';
+          btn.style.color = PAUSED ? 'var(--amber)' : '';
+        }
       }
     }
   } catch (e) {
@@ -2390,29 +2466,32 @@ async function applyFan() {
 let CURVE_POINTS = [];
 function renderCurveRows() {
   const wrap = $('curvePoints');
+  if (!wrap) return;
+  CURVE_POINTS.sort((a, b) => a.temp_c - b.temp_c);
   wrap.textContent = '';
   CURVE_POINTS.forEach((p, i) => {
-    const row = mk('div', 'row');
-    row.style.cssText = 'display:flex;gap:10px;align-items:flex-end;margin-bottom:8px';
-    const cell = (label, cls, min, max, step, val) => {
-      const c = mk('div'); c.style.flex = '1';
-      const l = mk('label', null, label); l.style.cssText = 'font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim)';
+    const row = document.createElement('tr');
+    const cell = (cls, min, max, step, val) => {
+      const td = document.createElement('td');
       const inp = document.createElement('input');
-      inp.type = 'number'; inp.className = cls; inp.name = cls; inp.autocomplete = 'off'; inp.min = min; inp.max = max; inp.step = step; inp.value = val; inp.style.width = '100%';
-      c.append(l, inp);
-      return [c, inp];
+      inp.type = 'number'; inp.className = cls; inp.autocomplete = 'off';
+      inp.min = min; inp.max = max; inp.step = step; inp.value = val;
+      td.appendChild(inp);
+      return [td, inp];
     };
-    const [c1, tIn] = cell('Outlet °C', 'curveTemp', 0, 150, 0.5, p.temp_c);
-    const [c2, dIn] = cell('Duty %', 'curveDuty', 0, 100, 1, p.duty_pct);
+    const [c1, tIn] = cell('curveTemp', 0, 150, 0.5, p.temp_c);
+    const [c2, dIn] = cell('curveDuty', 0, 100, 1, p.duty_pct);
     tIn.addEventListener('input', () => { CURVE_POINTS[i].temp_c = +tIn.value; drawCurvePreview(); });
     dIn.addEventListener('input', () => { CURVE_POINTS[i].duty_pct = +dIn.value; drawCurvePreview(); });
-    const rm = mk('button', 'btn', '×'); rm.type = 'button'; rm.title = 'Remove point'; rm.style.padding = '9px 12px';
+    const td = document.createElement('td');
+    const rm = mk('button', 'btn x', '×'); rm.type = 'button'; rm.title = 'Remove point';
     rm.addEventListener('click', () => {
       if (CURVE_POINTS.length <= 2) { setMsg('curveMsg', 'need at least 2 points'); return; }
       CURVE_POINTS.splice(i, 1);
       renderCurveRows(); drawCurvePreview();
     });
-    row.append(c1, c2, rm);
+    td.appendChild(rm);
+    row.append(c1, c2, td);
     wrap.appendChild(row);
   });
 }
@@ -2451,7 +2530,14 @@ function addCurvePoint() {
 async function applyCurve() {
   const name = activeName(), caps = activeCaps();
   if (!name || !caps || !caps.fan_curve) { setMsg('curveMsg', 'no fan curve for this board'); return; }
-  if (CURVE_POINTS.length < 2) { setMsg('curveMsg', 'need at least 2 points'); return; }
+  if (CURVE_POINTS.length < 2 || CURVE_POINTS.length > 8) { setMsg('curveMsg', 'need 2 to 8 points'); return; }
+  const ordered = CURVE_POINTS.slice().sort((a, b) => a.temp_c - b.temp_c);
+  for (let i = 0; i < ordered.length; i++) {
+    const t = ordered[i].temp_c, d = ordered[i].duty_pct;
+    if (!(t >= 0 && t <= 150) || !(d >= 0 && d <= 100)) { setMsg('curveMsg', 'temperature 0–150 °C and fan 0–100%'); return; }
+    if (i && !(ordered[i].temp_c > ordered[i - 1].temp_c)) { setMsg('curveMsg', 'outlet temperatures must increase'); return; }
+  }
+  CURVE_POINTS = ordered;
   if (writeBusy('curveMsg')) return;
   setMsg('curveMsg', 'saving…');
   lockWrites();
@@ -2495,6 +2581,7 @@ const restartMiner = () => powerAction('/api/v0/restart', 'restartBtn', 'powerMs
 
 // ---- PSU Overclock & Power Delivery ----
 async function loadPsuConfig() {
+  if (!$('psuModeSelect')) return;
   const name = activeName();
   if (!name) return;
   try {
@@ -2583,6 +2670,7 @@ async function applyPsuProfile() {
 
 // ---- Pool ----
 async function loadPool() {
+  if (!$('poolUrl')) return;
   try {
     const r = await fetch('/api/v0/pool');
     if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -2665,6 +2753,7 @@ function setTargetAxis(axis) {
         : '');
 }
 function syncTargetMode() {
+  if (!$('ownProfile')) return;
   const isTarget = $('ownProfile').value === 'target';
   $('ownTargetRows').style.display = isTarget ? '' : 'none';
   if (isTarget) setTargetAxis(TARGET_AXIS);
@@ -2685,8 +2774,8 @@ function renderOwnerTune(o) {
     const sp = pt(o.setpoint) || (o.frequency_mhz != null ? { f: o.frequency_mhz, v: o.core_voltage_mv } : null);
     if (sp && sp.f != null) ownTxt += ' · set ' + Math.round(sp.f) + ' MHz' + (sp.v != null ? ' @ ' + sp.v + ' mV' : '');
   }
-  $('ownCur').textContent = 'Current: ' + ownTxt;
-  if (!OWN_SYNCED) {
+  if ($('ownCur')) $('ownCur').textContent = 'Current: ' + ownTxt;
+  if ($('ownProfile') && !OWN_SYNCED) {
     if (o.enabled && o.target) {
       $('ownProfile').value = 'target';
       TARGET_AXIS = o.target.axis;
@@ -2880,6 +2969,36 @@ function closeMenus() {
     try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
   }
 }
+async function loadLiveTuning() {
+  const name = activeName();
+  if (!name || !$('tunePreset')) return;
+  try {
+    const r = await fetch('/api/v0/boards/' + encodeURIComponent(name) + '/tuning');
+    if (!r.ok) return;
+    const d = await r.json();
+    const preset = d.live_preset;
+    if (preset && Array.from($('tunePreset').options).some(o => o.value === preset)) {
+      $('tunePreset').value = preset;
+    } else if (d.pll_freq_mhz) {
+      $('tunePreset').value = 'custom';
+    }
+    if (d.pll_freq_mhz && d.pll_freq_mhz.length) $('tuneFreq').value = d.pll_freq_mhz[0];
+    const health = $('tuneHealth');
+    if (health && LAST && LAST.boards && LAST.boards[0]) {
+      const b = LAST.boards[0];
+      const chips = b.chips || [];
+      const hot = chips.reduce((m, c) => {
+        const t = +c.temp_c;
+        return (Number.isFinite(t) && t > -200) ? Math.max(m, t) : m;
+      }, 0);
+      const worst = chips.reduce((m, c) => Math.max(m, +c.spd_dh || 0), 0);
+      health.textContent = (chips.length || '—') + '/' + (chips.length || '—') + ' chips, worst fail rate '
+        + (worst ? worst.toFixed(1) + '%' : '—') + ', hottest chip ' + (hot ? hot.toFixed(1) + ' °C' : '—');
+    }
+    if (d.voltage_mv != null) $('tuneVolt').value = d.voltage_mv;
+    if (d.power_target_w != null && $('tunePowerTarget')) $('tunePowerTarget').value = d.power_target_w;
+  } catch (e) { /* leave the form */ }
+}
 function openMenu(key) {
   if (key === 'dashboard') {
     closeMenus();
@@ -2894,11 +3013,7 @@ function openMenu(key) {
   const b = document.querySelector('.menubtn[data-menu="' + key + '"]');
   if (b) b.classList.add('on');
   if (key === 'power') loadPsuConfig();
-  if (key === 'tuning') {
-    renderModalBoardTabs('tuneBoardTabs');
-    applyBoardCaps();
-    pollOwnerTune();
-  }
+  if (key === 'tuning') loadLiveTuning();
   if (key === 'fan') {
     renderModalBoardTabs('fanBoardTabs');
     applyBoardCaps();
@@ -2906,8 +3021,10 @@ function openMenu(key) {
 }
 function openFromHash() {
   const h = location.hash.replace(/^#/, '');
-  if (['power', 'tuning', 'fan', 'curve', 'pool', 'display'].includes(h)) {
-    openMenu(h);
+  if (h === 'pool') { location.replace('/pool'); return; }
+  const key = (h === 'fan-curve') ? 'curve' : h;
+  if (['power', 'tuning', 'fan', 'curve', 'display', 'led', 'firmware', 'info'].includes(key)) {
+    openMenu(key);
     try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
   }
 }
@@ -2919,7 +3036,10 @@ document.querySelectorAll('.menubtn').forEach(b => b.addEventListener('click', (
     closeMenus();
     return;
   }
+  const href = b.getAttribute && b.getAttribute('href');
+  if (href && href.charAt(0) === '/' && href.indexOf('#') < 0) return;
   if (b.dataset.menu && document.getElementById('menu-' + b.dataset.menu)) {
+    e.preventDefault();
     openMenu(b.dataset.menu);
   }
 }));
@@ -2928,23 +3048,63 @@ document.querySelectorAll('.menusheet').forEach(m => m.addEventListener('click',
 }));
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeMenus(); });
 window.addEventListener('hashchange', openFromHash);
-$('tunePreset').addEventListener('change', syncTunePreset);
-$('tuneApply').addEventListener('click', applyTuning);
-$('fanMode').addEventListener('change', syncFanMode);
-$('fanApply').addEventListener('click', applyFan);
-$('curveAddPoint').addEventListener('click', addCurvePoint);
-$('curveApply').addEventListener('click', applyCurve);
-$('pauseBtn').addEventListener('click', togglePause);
-$('rebootBtn').addEventListener('click', rebootDevice);
-$('restartBtn').addEventListener('click', restartMiner);
-$('psuModeSelect').addEventListener('change', syncPsuMode);
-$('psuApplyBtn').addEventListener('click', applyPsuProfile);
-$('poolSave').addEventListener('click', savePool);
-$('poolReboot').addEventListener('click', poolApplyNow);
-$('ownApply').addEventListener('click', applyOwner);
-$('ownProfile').addEventListener('change', syncTargetMode);
+if ($('tunePreset')) $('tunePreset').addEventListener('change', syncTunePreset);
+if ($('tuneApply')) $('tuneApply').addEventListener('click', applyTuning);
+if ($('fanMode')) $('fanMode').addEventListener('change', syncFanMode);
+if ($('fanApply')) $('fanApply').addEventListener('click', applyFan);
+if ($('curveAddPoint')) $('curveAddPoint').addEventListener('click', addCurvePoint);
+if ($('curveApply')) $('curveApply').addEventListener('click', applyCurve);
+if ($('pauseBtn')) $('pauseBtn').addEventListener('click', togglePause);
+if ($('rebootBtn')) $('rebootBtn').addEventListener('click', rebootDevice);
+if ($('restartBtn')) $('restartBtn').addEventListener('click', restartMiner);
+if ($('psuModeSelect')) $('psuModeSelect').addEventListener('change', syncPsuMode);
+if ($('psuApplyBtn')) $('psuApplyBtn').addEventListener('click', applyPsuProfile);
+if ($('poolSave')) $('poolSave').addEventListener('click', savePool);
+if ($('poolReboot')) $('poolReboot').addEventListener('click', poolApplyNow);
+if ($('immersionToggle')) $('immersionToggle').addEventListener('change', async () => {
+  const on = $('immersionToggle').checked;
+  if (on && !confirm('Only enable when the miner is submerged in dielectric fluid; in air the chips will overheat')) {
+    $('immersionToggle').checked = false;
+    return;
+  }
+  const name = activeName();
+  if (!name) return;
+  try {
+    const r = await fetch('/api/v0/boards/' + encodeURIComponent(name) + '/fan', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ immersion: on })
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    setMsg('immersionMsg', on ? 'Immersion on' : 'Immersion off', true);
+    ['fanMode', 'fanDuty', 'fanApply', 'curveAddPoint', 'curveApply'].forEach(id => { const el = $(id); if (el) el.disabled = on; });
+  } catch (e) {
+    $('immersionToggle').checked = !on;
+    setMsg('immersionMsg', 'save failed: ' + e.message);
+  }
+});
+if ($('psuBypassToggle')) $('psuBypassToggle').addEventListener('change', async () => {
+  const on = $('psuBypassToggle').checked;
+  if (on && !confirm('PSU bypass lets the miner draw past the stock adapter limit. The stock adapter can overheat. The 137 W trip and over-temperature shutdown stay on. Enable PSU bypass?')) {
+    $('psuBypassToggle').checked = false;
+    return;
+  }
+  const name = activeName();
+  if (!name) return;
+  try {
+    const r = await fetch('/api/v0/boards/' + encodeURIComponent(name) + '/psu', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ psu_bypass: on })
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    setMsg('psuBypassMsg', on ? 'PSU bypass on' : 'PSU bypass off', true);
+    show('psuBypassBadge', on);
+  } catch (e) {
+    $('psuBypassToggle').checked = !on;
+    setMsg('psuBypassMsg', 'save failed: ' + e.message);
+  }
+});
+if ($('ownApply')) $('ownApply').addEventListener('click', applyOwner);
+if ($('ownProfile')) $('ownProfile').addEventListener('change', syncTargetMode);
 document.querySelectorAll('#ownTargetAxis .segbtn').forEach(b => b.addEventListener('click', () => setTargetAxis(b.dataset.axis)));
-$('ownContinuous').addEventListener('change', () => {
+if ($('ownContinuous')) $('ownContinuous').addEventListener('change', () => {
   USER_EDITING_CONTINUOUS = true;
   syncContinuousUI();
 });
@@ -2960,7 +3120,7 @@ if (contRow) {
     }
   });
 }
-$('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(b => {
+if ($('chipFilterBtns')) $('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(b => {
   b.addEventListener('click', () => {
     $('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(x => x.classList.remove('active'));
     b.classList.add('active');
@@ -2970,11 +3130,11 @@ $('chipFilterBtns').querySelectorAll('.cfilterbtn').forEach(b => {
 });
 
 const themeSel = $('uitheme');
-themeSel.value = themeNow();
+if (themeSel) themeSel.value = themeNow();
 let LAST_THEME_PUSH_MS = 0;
 function applyThemeSelection(t, pushToUnit) {
   if (THEMES.indexOf(t) < 0) t = 'cyberpunk';
-  themeSel.value = t;
+  if (themeSel) themeSel.value = t;
   try { localStorage.setItem('mujina-theme', t); } catch (e) { /* storage blocked */ }
   document.body.className = 'theme-' + t;
   if (LAST) render(LAST);
@@ -2987,7 +3147,7 @@ function applyThemeSelection(t, pushToUnit) {
     }).catch(() => {});
   }
 }
-themeSel.addEventListener('change', () => applyThemeSelection(themeSel.value, true));
+if (themeSel) themeSel.addEventListener('change', () => applyThemeSelection(themeSel.value, true));
 async function loadDisplayTheme() {
   try {
     const r = await fetch('/api/v0/display');

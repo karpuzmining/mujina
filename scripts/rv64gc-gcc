@@ -1,0 +1,21 @@
+#!/bin/sh
+# RV64GC link driver for Nano 3S images.
+#
+# v5.1.0 and multipool test.3 link with +crt-static, so the finished
+# miner has no PT_INTERP and no DT_NEEDED (see those release binaries).
+# A dynamic link must still name the loader the device ships. The Debian
+# driver on its own writes /lib/ld-linux-riscv64-lp64d.so.1, which the
+# Nano does not have.
+set -eu
+dynamic=1
+for arg in "$@"; do
+  case "$arg" in
+    -static|--static|-static-pie) dynamic=0 ;;
+  esac
+done
+if [ "$dynamic" -eq 1 ]; then
+  exec riscv64-linux-gnu-gcc -march=rv64gc -mabi=lp64d \
+    -Wl,--dynamic-linker=/lib/ld-linux-riscv64xthead-lp64d.so.1 \
+    "$@"
+fi
+exec riscv64-linux-gnu-gcc -march=rv64gc -mabi=lp64d "$@"

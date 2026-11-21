@@ -33,7 +33,7 @@
 //!   this riscv64 target) `u32` words, no swap.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -43,9 +43,14 @@ use bitcoin::hashes::Hash;
 use bitcoin::hashes::sha256d;
 use tokio::sync::{mpsc, watch};
 
+use super::a3197s::ChipClockPolicy;
+use super::nano3s_power::{
+    estimate_input_watts, i2c2_bus_enabled, i2c2_pad_gpio, i2c2_sda_stuck_low, ina226_sdk_reading,
+    I2C2_PAD_ALT3,
+};
+use super::nano3s_auto_tune::ChipTuneStatus;
 use super::nano3s_auto_tune::{self as auto_tune, AutoTune, AutoTuneCmd, TuneChoice};
 use super::nano3s_chip_tuner::{ChipGoal, ChipMetrics, ChipPhase, ChipTuner, ChipTunerConfig};
-use super::nano3s_auto_tune::ChipTuneStatus;
 use super::nano3s_tuner_core::{SearchMemory, TuneProfile, TuneSetpoint, TuneTarget};
 use super::{BackplaneConnector, BoardInfo, VirtualBoardDescriptor};
 use crate::api_client::types::{
@@ -89,6 +94,14 @@ struct Nano3sChipStatus {
     nonce_data: u32,
     ghsspd: f32,
     spd_dh: f32,
+    /// Bit n set when PLL domain n reported lock.
+    pll_lock: u8,
+    /// 1 when this chip's UART id matched its index.
+    enum_ok: u8,
+    /// Reported UART chip id, or 0xff when the read failed.
+    enum_id: u8,
+    /// 1 when this status interval soft-reset the chip.
+    reinit: u8,
 }
 
 /// Mirrors `nano3s_status_t` (nano3s_ipc_shim.h) field-for-field. Carries a
@@ -115,12 +128,20 @@ struct Nano3sStatus {
     chips: [Nano3sChipStatus; NANO3S_STATUS_MAX_CHIPS],
 }
 
+fn serialize_pvt_temp<S: serde::Serializer>(t: &f32, serializer: S) -> Result<S::Ok, S::Error> {
+    match auto_tune::reported_temp_c(*t) {
+        Some(v) => serializer.serialize_f32(v),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// Per-chip detail for the dashboard's Info page -- JSON-friendly
 /// reshaping of `Nano3sChipStatus` (wire types stay as-is, no unit
 /// conversion here; the page does that).
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub(crate) struct Nano3sChipDetail {
     pub chip: u8,
+    #[serde(serialize_with = "serialize_pvt_temp")]
     pub temp_c: f32,
     pub volt_mv: f32,
     pub pll_cnt: [u8; 4],
@@ -128,8 +149,20 @@ pub(crate) struct Nano3sChipDetail {
     pub nonce_timeout: u32,
     pub nonce_heartbeat: u32,
     pub nonce_data: u32,
+    /// Speed-log hashrate, GH/s. `pass_count * 0.256 / 1000` from
+    /// `A3197S_SPDLOG_PASSCNT` (0x42c).
     pub ghsspd: f32,
+    /// Speed-log error rate, percent. `fail / (pass + fail) * 100` from
+    /// `A3197S_SPDLOG_FAILCNT` (0x430) and the pass count.
     pub spd_dh: f32,
+    /// Bit n set when PLL domain n reported lock.
+    pub pll_lock: u8,
+    /// 1 when this chip's UART id matched its index.
+    pub enum_ok: u8,
+    /// Reported UART chip id, or 0xff when the read failed.
+    pub enum_id: u8,
+    /// 1 when this status interval soft-reset the chip.
+    pub reinit: u8,
 }
 
 /// Full chain + per-chip detail snapshot -- everything the dashboard's
@@ -150,7 +183,9 @@ pub(crate) struct Nano3sDetail {
     pub ghsspd: u32,
     /// Internal SmartSpeed fail rate, percent.
     pub spd_dh: f32,
+    #[serde(serialize_with = "serialize_pvt_temp")]
     pub temp_avg: f32,
+    #[serde(serialize_with = "serialize_pvt_temp")]
     pub temp_max: f32,
     /// Last commanded (not read back) PLL frequency per domain, MHz.
     pub pll_freq_commanded: [u32; 4],
@@ -158,6 +193,8 @@ pub(crate) struct Nano3sDetail {
     pub voltage_mv_commanded: u32,
     /// Last commanded per-chip clock offsets, MHz (all zero = uniform).
     pub chip_offset_mhz: [i16; CHIP_COUNT],
+    /// `clear` (default) or `keep`. See [`ChipClockPolicy`].
+    pub chip_clock_policy: String,
     pub err_crc: u32,
     pub nonce_read_err: u32,
     pub nonce_bad_len: u32,
@@ -237,19 +274,28 @@ unsafe extern "C" {
 
 /// Chips on the Nano 3S chain (and slots in the per-chip offset message).
 pub(crate) const CHIP_COUNT: usize = 12;
-/// Allowed per-chip clock offset, MHz (rtos_core also clamps the result
-/// at 100 MHz).
-pub(crate) const CHIP_OFFSET_RANGE_MHZ: std::ops::RangeInclusive<i16> = -150..=50;
+/// Allowed per-chip clock offset, MHz. Shared with ChipTuner. rtos_core
+/// also clamps each domain to 100..=580 MHz.
+pub(crate) const CHIP_OFFSET_RANGE_MHZ: std::ops::RangeInclusive<i16> =
+    super::a3197s::CHIP_OFFSET_MIN_MHZ..=super::a3197s::CHIP_OFFSET_MAX_MHZ;
 
 /// Parses `a,b,...` (exactly [`CHIP_COUNT`] in-range offsets).
 fn parse_chip_offsets(s: &str) -> Option<[i16; CHIP_COUNT]> {
-    let v: Vec<i16> = s.split(',').map(|f| f.trim().parse().ok()).collect::<Option<_>>()?;
+    let v: Vec<i16> = s
+        .split(',')
+        .map(|f| f.trim().parse().ok())
+        .collect::<Option<_>>()?;
     let arr: [i16; CHIP_COUNT] = v.try_into().ok()?;
-    arr.iter().all(|o| CHIP_OFFSET_RANGE_MHZ.contains(o)).then_some(arr)
+    arr.iter()
+        .all(|o| CHIP_OFFSET_RANGE_MHZ.contains(o))
+        .then_some(arr)
 }
 
 fn join_chip_offsets(o: &[i16; CHIP_COUNT]) -> String {
-    o.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")
+    o.iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// PLL ramp target sent once at board startup via IPC_MSG_SET_MODE.
@@ -279,7 +325,7 @@ const NANO3S_MAX_SANE_DIFFICULTY: u64 = 100_000_000_000;
 /// Power-target voltage loop: given a target power in watts
 /// (`MUJINA_NANO3S_POWER_TARGET_W`, unset = feature off), steps core
 /// voltage up when measured power is below target and down when above,
-/// based on `ina_power_w` feedback (see `read_power_estimate()`), via the
+/// based on the INA226 input reading, via the
 /// same live-tuning IPC path the dashboard/API use.
 ///
 /// Step size matches the DC/DC controller's voltage quantization
@@ -489,7 +535,11 @@ fn level_to_freq_voltage_limit(level: f64) -> ([u32; 4], u32, f64) {
     let span = hi_level - lo_level;
     // frac can exceed 1.0 when level > 1.0 -- deliberate extrapolation,
     // bounded by the per-field clamps below rather than by frac itself.
-    let frac = if span > 0.0 { (level - lo_level) / span } else { 0.0 };
+    let frac = if span > 0.0 {
+        (level - lo_level) / span
+    } else {
+        0.0
+    };
 
     // Interpolate/extrapolate the base domain only, then rebuild the
     // other three with the fixed +20MHz-per-domain spacing every
@@ -500,7 +550,12 @@ fn level_to_freq_voltage_limit(level: f64) -> ([u32; 4], u32, f64) {
     // the 500MHz/domain absolute ceiling.
     let base = (lo_freq[0] as f64 + frac * (hi_freq[0] as f64 - lo_freq[0] as f64)).round() as i32;
     let base = base.clamp(TEMP_TARGET_MIN_MHZ as i32, 460);
-    let freq = [base as u32, (base + 20) as u32, (base + 40) as u32, (base + 60) as u32];
+    let freq = [
+        base as u32,
+        (base + 20) as u32,
+        (base + 40) as u32,
+        (base + 60) as u32,
+    ];
 
     let volt_f = lo_volt as f64 + frac * (hi_volt as f64 - lo_volt as f64);
     let steps = (volt_f / POWER_TARGET_STEP_MV as f64).round() as i32;
@@ -510,7 +565,11 @@ fn level_to_freq_voltage_limit(level: f64) -> ([u32; 4], u32, f64) {
         // (3704mV) passes through 3600mV -- the documented core-domain
         // migration-collapse voltage POWER_TARGET_AVOID_MV exists to
         // dodge. Step one grid unit further in the direction of travel.
-        volt_mv += if frac >= 0.5 { POWER_TARGET_STEP_MV } else { -POWER_TARGET_STEP_MV };
+        volt_mv += if frac >= 0.5 {
+            POWER_TARGET_STEP_MV
+        } else {
+            -POWER_TARGET_STEP_MV
+        };
     }
     volt_mv = volt_mv.clamp(POWER_TARGET_MIN_MV, POWER_TARGET_MAX_MV);
 
@@ -560,7 +619,10 @@ fn gp_bits_mask_to_raw(gp_mask: GeneralPurposeBits) -> u32 {
 /// `[d,c,b,a, h,g,f,e, ...]`, word positions unchanged. `bytes.len()`
 /// must be a multiple of 4.
 fn word_bswap32(bytes: &[u8]) -> Vec<u8> {
-    bytes.chunks_exact(4).flat_map(|w| w.iter().rev().copied()).collect()
+    bytes
+        .chunks_exact(4)
+        .flat_map(|w| w.iter().rev().copied())
+        .collect()
 }
 
 /// Header layout offset for the merkle root field, matching the wire
@@ -622,15 +684,25 @@ mod companion_binaries {
 
     pub fn sync_companion_binaries() {
         sync_one("/data/nano3s_ui", EMBEDDED_NANO3S_UI, Some("nano3s_ui"));
-        sync_one("/mntapp/release/linux/app/fb_button", EMBEDDED_FB_BUTTON, Some("fb_button"));
+        sync_one(
+            "/mntapp/release/linux/app/fb_button",
+            EMBEDDED_FB_BUTTON,
+            Some("fb_button"),
+        );
         sync_one(
             "/mntapp/release/linux/app/mujina_display_startup.sh",
             EMBEDDED_STARTUP_SH,
             None,
         );
         sync_one("/data/ble_setup", EMBEDDED_BLE_SETUP, Some("ble_setup"));
-        if sync_one("/mntapp/release/rtt/rtos_core.elf", EMBEDDED_RTOS_CORE, None) {
-            info!("Updated /mntapp/release/rtt/rtos_core.elf; rebooting to load updated Core 1 firmware...");
+        if sync_one(
+            "/mntapp/release/rtt/rtos_core.elf",
+            EMBEDDED_RTOS_CORE,
+            None,
+        ) {
+            info!(
+                "Updated /mntapp/release/rtt/rtos_core.elf; rebooting to load updated Core 1 firmware..."
+            );
             let _ = fs::write("/sharefs/reboot_request", "rtos_core_updated\n");
             let _ = Command::new("sync").status();
             let _ = Command::new("/sbin/reboot").arg("-f").status();
@@ -650,7 +722,11 @@ mod companion_binaries {
             return false;
         }
 
-        info!("Companion binary {} needs update ({} bytes). Staging...", live_path, embedded.len());
+        info!(
+            "Companion binary {} needs update ({} bytes). Staging...",
+            live_path,
+            embedded.len()
+        );
         let staged_path = format!("{}.new", live_path);
         let write_res = (|| -> std::io::Result<()> {
             let mut file = fs::File::create(&staged_path)?;
@@ -676,12 +752,22 @@ mod companion_binaries {
         }
 
         if let Some(proc_name) = proc_name {
-            info!("Successfully installed new companion binary at {}. Restarting process...", live_path);
+            info!(
+                "Successfully installed new companion binary at {}. Restarting process...",
+                live_path
+            );
             // Kill existing process so supervisor restarts it with the new binary
             let _ = Command::new("killall").arg("-9").arg(proc_name).status();
-            let _ = Command::new("pkill").arg("-9").arg("-f").arg(proc_name).status();
+            let _ = Command::new("pkill")
+                .arg("-9")
+                .arg("-f")
+                .arg(proc_name)
+                .status();
         } else {
-            info!("Successfully installed new companion file at {}.", live_path);
+            info!(
+                "Successfully installed new companion file at {}.",
+                live_path
+            );
         }
         true
     }
@@ -1015,7 +1101,12 @@ impl HashThread for Nano3sHashThread {
 /// `word_bswap32()` (each 4-byte word reversed in place) to recover the
 /// raw wire byte order the chip's register-loading expects. `ntime` and
 /// `bits` are written big-endian.
-fn build_header_bytes(version: bitcoin::block::Version, prev_blockhash: bitcoin::BlockHash, ntime: u32, bits: bitcoin::pow::CompactTarget) -> [u8; 128] {
+fn build_header_bytes(
+    version: bitcoin::block::Version,
+    prev_blockhash: bitcoin::BlockHash,
+    ntime: u32,
+    bits: bitcoin::pow::CompactTarget,
+) -> [u8; 128] {
     let mut header = [0u8; 128];
     header[0..4].copy_from_slice(&(version.to_consensus() as u32).to_le_bytes());
     header[4..36].copy_from_slice(&word_bswap32(&prev_blockhash.to_byte_array()));
@@ -1047,7 +1138,11 @@ fn target_bytes_for(share_target: bitcoin::pow::Target) -> [u8; 32] {
     target
 }
 
-fn send_task_to_chain(job_id: u32, task: &HashTask, work_restart: bool) -> Result<Option<JobContext>> {
+fn send_task_to_chain(
+    job_id: u32,
+    task: &HashTask,
+    work_restart: bool,
+) -> Result<Option<JobContext>> {
     let template = task.template.as_ref();
     let mrt: &MerkleRootTemplate = match &template.merkle_root {
         MerkleRootKind::Computed(mrt) => mrt,
@@ -1066,7 +1161,11 @@ fn send_task_to_chain(job_id: u32, task: &HashTask, work_restart: bool) -> Resul
     let chip_nonce2_size = (en2_size.min(4)) as i32;
     let high_en2_bytes = en2_size.saturating_sub(4) as usize;
     let nonce2_start = (en2.value() & 0xFFFF_FFFF) as u32;
-    let en2_high = if high_en2_bytes > 0 { (en2.value() >> 32) as u32 } else { 0 };
+    let en2_high = if high_en2_bytes > 0 {
+        (en2.value() >> 32) as u32
+    } else {
+        0
+    };
 
     let coinbase1 = mrt.coinbase1.clone();
     let extranonce1 = mrt.extranonce1.clone();
@@ -1077,7 +1176,9 @@ fn send_task_to_chain(job_id: u32, task: &HashTask, work_restart: bool) -> Resul
     // convention. rtos_core.elf's miner_gen_nonce2_work() copies
     // `chip_nonce2_size` bytes on every task_send_work() call using its own
     // internal nonce2 counter, so this initial value only matters for the first send.
-    let mut coinbase = Vec::with_capacity(coinbase1.len() + extranonce1.len() + en2_size as usize + coinbase2.len());
+    let mut coinbase = Vec::with_capacity(
+        coinbase1.len() + extranonce1.len() + en2_size as usize + coinbase2.len(),
+    );
     coinbase.extend_from_slice(&coinbase1);
     coinbase.extend_from_slice(&extranonce1);
     coinbase.extend_from_slice(&nonce2_start.to_le_bytes()[..chip_nonce2_size as usize]);
@@ -1088,14 +1189,21 @@ fn send_task_to_chain(job_id: u32, task: &HashTask, work_restart: bool) -> Resul
 
     let nmerkles = mrt.merkle_branches.len();
     if nmerkles > 30 {
-        anyhow::bail!("nano3s: job has {nmerkles} merkle branches, hardware wire format supports at most 30");
+        anyhow::bail!(
+            "nano3s: job has {nmerkles} merkle branches, hardware wire format supports at most 30"
+        );
     }
     let mut merkles_flat = vec![0u8; nmerkles * 32];
     for (i, branch) in mrt.merkle_branches.iter().enumerate() {
         merkles_flat[i * 32..(i + 1) * 32].copy_from_slice(branch.as_byte_array());
     }
 
-    let header = build_header_bytes(template.version.base(), template.prev_blockhash, task.ntime, template.bits);
+    let header = build_header_bytes(
+        template.version.base(),
+        template.prev_blockhash,
+        task.ntime,
+        template.bits,
+    );
     // `template.share_target` is the current pool session target (Layer
     // 3), not the scheduler's flood-control target (Layer 2). No floor is
     // applied.
@@ -1145,69 +1253,404 @@ fn send_task_to_chain(job_id: u32, task: &HashTask, work_restart: bool) -> Resul
     }))
 }
 
-/// INA226 power monitor. Bus voltage: 1.25 mV/LSB (reg 0x02). Shunt
-/// voltage: 2.5 uV/LSB, signed (reg 0x01). `i2cget`'s word mode returns
-/// SMBus LSB-first byte order, swapped back before applying the scale.
-/// Power = bus_v * (shunt_v / assumed_shunt_ohms), assuming a 10mOhm
-/// shunt. Returns 0.0 on any read failure ("unavailable", not "0W
-/// measured").
-const POWER_I2C_BUS: u32 = 2;
+/// INA226 on `/dev/i2c-2` address `0x40`. Canaan's Linux `psu_dcdc_pd.c`
+/// writes config `0x4727` and calibration `0x0AEC` once, then reads bus
+/// `0x02` and current `0x04` as two bytes each. It does not use `i2cget`.
 const POWER_I2C_ADDR: u32 = 0x40;
+/// PD controller. The only transaction is one byte, register `0x02` =
+/// `0x1B`, which is Canaan's `PD_CFG_VAL` ("set i2c mode") in
+/// `pd_pout_limit`, done before GPIO34 enables the hashboard rail.
+const PD_I2C_ADDR: u32 = 0x42;
+const PD_CFG_REG: u8 = 0x02;
+const PD_CFG_I2C_MODE: u8 = 0x1B;
 
-fn i2c_read_word(bus: u32, addr: u32, reg: u32) -> Option<u32> {
-    let output = std::process::Command::new("i2cget")
-        .args(["-y", &bus.to_string(), &format!("0x{addr:02x}"), &format!("0x{reg:02x}"), "w"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let text = text.trim();
-    let val = if let Some(hex) = text.strip_prefix("0x") {
-        u32::from_str_radix(hex, 16).ok()?
-    } else {
-        text.parse().ok()?
+const POWER_CAL_PATH: &str = "/data/userconfig/power_cal.conf";
+
+fn load_power_cal() -> f64 {
+    let Ok(text) = std::fs::read_to_string(POWER_CAL_PATH) else {
+        return 1.0;
     };
-    if val > 0xFFFF { None } else { Some(val) }
+    text.lines()
+        .find_map(|line| line.strip_prefix("factor="))
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|f| f.is_finite() && (0.5..=2.0).contains(f))
+        .unwrap_or(1.0)
 }
 
-/// Reads the INA226 and returns `(bus_v, current_a, power_w)`. This is
-/// the USB-C PD input rail, not the ASIC core rail.
-fn read_power_estimate() -> (f64, f64, f64) {
-    let (Some(raw_bus), Some(raw_shunt)) = (
-        i2c_read_word(POWER_I2C_BUS, POWER_I2C_ADDR, 0x02),
-        i2c_read_word(POWER_I2C_BUS, POWER_I2C_ADDR, 0x01),
-    ) else {
-        return (0.0, 0.0, 0.0);
-    };
-
-    let bv_swapped = ((raw_bus & 0xff) << 8) | ((raw_bus >> 8) & 0xff);
-    let sv_swapped = ((raw_shunt & 0xff) << 8) | ((raw_shunt >> 8) & 0xff);
-    let shunt_signed = sv_swapped as u16 as i16;
-
-    let bus_v = bv_swapped as f64 * 1.25 / 1000.0;
-    let shunt_v = shunt_signed as f64 * 0.0025 / 1000.0;
-    let current_a = shunt_v / 0.010; // assumed 10mOhm shunt, unconfirmed
-
-    (bus_v, current_a, bus_v * current_a)
+pub(crate) fn set_power_cal(factor: f64) -> std::io::Result<()> {
+    if !factor.is_finite() || !(0.5..=2.0).contains(&factor) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "calibration factor must be 0.5 to 2.0",
+        ));
+    }
+    atomic_conf_write(
+        std::path::Path::new(POWER_CAL_PATH),
+        format!("factor={factor}\n").as_bytes(),
+    )
 }
 
-fn i2c_read_byte(bus: u32, addr: u32, reg: u32) -> Option<u8> {
-    let output = std::process::Command::new("i2cget")
-        .args(["-y", &bus.to_string(), &format!("0x{addr:02x}"), &format!("0x{reg:02x}")])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let text = text.trim();
-    if let Some(hex) = text.strip_prefix("0x") {
-        u8::from_str_radix(hex, 16).ok()
+/// Input rail volts, amps, watts, and `measured` or `estimated`.
+fn board_power_reading(st: &Nano3sStatus) -> (f64, f64, f64, &'static str) {
+    let cal = load_power_cal();
+    let dies: Vec<f64> = st.chips.iter().take(12).map(|c| c.volt_mv as f64).collect();
+    let freqs: Vec<f64> = st.chips.iter().take(12).map(|c| c.pll_freq[0] as f64).collect();
+    let freq_fallback = st.pll_freq[0] as f64;
+    let freqs: Vec<f64> = if freqs.iter().any(|f| *f > 1.0) {
+        freqs
     } else {
-        text.parse().ok()
+        vec![freq_fallback; 12]
+    };
+    if let Some((v, i, p)) = read_ina226_sdk() {
+        // 8 V is Canaan's POWER_VALID_VOLT_MIN. Below that the adapter
+        // is treated as absent, not as a zero-watt success.
+        if v >= 8.0 {
+            note_power_sensor(true);
+            return (v, i * cal, p * cal, "measured");
+        }
     }
+    note_power_sensor(false);
+    let watts = estimate_input_watts(&dies, &freqs, st.voltage_mv as f64) * cal;
+    let rail_v = if st.voltage_mv > 500 {
+        st.voltage_mv as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let amps = if rail_v > 0.5 { watts / rail_v } else { 0.0 };
+    (0.0, amps, watts, "estimated")
+}
+
+/// Canaan writes config `0x4727` and calibration `0x0AEC` before trusting
+/// the current register. Bus `/dev/i2c-2`, address `0x40`.
+const INA226_CFG: u16 = 0x4727;
+const INA226_CAL: u16 = 0x0AEC;
+const INA226_DEV: &str = "/dev/i2c-2";
+
+fn i2c2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = i2c2_bus_enabled(
+            std::env::var("MUJINA_NANO3S_I2C2").ok().as_deref(),
+            std::env::var("MUJINA_NANO3S_NO_I2C2").ok().as_deref(),
+        );
+        if !on {
+            eprintln!(
+                "[nano3s] MUJINA_NANO3S_NO_I2C2 disables /dev/i2c-2. No INA226, no PD write, no bus recovery."
+            );
+        }
+        on
+    })
+}
+
+fn read_ina226_sdk() -> Option<(f64, f64, f64)> {
+    #[cfg(target_os = "linux")]
+    {
+        if !i2c2_enabled() {
+            return None;
+        }
+        let _bus = POWER_BUS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if power_bus_quiet() {
+            return None;
+        }
+        pd_enter_i2c_mode();
+        if let Some(reading) = ina226_sample() {
+            power_bus_recovered();
+            return Some(reading);
+        }
+        // The DesignWare controller timed out. If SDA is stuck low, clock
+        // it free and program the INA226 again before giving up.
+        match i2c2_recover() {
+            I2cRecovery::Clocked => {
+                INA_READY.store(false, Ordering::Relaxed);
+                if let Some(reading) = ina226_sample() {
+                    power_bus_recovered();
+                    return Some(reading);
+                }
+            }
+            I2cRecovery::Skipped | I2cRecovery::Failed | I2cRecovery::None => {}
+        }
+        power_bus_failed();
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// One byte to the PD controller: register 0x02 = 0x1B. Canaan's
+/// `pd_pout_limit` does this before GPIO34 goes high and keeps going if
+/// the chip does not ack. test.2 instead ran `i2cget -y 2 0x42 0x01` on
+/// every `/psu` poll, a register the SDK never reads.
+#[cfg(target_os = "linux")]
+fn pd_enter_i2c_mode() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let mut buf = [PD_CFG_REG, PD_CFG_I2C_MODE];
+    let ok = i2c_xfer(INA226_DEV, PD_I2C_ADDR, &mut buf, None);
+    eprintln!(
+        "[nano3s] PD 0x42 reg 0x02 = 0x1B (i2c mode): {}",
+        if ok { "acked" } else { "no ack" }
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn ina226_sample() -> Option<(f64, f64, f64)> {
+    if !INA_READY.load(Ordering::Relaxed) {
+        let cfg_ok = i2c_write_reg_be(INA226_DEV, POWER_I2C_ADDR, 0x00, INA226_CFG);
+        let cal_ok = i2c_write_reg_be(INA226_DEV, POWER_I2C_ADDR, 0x05, INA226_CAL);
+        if !(cfg_ok && cal_ok) {
+            INA_READY.store(false, Ordering::Relaxed);
+            return None;
+        }
+        INA_READY.store(true, Ordering::Relaxed);
+    }
+    let bus = i2c_read_reg_be(INA226_DEV, POWER_I2C_ADDR, 0x02)?;
+    let cur = i2c_read_reg_be(INA226_DEV, POWER_I2C_ADDR, 0x04).unwrap_or(0);
+    Some(ina226_sdk_reading(bus, cur))
+}
+
+static POWER_SENSOR_OK: AtomicBool = AtomicBool::new(false);
+static INA_READY: AtomicBool = AtomicBool::new(false);
+static POWER_BUS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static LAST_I2C_RECOVERY: AtomicU8 = AtomicU8::new(0);
+/// Monotonic millis after which `/dev/i2c-2` may be touched again.
+/// A missing INA226 makes the DesignWare controller time out, so a
+/// failed probe waits a minute instead of retrying every status tick.
+static POWER_BUS_NEXT_MS: AtomicU64 = AtomicU64::new(0);
+static POWER_BUS_LOG_MS: AtomicU64 = AtomicU64::new(0);
+const POWER_BUS_BACKOFF_MS: u64 = 60_000;
+
+fn power_bus_now_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+fn power_bus_quiet() -> bool {
+    power_bus_now_ms() < POWER_BUS_NEXT_MS.load(Ordering::Relaxed)
+}
+
+fn power_bus_failed() {
+    let now = power_bus_now_ms();
+    POWER_BUS_NEXT_MS.store(now.saturating_add(POWER_BUS_BACKOFF_MS), Ordering::Relaxed);
+    let last = POWER_BUS_LOG_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= POWER_BUS_BACKOFF_MS {
+        POWER_BUS_LOG_MS.store(now, Ordering::Relaxed);
+        eprintln!(
+            "[nano3s] power sensor unavailable on {INA226_DEV} addr 0x40 (i2c recovery: {}). Holding voltage and frequency. The {POWER_TARGET_SAFETY_W:.0} W trip is not evaluated. Next probe in {POWER_BUS_BACKOFF_MS} ms. Overview power is the V²·f estimate.",
+            power_i2c_recovery()
+        );
+    }
+}
+
+fn power_bus_recovered() {
+    POWER_BUS_NEXT_MS.store(0, Ordering::Relaxed);
+    POWER_BUS_LOG_MS.store(0, Ordering::Relaxed);
+}
+
+fn note_power_sensor(ok: bool) {
+    let was = POWER_SENSOR_OK.swap(ok, Ordering::Relaxed);
+    if ok && !was {
+        eprintln!("[nano3s] power sensor answered on {INA226_DEV} addr 0x40");
+    }
+}
+
+pub(crate) fn power_sensor_ok() -> bool {
+    POWER_SENSOR_OK.load(Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy)]
+enum I2cRecovery {
+    None = 0,
+    Skipped = 1,
+    Clocked = 2,
+    Failed = 3,
+}
+
+fn note_i2c_recovery(result: I2cRecovery) {
+    LAST_I2C_RECOVERY.store(result as u8, Ordering::Relaxed);
+}
+
+/// Last bus-2 recovery: `none`, `skipped` (SDA was not stuck), `clocked`, or `failed`.
+pub(crate) fn power_i2c_recovery() -> &'static str {
+    match LAST_I2C_RECOVERY.load(Ordering::Relaxed) {
+        1 => "skipped",
+        2 => "clocked",
+        3 => "failed",
+        _ => "none",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn i2c_xfer(dev: &str, addr: u32, write: &mut [u8], read: Option<&mut [u8]>) -> bool {
+    use std::ffi::CString;
+    let Ok(c) = CString::new(dev) else { return false };
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDWR) };
+    if fd < 0 {
+        return false;
+    }
+    #[repr(C)]
+    struct Msg {
+        addr: u16,
+        flags: u16,
+        len: u16,
+        buf: *mut u8,
+    }
+    #[repr(C)]
+    struct Rdwr {
+        msgs: *mut Msg,
+        nmsgs: u32,
+    }
+    let mut n = 0u32;
+    let mut msgs = [
+        Msg { addr: addr as u16, flags: 0, len: 0, buf: std::ptr::null_mut() },
+        Msg { addr: addr as u16, flags: 0x0001, len: 0, buf: std::ptr::null_mut() },
+    ];
+    if !write.is_empty() {
+        msgs[0].len = write.len() as u16;
+        msgs[0].buf = write.as_mut_ptr();
+        n = 1;
+    }
+    if let Some(r) = read {
+        let i = n as usize;
+        msgs[i].addr = addr as u16;
+        msgs[i].flags = 0x0001;
+        msgs[i].len = r.len() as u16;
+        msgs[i].buf = r.as_mut_ptr();
+        n += 1;
+    }
+    let data = Rdwr { msgs: msgs.as_mut_ptr(), nmsgs: n };
+    let rc = unsafe { libc::ioctl(fd, 0x0707, &data) };
+    unsafe { libc::close(fd) };
+    rc >= 0
+}
+
+#[cfg(target_os = "linux")]
+fn i2c_write_reg_be(dev: &str, addr: u32, reg: u8, value: u16) -> bool {
+    let [hi, lo] = value.to_be_bytes();
+    let mut buf = [reg, hi, lo];
+    i2c_xfer(dev, addr, &mut buf, None)
+}
+
+#[cfg(target_os = "linux")]
+fn i2c_read_reg_be(dev: &str, addr: u32, reg: u8) -> Option<u16> {
+    let mut w = [reg];
+    let mut r = [0u8; 2];
+    i2c_xfer(dev, addr, &mut w, Some(&mut r)).then_some(u16::from_be_bytes(r))
+}
+
+/// IOMUX page and the GPIO bank that owns IO11 (SCL) and IO12 (SDA)
+/// once SEL is 0. Bit 31 of each pad register is the live input.
+const IOMUX_BASE: u64 = 0x9110_5000;
+const IO11_OFF: usize = 0x2C;
+const IO12_OFF: usize = 0x30;
+const GPIOA_BASE: u64 = 0x9140_B000;
+const GPIO_DR: usize = 0x00;
+const GPIO_DDR: usize = 0x04;
+const SCL_BIT: u32 = 1 << 11;
+const SDA_BIT: u32 = 1 << 12;
+
+#[cfg(target_os = "linux")]
+struct DevMem {
+    ptr: *mut u8,
+    len: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl DevMem {
+    fn map(base: u64, len: usize) -> Option<Self> {
+        let fd = unsafe { libc::open(c"/dev/mem".as_ptr(), libc::O_RDWR | libc::O_SYNC) };
+        if fd < 0 {
+            return None;
+        }
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                base as libc::off_t,
+            )
+        };
+        unsafe { libc::close(fd) };
+        if ptr == libc::MAP_FAILED {
+            return None;
+        }
+        Some(Self { ptr: ptr as *mut u8, len })
+    }
+
+    fn read(&self, off: usize) -> u32 {
+        unsafe { std::ptr::read_volatile(self.ptr.add(off) as *const u32) }
+    }
+
+    fn write(&self, off: usize, value: u32) {
+        unsafe { std::ptr::write_volatile(self.ptr.add(off) as *mut u32, value) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for DevMem {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.len) };
+    }
+}
+
+/// Clock SCL nine times and send STOP while SDA is stuck low, then put
+/// IO11/IO12 back on I2C2. The caller programs the INA226 afterwards.
+#[cfg(target_os = "linux")]
+fn i2c2_recover() -> I2cRecovery {
+    let Some(mux) = DevMem::map(IOMUX_BASE, 0x1000) else {
+        note_i2c_recovery(I2cRecovery::Failed);
+        return I2cRecovery::Failed;
+    };
+    let sda = mux.read(IO12_OFF);
+    if !i2c2_sda_stuck_low(sda) {
+        note_i2c_recovery(I2cRecovery::Skipped);
+        return I2cRecovery::Skipped;
+    }
+    let Some(gpio) = DevMem::map(GPIOA_BASE, 0x1000) else {
+        note_i2c_recovery(I2cRecovery::Failed);
+        return I2cRecovery::Failed;
+    };
+    // Idle SCL high and SDA an input before the pads leave I2C2.
+    let mut dr = gpio.read(GPIO_DR) | SCL_BIT;
+    let mut ddr = (gpio.read(GPIO_DDR) | SCL_BIT) & !SDA_BIT;
+    gpio.write(GPIO_DR, dr);
+    gpio.write(GPIO_DDR, ddr);
+    let gpio_mode = i2c2_pad_gpio(I2C2_PAD_ALT3);
+    mux.write(IO11_OFF, gpio_mode);
+    mux.write(IO12_OFF, gpio_mode);
+    let pause = || std::thread::sleep(std::time::Duration::from_micros(5));
+    for _ in 0..9 {
+        dr &= !SCL_BIT;
+        gpio.write(GPIO_DR, dr);
+        pause();
+        dr |= SCL_BIT;
+        gpio.write(GPIO_DR, dr);
+        pause();
+    }
+    ddr |= SDA_BIT;
+    dr &= !SDA_BIT;
+    dr &= !SCL_BIT;
+    gpio.write(GPIO_DR, dr);
+    gpio.write(GPIO_DDR, ddr);
+    pause();
+    dr |= SCL_BIT;
+    gpio.write(GPIO_DR, dr);
+    pause();
+    dr |= SDA_BIT;
+    gpio.write(GPIO_DR, dr);
+    pause();
+    mux.write(IO11_OFF, I2C2_PAD_ALT3);
+    mux.write(IO12_OFF, I2C2_PAD_ALT3);
+    note_i2c_recovery(I2cRecovery::Clocked);
+    I2cRecovery::Clocked
 }
 
 /// Margin subtracted from the classified/overridden PD ceiling before
@@ -1222,26 +1665,9 @@ fn i2c_read_byte(bus: u32, addr: u32, reg: u32) -> Option<u8> {
 /// and this margin is the only thing guarding against it being wrong.
 const PD_CEILING_MARGIN_W: f64 = 3.0;
 
-const PD_I2C_ADDR: u32 = 0x42;
-
-/// HUSB238A `PD_STATUS1` (reg `0x01`) bit 6 = ATTACH -- whether a PD
-/// contract is currently established. This is the only bit read from
-/// this chip; `PD_STATUS0`'s voltage/current code nibbles are NOT
-/// decoded here -- live-verified 2026-09-16 that they read wrong for
-/// this board: `PD_STATUS0=0x40` decodes on the standard (base
-/// HUSB238) code table to 15V/0.5A, while the INA226 on the same bus
-/// simultaneously measures 27.64V/3.05A. This chip variant negotiates
-/// USB PD 3.1 EPR (28/36/48V), which uses code values the base table
-/// doesn't cover, so its raw codes are not trustworthy here -- bus
-/// voltage from the INA226 is used as the sole ground truth instead
-/// (see [`pd_ceiling_w_for_voltage`]).
-fn read_pd_attached() -> Option<bool> {
-    i2c_read_byte(POWER_I2C_BUS, PD_I2C_ADDR, 0x01).map(|v| v & 0x40 != 0)
-}
-
 /// Conservative USB-C PD power-contract ceiling, classified from
-/// measured INA226 bus voltage alone -- never from HUSB238A's own
-/// status codes (see [`read_pd_attached`]'s doc comment for why).
+/// measured INA226 bus voltage alone. The part at 0x42 is not an
+/// HUSB238, so register 0x01 bit 6 is not an attach flag and is not read.
 /// Current is *assumed* at each voltage tier's typical/spec maximum,
 /// never measured, so this only ever misclassifies in the conservative
 /// direction (a charger that can't sustain the assumed current at a
@@ -1309,20 +1735,32 @@ fn write_psu_override_w(override_max_w: Option<f64>) {
 /// infrequently by the dashboard and a fresh read costs one `i2cget`
 /// round-trip either way.
 pub(crate) fn read_psu_status() -> (Option<f64>, Option<bool>, Option<f64>, Option<f64>, f64) {
-    let (bus_v, _current_a, _power_w) = read_power_estimate();
-    let bus_v = if bus_v > 0.0 { Some(bus_v) } else { None };
-    let attached = read_pd_attached();
-    let detected_ceiling_w = bus_v.map(pd_ceiling_w_for_voltage).filter(|w| w.is_finite());
+    let measured = read_ina226_sdk();
+    let bus_v = measured.and_then(|(v, _, _)| (v >= 8.0).then_some(v));
+    let attached = None;
+    let detected_ceiling_w = bus_v
+        .map(pd_ceiling_w_for_voltage)
+        .filter(|w| w.is_finite());
     let override_max_w = load_psu_override_w();
-    let effective_ceiling_w = if let Some(override_w) = override_max_w.filter(|w| w.is_finite() && *w > 0.0) {
-        // Explicit continuous power ceiling override (e.g. 130W Aggressive, 140W Mean Well)
-        override_w.clamp(40.0, 140.0)
-    } else {
-        detected_ceiling_w
-            .map(|w| (w * auto_tune::PD_CONTINUOUS_FRACTION).min(POWER_TARGET_SAFETY_W - PD_CEILING_MARGIN_W))
-            .unwrap_or(POWER_TARGET_SAFETY_W - PD_CEILING_MARGIN_W)
-    };
-    (bus_v, attached, detected_ceiling_w, override_max_w, effective_ceiling_w)
+    let effective_ceiling_w =
+        if let Some(override_w) = override_max_w.filter(|w| w.is_finite() && *w > 0.0) {
+            // Explicit continuous power ceiling override (e.g. 130W Aggressive, 140W Mean Well)
+            override_w.clamp(40.0, 140.0)
+        } else {
+            detected_ceiling_w
+                .map(|w| {
+                    (w * auto_tune::PD_CONTINUOUS_FRACTION)
+                        .min(POWER_TARGET_SAFETY_W - PD_CEILING_MARGIN_W)
+                })
+                .unwrap_or(POWER_TARGET_SAFETY_W - PD_CEILING_MARGIN_W)
+        };
+    (
+        bus_v,
+        attached,
+        detected_ceiling_w,
+        override_max_w,
+        effective_ceiling_w,
+    )
 }
 
 /// Snapshot for `GET /api/v0/boards/{name}/autotune-hashrate` -- reads
@@ -1333,7 +1771,13 @@ pub(crate) fn read_autotune_hashrate_status() -> (bool, Option<f64>, f64, u32, u
     let enabled = cfg.autotune_hashrate_target_ths.is_some();
     let level = cfg.autotune_level.unwrap_or(0.5);
     let (freq, volt, _) = level_to_freq_voltage_limit(level);
-    (enabled, cfg.autotune_hashrate_target_ths, level, freq[0], volt)
+    (
+        enabled,
+        cfg.autotune_hashrate_target_ths,
+        level,
+        freq[0],
+        volt,
+    )
 }
 
 /// Control file the harness (mujina_test_harness.c) polls independently
@@ -1362,7 +1806,13 @@ fn read_fan_status() -> Option<Fan> {
             continue;
         };
         match key {
-            "rpm" => rpm = val.parse::<i32>().ok().filter(|v| *v >= 0).map(|v| v as u32),
+            "rpm" => {
+                rpm = val
+                    .parse::<i32>()
+                    .ok()
+                    .filter(|v| *v >= 0)
+                    .map(|v| v as u32)
+            }
             "duty" => percent = val.parse::<u8>().ok(),
             _ => {}
         }
@@ -1394,7 +1844,11 @@ const OUTLET_NTC_B: f64 = 3950.0;
 
 fn read_outlet_temp_c() -> Option<f64> {
     let read = |f: &str| -> Option<f64> {
-        std::fs::read_to_string(format!("{OUTLET_ADC_DIR}/{f}")).ok()?.trim().parse().ok()
+        std::fs::read_to_string(format!("{OUTLET_ADC_DIR}/{f}"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
     };
     // in_voltage_scale is mV per LSB (0.44 on this SoC).
     let mv = read(OUTLET_ADC_RAW)? * read("in_voltage_scale")?;
@@ -1457,6 +1911,12 @@ struct PersistedTuning {
     chip_tune: bool,
     /// Continuous dynamic tuning switch.
     continuous: bool,
+    /// `clear` zeros chip offsets when the profile or board VF changes.
+    /// `keep` leaves them. Absent in tuning.conf means `clear`.
+    chip_clock_policy: ChipClockPolicy,
+    /// Live Tuning selector (`210,230,250,270` / `338,358,378,398` /
+    /// `420,440,460,480` / `custom`). Restored into the dashboard.
+    live_preset: Option<String>,
 }
 
 static TUNING_CONF_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1517,11 +1977,16 @@ fn chip_goal(p: Option<TuneChoice>) -> ChipGoal {
 /// `profile,freq,mv,ths,jth,floor_mv,ceiling_mhz`.
 fn parse_auto_memory(s: &str) -> Option<(TuneProfile, SearchMemory)> {
     let f: Vec<&str> = s.split(',').map(str::trim).collect();
-    let [p, freq, mv, ths, jth, floor, ceil] = f.as_slice() else { return None };
+    let [p, freq, mv, ths, jth, floor, ceil] = f.as_slice() else {
+        return None;
+    };
     Some((
         auto_tune::parse_directive(p).ok().flatten()?,
         SearchMemory {
-            best: TuneSetpoint { frequency_mhz: freq.parse().ok()?, core_voltage_mv: mv.parse().ok()? },
+            best: TuneSetpoint {
+                frequency_mhz: freq.parse().ok()?,
+                core_voltage_mv: mv.parse().ok()?,
+            },
             best_hashrate_ths: ths.parse().ok()?,
             best_j_th: jth.parse().ok()?,
             probe_floor_mv: floor.parse().ok()?,
@@ -1585,16 +2050,26 @@ fn load_tuning_from(path: &std::path::Path) -> PersistedTuning {
                 cfg.autotune_hashrate_target_ths = value.parse::<f64>().ok()
             }
             "autotune_level" => cfg.autotune_level = value.parse::<f64>().ok(),
-            "auto_tune_profile" | "owner_tune_profile" => cfg.auto_tune_profile = auto_tune::parse_choice(value).ok().flatten(),
+            "auto_tune_profile" | "owner_tune_profile" => {
+                cfg.auto_tune_profile = auto_tune::parse_choice(value).ok().flatten()
+            }
             "auto_fan_target_c" | "owner_fan_target_c" => {
-                cfg.auto_fan_target_c =
-                    value.parse::<f32>().ok().filter(|c| auto_tune::FAN_TARGET_RANGE_C.contains(c))
+                cfg.auto_fan_target_c = value
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|c| auto_tune::FAN_TARGET_RANGE_C.contains(c))
             }
             "chip_offset_mhz" => cfg.chip_offset_mhz = parse_chip_offsets(value),
             "auto_memory" | "owner_memory" => cfg.auto_memory = parse_auto_memory(value),
             "target_memory" => cfg.target_memory = auto_tune::parse_target_memory(value),
             "chip_tune" => cfg.chip_tune = value == "on",
             "continuous" => cfg.continuous = value == "on",
+            "chip_clock_policy" => {
+                if let Some(p) = ChipClockPolicy::parse(value) {
+                    cfg.chip_clock_policy = p;
+                }
+            }
+            "live_preset" => cfg.live_preset = Some(value.to_string()),
             _ => {}
         }
     }
@@ -1608,7 +2083,10 @@ fn write_tuning_conf_to(path: &std::path::Path, cfg: &PersistedTuning) {
     use std::io::Write as _;
     let mut out = String::new();
     if let Some(f) = cfg.pll_freq_mhz {
-        out.push_str(&format!("freq0={}\nfreq1={}\nfreq2={}\nfreq3={}\n", f[0], f[1], f[2], f[3]));
+        out.push_str(&format!(
+            "freq0={}\nfreq1={}\nfreq2={}\nfreq3={}\n",
+            f[0], f[1], f[2], f[3]
+        ));
     }
     if let Some(v) = cfg.voltage_mv {
         out.push_str(&format!("voltage_mv={v}\n"));
@@ -1626,7 +2104,10 @@ fn write_tuning_conf_to(path: &std::path::Path, cfg: &PersistedTuning) {
         out.push_str(&format!("autotune_level={l}\n"));
     }
     if let Some(p) = cfg.auto_tune_profile {
-        out.push_str(&format!("auto_tune_profile={}\n", auto_tune::choice_text(Some(p))));
+        out.push_str(&format!(
+            "auto_tune_profile={}\n",
+            auto_tune::choice_text(Some(p))
+        ));
     }
     if let Some(c) = cfg.auto_fan_target_c {
         out.push_str(&format!("auto_fan_target_c={c}\n"));
@@ -1635,7 +2116,10 @@ fn write_tuning_conf_to(path: &std::path::Path, cfg: &PersistedTuning) {
         out.push_str(&format!("auto_memory={}\n", format_auto_memory(m)));
     }
     if let Some(m) = &cfg.target_memory {
-        out.push_str(&format!("target_memory={}\n", auto_tune::format_target_memory(m)));
+        out.push_str(&format!(
+            "target_memory={}\n",
+            auto_tune::format_target_memory(m)
+        ));
     }
     if cfg.chip_tune {
         out.push_str("chip_tune=on\n");
@@ -1643,15 +2127,23 @@ fn write_tuning_conf_to(path: &std::path::Path, cfg: &PersistedTuning) {
     if cfg.continuous {
         out.push_str("continuous=on\n");
     }
+    if cfg.chip_clock_policy == ChipClockPolicy::Keep {
+        out.push_str("chip_clock_policy=keep\n");
+    }
     if let Some(o) = cfg.chip_offset_mhz.filter(|o| o.iter().any(|x| *x != 0)) {
         out.push_str(&format!("chip_offset_mhz={}\n", join_chip_offsets(&o)));
+    }
+    if let Some(p) = &cfg.live_preset {
+        out.push_str(&format!("live_preset={p}\n"));
     }
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         let _ = std::fs::create_dir_all(parent);
     }
     let tmp_name = format!(
         "{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("tuning.conf")
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("tuning.conf")
     );
     let tmp_path = path.with_file_name(tmp_name);
     let res = (|| -> std::io::Result<()> {
@@ -1701,7 +2193,70 @@ fn persist_tuning_set(
         if temp_target_c.is_some() {
             cfg.temp_target_c = temp_target_c;
         }
+        if let Some(f) = pll_freq_mhz {
+            cfg.live_preset = Some(live_preset_id(f).to_string());
+        }
     });
+}
+
+/// Option value of the Live Tuning selector for a four-domain clock.
+fn live_preset_id(freq: [u32; 4]) -> &'static str {
+    match freq {
+        [210, 230, 250, 270] => "210,230,250,270",
+        [338, 358, 378, 398] => "338,358,378,398",
+        [420, 440, 460, 480] => "420,440,460,480",
+        _ => "custom",
+    }
+}
+
+/// Saved Live Tuning and AutoTune choice, for GET and for the dashboard
+/// to refill its selectors after a reload.
+#[derive(Clone, Debug)]
+pub(crate) struct SavedTuning {
+    pub pll_freq_mhz: Option<[u32; 4]>,
+    pub voltage_mv: Option<u32>,
+    pub power_target_w: Option<f64>,
+    pub temp_target_c: Option<f64>,
+    pub live_preset: String,
+    pub auto_profile: Option<TuneProfile>,
+    pub auto_target: Option<TuneTarget>,
+    pub auto_enabled: bool,
+    pub continuous: bool,
+}
+
+pub(crate) fn saved_tuning() -> SavedTuning {
+    let cfg = load_tuning();
+    let (auto_profile, auto_target) = match cfg.auto_tune_profile {
+        Some(TuneChoice::Profile(p)) => (Some(p), None),
+        Some(TuneChoice::Target(t)) => (None, Some(t)),
+        None => (None, None),
+    };
+    let live_preset = cfg
+        .live_preset
+        .or_else(|| cfg.pll_freq_mhz.map(|f| live_preset_id(f).to_string()))
+        .unwrap_or_else(|| "338,358,378,398".to_string());
+    SavedTuning {
+        pll_freq_mhz: cfg.pll_freq_mhz,
+        voltage_mv: cfg.voltage_mv,
+        power_target_w: cfg.power_target_w,
+        temp_target_c: cfg.temp_target_c,
+        live_preset,
+        auto_profile,
+        auto_target,
+        auto_enabled: cfg.auto_tune_profile.is_some(),
+        continuous: cfg.continuous,
+    }
+}
+
+pub(crate) fn saved_auto_tune_status() -> auto_tune::AutoTuneStatus {
+    let s = saved_tuning();
+    auto_tune::AutoTuneStatus {
+        enabled: s.auto_enabled,
+        profile: s.auto_profile,
+        target: s.auto_target,
+        continuous: s.continuous,
+        ..auto_tune::AutoTuneStatus::default()
+    }
 }
 
 fn persist_tuning_clear_power_target() {
@@ -1734,8 +2289,8 @@ fn persist_auto_tune_profile(profile: Option<TuneChoice>) {
     update_tuning_conf(|cfg| cfg.auto_tune_profile = profile);
 }
 
-/// Stops any active per-chip tuner, zeroes per-chip clock offsets in
-/// firmware and `tuning.conf`, and clears per-chip tuner UI state.
+/// Stops any active per-chip tuner. With the default `clear` policy this
+/// also zeroes the twelve offsets. With `keep` the committed offsets stay.
 fn reset_chip_tuning_to_zero(
     auto_tuner: &mut AutoTune,
     chip_tuner: &mut Option<ChipTuner>,
@@ -1747,15 +2302,23 @@ fn reset_chip_tuning_to_zero(
     if let Some(mut ct) = chip_tuner.take() {
         ct.interrupt();
     }
-    let zeros = [0i16; CHIP_COUNT];
-    send_chip_offsets(zeros, chip_offset_mhz, why);
-    *persisted_chip_offsets = zeros;
     persisted_tuning.chip_tune = false;
+    persisted_tuning.chip_clock_policy = load_tuning().chip_clock_policy;
     auto_tuner.set_chip_status(None);
-    update_tuning_conf(|cfg| {
-        cfg.chip_offset_mhz = None;
-        cfg.chip_tune = false;
-    });
+    if persisted_tuning.chip_clock_policy.clears_on_board_change() {
+        let zeros = [0i16; CHIP_COUNT];
+        send_chip_offsets(zeros, chip_offset_mhz, why);
+        *persisted_chip_offsets = zeros;
+        update_tuning_conf(|cfg| {
+            cfg.chip_offset_mhz = None;
+            cfg.chip_tune = false;
+        });
+    } else {
+        let keep = *persisted_chip_offsets;
+        send_chip_offsets(keep, chip_offset_mhz, why);
+        update_tuning_conf(|cfg| cfg.chip_tune = false);
+        eprintln!("[nano3s] {why}: keeping per-chip clocks {keep:?}");
+    }
 }
 
 /// Turns the AutoTune off because a manual/aadhi control took over.
@@ -1807,7 +2370,11 @@ fn build_auto_tune_directive(
         line.push_str(if on { ";chip=on" } else { ";chip=off" });
     }
     if let Some(on) = continuous {
-        line.push_str(if on { ";continuous=on" } else { ";continuous=off" });
+        line.push_str(if on {
+            ";continuous=on"
+        } else {
+            ";continuous=off"
+        });
     }
     line
 }
@@ -1828,13 +2395,17 @@ fn apply_auto_tune_directive_to_conf(cfg: &mut PersistedTuning, d: &auto_tune::A
             if matches!(choice, TuneChoice::Profile(_)) {
                 cfg.auto_memory = None;
             }
-            cfg.chip_offset_mhz = None;
+            if cfg.chip_clock_policy.clears_on_board_change() {
+                cfg.chip_offset_mhz = None;
+            }
             cfg.chip_tune = d.chip_tune.unwrap_or(false);
         }
         Some(None) => {
             cfg.auto_tune_profile = None;
             cfg.chip_tune = false;
-            cfg.chip_offset_mhz = None;
+            if cfg.chip_clock_policy.clears_on_board_change() {
+                cfg.chip_offset_mhz = None;
+            }
         }
         None => {}
     }
@@ -1874,7 +2445,31 @@ pub(crate) fn write_auto_tune_command(
 /// and persists it. Shares the single-slot control file: space calls >= 5 s.
 pub(crate) fn write_chip_offset_command(offset_mhz: [i16; CHIP_COUNT]) -> std::io::Result<()> {
     update_tuning_conf(|cfg| cfg.chip_offset_mhz = Some(offset_mhz));
-    std::fs::write(MUJINA_CONTROL_FILE, format!("chip_offset:{}", join_chip_offsets(&offset_mhz)))
+    std::fs::write(
+        MUJINA_CONTROL_FILE,
+        format!("chip_offset:{}", join_chip_offsets(&offset_mhz)),
+    )
+}
+
+/// Persists `chip_clock_policy` and tells the run loop. `clear` omits the
+/// key so an upgrade that never opts in keeps today's file.
+pub(crate) fn write_chip_clock_policy(policy: ChipClockPolicy) -> std::io::Result<()> {
+    update_tuning_conf(|cfg| cfg.chip_clock_policy = policy);
+    std::fs::write(
+        MUJINA_CONTROL_FILE,
+        format!("chip_policy:{}", policy.as_conf()),
+    )
+}
+
+/// Board PLL the absolute-MHz API subtracts. Live commanded clocks, then
+/// the saved tune, then the factory ramp target.
+pub(crate) fn commanded_pll_freq() -> [u32; 4] {
+    if let Some(d) = get_detail_snapshot()
+        && d.pll_freq_commanded.iter().all(|f| (100..=580).contains(f))
+    {
+        return d.pll_freq_commanded;
+    }
+    load_tuning().pll_freq_mhz.unwrap_or(NANO3S_PLL_FREQ_TARGET)
 }
 
 fn persist_autotune_level(level: f64) {
@@ -2013,6 +2608,11 @@ pub(crate) fn write_fan_control_command(cmd: &str) -> std::io::Result<()> {
     std::fs::write(HARNESS_CONTROL_FILE, cmd)?;
     if let Some(ov) = auto_tune::parse_fan_control_override(cmd) {
         *MANUAL_FAN_DUTY.lock().unwrap_or_else(|e| e.into_inner()) = ov;
+        let (mode, duty) = match ov {
+            Some(d) => ("manual", Some(d)),
+            None => ("auto", None),
+        };
+        store_fan_mode(mode, duty)?;
     }
     Ok(())
 }
@@ -2038,22 +2638,172 @@ fn sync_manual_fan_with_tuner(auto_tuner: &mut auto_tune::AutoTune) {
     }
 }
 
-/// Path the C harness persists the fan curve to (`fan_curve_save()` in
-/// `mujina_test_harness.c`) -- sole writer is the harness itself, not
-/// this process; [`read_fan_curve`] only reads it back for display.
+/// Path the C harness and this process persist the fan curve to.
+/// `reboot -f` does not flush the page cache, so the miner writes the
+/// file itself (fsync, then rename) before the live harness command.
 const FAN_CURVE_CONF_PATH: &str = "/data/userconfig/fan_curve.conf";
 
-/// Writes a `fancurve:t1:d1,t2:d2,...` directive to `HARNESS_CONTROL_FILE`.
-/// The harness validates, sorts by temp, applies live, and persists to
-/// [`FAN_CURVE_CONF_PATH`] -- this function itself does no validation
-/// beyond formatting; range/count checks happen in the API handler.
+/// Saves `temp,duty` lines to [`FAN_CURVE_CONF_PATH`], then writes a
+/// `fancurve:t1:d1,t2:d2,...` directive so the harness applies it live.
+/// Range and count checks happen in the API handler.
 pub(crate) fn write_fan_curve_command(points: &[(f64, f64)]) -> std::io::Result<()> {
-    let body = points
+    let mut pts = points.to_vec();
+    pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut file = String::new();
+    for (t, d) in &pts {
+        file.push_str(&format!("{t},{d}\n"));
+    }
+    atomic_conf_write(std::path::Path::new(FAN_CURVE_CONF_PATH), file.as_bytes())?;
+    let body = pts
         .iter()
         .map(|(t, d)| format!("{t}:{d}"))
         .collect::<Vec<_>>()
         .join(",");
     std::fs::write(HARNESS_CONTROL_FILE, format!("fancurve:{body}"))
+}
+
+const PSU_BYPASS_PATH: &str = "/data/userconfig/psu_bypass.conf";
+const IMMERSION_PATH: &str = "/data/userconfig/immersion.conf";
+const FAN_MODE_PATH: &str = "/data/userconfig/fan_mode.conf";
+
+fn flag_slot(path: &'static str, key: &'static str) -> &'static AtomicBool {
+    use std::sync::OnceLock;
+    static SLOTS: OnceLock<Mutex<std::collections::HashMap<&'static str, &'static AtomicBool>>> =
+        OnceLock::new();
+    // One atomic per path, leaked for the process lifetime.
+    let map = SLOTS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(f) = g.get(path) {
+        return f;
+    }
+    let flag: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(load_flag_file(
+        std::path::Path::new(path),
+        key,
+    ))));
+    g.insert(path, flag);
+    flag
+}
+
+fn load_flag_file(path: &std::path::Path, key: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        line.split_once('=')
+            .is_some_and(|(k, v)| k.trim() == key && v.trim() == "1")
+    })
+}
+
+fn store_flag_file(path: &std::path::Path, key: &str, on: bool) -> std::io::Result<()> {
+    let body = format!("{key}={}\n", if on { "1" } else { "0" });
+    atomic_conf_write(path, body.as_bytes())
+}
+
+pub(crate) fn psu_bypass_enabled() -> bool {
+    flag_slot(PSU_BYPASS_PATH, "psu_bypass").load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_psu_bypass(on: bool) -> std::io::Result<()> {
+    store_flag_file(std::path::Path::new(PSU_BYPASS_PATH), "psu_bypass", on)?;
+    flag_slot(PSU_BYPASS_PATH, "psu_bypass").store(on, Ordering::Relaxed);
+    Ok(())
+}
+
+pub(crate) fn immersion_enabled() -> bool {
+    flag_slot(IMMERSION_PATH, "immersion").load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_immersion(on: bool) -> std::io::Result<()> {
+    store_flag_file(std::path::Path::new(IMMERSION_PATH), "immersion", on)?;
+    flag_slot(IMMERSION_PATH, "immersion").store(on, Ordering::Relaxed);
+    let _ = std::fs::write("/tmp/immersion", if on { "1\n" } else { "0\n" });
+    if on {
+        write_fan_control_command("fan:manual,0")?;
+    } else {
+        write_fan_control_command("fan:auto,")?;
+    }
+    Ok(())
+}
+
+/// Tuner ceiling (W) and the wattage trip (W). Bypass lifts the PD tiers
+/// and the 137 W trip. Chip temperature limits and the 3912 mV rail max
+/// are applied elsewhere and are not changed here.
+pub(crate) fn power_limits(bypass: bool, override_w: Option<f64>, bus_v: f64) -> (f32, f64) {
+    // Bypass drops the USB-C PD tier. It does not remove the 137 W trip.
+    let hard = POWER_TARGET_SAFETY_W;
+    if bypass && override_w.is_none() {
+        let ceiling = auto_tune::auto_tune_power_ceiling(f64::INFINITY, hard);
+        return (ceiling, hard);
+    }
+    if let Some(override_w) = override_w {
+        let ceiling = (override_w as f32).clamp(40.0, 140.0);
+        let safety = (override_w * 1.03).clamp(40.0, 150.0);
+        (ceiling, safety)
+    } else {
+        let pd_contract = pd_ceiling_w_for_voltage(bus_v);
+        let safety = POWER_TARGET_SAFETY_W.min(pd_contract - PD_CEILING_MARGIN_W);
+        let ceiling = auto_tune::auto_tune_power_ceiling(pd_contract, safety);
+        (ceiling, safety)
+    }
+}
+
+fn load_fan_mode_from(path: &std::path::Path) -> (String, Option<u8>) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return ("auto".into(), None);
+    };
+    let mut mode = "auto".to_string();
+    let mut duty = None;
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once('=') else { continue };
+        match k.trim() {
+            "mode" => mode = v.trim().to_string(),
+            "duty" => duty = v.trim().parse().ok(),
+            _ => {}
+        }
+    }
+    if mode != "manual" {
+        mode = "auto".into();
+        duty = None;
+    }
+    (mode, duty)
+}
+
+fn store_fan_mode(mode: &str, duty: Option<u8>) -> std::io::Result<()> {
+    let body = match (mode, duty) {
+        ("manual", Some(d)) => format!("mode=manual\nduty={d}\n"),
+        _ => "mode=auto\n".to_string(),
+    };
+    atomic_conf_write(std::path::Path::new(FAN_MODE_PATH), body.as_bytes())
+}
+
+pub(crate) fn fan_mode_saved() -> (String, Option<u8>) {
+    if immersion_enabled() {
+        return ("manual".into(), Some(0));
+    }
+    load_fan_mode_from(std::path::Path::new(FAN_MODE_PATH))
+}
+
+fn atomic_conf_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("conf.tmp");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 /// Reads the currently persisted fan curve directly from
@@ -2314,11 +3064,11 @@ fn load_led_conf_from(path: &std::path::Path) -> LedOverrideState {
     state
 }
 
-fn write_led_conf(state: &LedOverrideState) {
-    write_led_conf_to(std::path::Path::new(LED_CONF_PATH), state);
+fn write_led_conf(state: &LedOverrideState) -> Result<(), String> {
+    write_led_conf_to(std::path::Path::new(LED_CONF_PATH), state)
 }
 
-fn write_led_conf_to(path: &std::path::Path, state: &LedOverrideState) {
+fn write_led_conf_to(path: &std::path::Path, state: &LedOverrideState) -> Result<(), String> {
     let out = format!(
         "effect={}\ncolor=#{:02x}{:02x}{:02x}\nbrightness={}\nspeed={}\n",
         state.effect.as_str(),
@@ -2328,17 +3078,29 @@ fn write_led_conf_to(path: &std::path::Path, state: &LedOverrideState) {
         state.brightness,
         state.speed
     );
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| format!("failed to save LED config: {e}"))?;
     }
-    let tmp_path = format!("{}.tmp", path.display());
-    if let Err(e) = std::fs::write(&tmp_path, &out) {
-        eprintln!("[nano3s] failed to write {tmp_path}: {e}");
-        return;
+    let tmp = path.with_extension("conf.tmp");
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp)
+            .map_err(|e| format!("failed to save LED config: {e}"))?;
+        file.write_all(out.as_bytes())
+            .map_err(|e| format!("failed to save LED config: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("failed to save LED config: {e}"))?;
     }
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        eprintln!("[nano3s] failed to rename {tmp_path} to {}: {e}", path.display());
+    std::fs::rename(&tmp, path).map_err(|e| format!("failed to save LED config: {e}"))?;
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
     }
+    Ok(())
 }
 
 /// Global manual LED state, shared between the API handler (async, in the
@@ -2352,7 +3114,10 @@ fn parse_hex_color(s: &str) -> Result<(u8, u8, u8), String> {
     if s.len() != 6 {
         return Err(format!("invalid color '{s}' (want #RRGGBB)"));
     }
-    let byte = |i: usize| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| format!("invalid color '{s}' (want #RRGGBB)"));
+    let byte = |i: usize| {
+        u8::from_str_radix(&s[i..i + 2], 16)
+            .map_err(|_| format!("invalid color '{s}' (want #RRGGBB)"))
+    };
     Ok((byte(0)?, byte(2)?, byte(4)?))
 }
 
@@ -2361,7 +3126,12 @@ fn parse_hex_color(s: &str) -> Result<(u8, u8, u8), String> {
 /// semantics. Any argument left `None` keeps that field's current value.
 /// Returns an error string (for the handler to turn into a 400) on an
 /// unknown effect name or malformed color. Persists changes to [`LED_CONF_PATH`].
-pub(crate) fn write_led_command(effect: Option<String>, color: Option<String>, brightness: Option<u8>, speed: Option<u8>) -> Result<(), String> {
+pub(crate) fn write_led_command(
+    effect: Option<String>,
+    color: Option<String>,
+    brightness: Option<u8>,
+    speed: Option<u8>,
+) -> Result<(), String> {
     let mut state = LED_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(e) = effect {
         state.effect = LedEffect::parse(&e)?;
@@ -2375,7 +3145,7 @@ pub(crate) fn write_led_command(effect: Option<String>, color: Option<String>, b
     if let Some(s) = speed {
         state.speed = s;
     }
-    write_led_conf(&state);
+    write_led_conf(&state)?;
     Ok(())
 }
 
@@ -2384,7 +3154,10 @@ pub(crate) fn get_led_state() -> crate::api_client::types::BoardLedState {
     let state = *LED_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner());
     crate::api_client::types::BoardLedState {
         effect: state.effect.as_str().to_string(),
-        color: format!("#{:02x}{:02x}{:02x}", state.color.0, state.color.1, state.color.2),
+        color: format!(
+            "#{:02x}{:02x}{:02x}",
+            state.color.0, state.color.1, state.color.2
+        ),
         brightness: state.brightness,
         speed: state.speed,
     }
@@ -2416,7 +3189,9 @@ impl UiTheme {
             "cyberpunk" => Ok(UiTheme::Cyberpunk),
             "minimal" | "apple" => Ok(UiTheme::Minimal),
             "parasite" => Ok(UiTheme::Parasite),
-            other => Err(format!("unknown UI theme '{other}' (want cyberpunk/minimal/parasite)")),
+            other => Err(format!(
+                "unknown UI theme '{other}' (want cyberpunk/minimal/parasite)"
+            )),
         }
     }
 }
@@ -2477,7 +3252,15 @@ static UI_THEME: std::sync::LazyLock<std::sync::Mutex<UiTheme>> =
 fn is_valid_page(p: &str) -> bool {
     matches!(
         p.trim(),
-        "mujina-logo" | "nano3s" | "nano3s-tuner" | "ip" | "parasite-logo" | "plasma" | "pizza" | "wifi-setup" | "doom"
+        "mujina-logo"
+            | "nano3s"
+            | "nano3s-tuner"
+            | "ip"
+            | "parasite-logo"
+            | "plasma"
+            | "pizza"
+            | "wifi-setup"
+            | "doom"
     )
 }
 
@@ -2510,7 +3293,9 @@ pub(crate) fn write_display_command(
     if let Some(p_str) = page {
         let p = p_str.trim();
         if !is_valid_page(p) {
-            return Err(DisplayError::BadRequest(format!("unknown display page '{p}'")));
+            return Err(DisplayError::BadRequest(format!(
+                "unknown display page '{p}'"
+            )));
         }
         atomic_write_file(std::path::Path::new(FB_PAGE_PATH), &format!("{p}\n"))
             .map_err(DisplayError::Io)?;
@@ -2521,7 +3306,11 @@ pub(crate) fn write_display_command(
         .to_string();
     Ok(crate::api_client::types::DisplayState {
         theme: current.as_str().to_string(),
-        page: if active_page.is_empty() { "mujina-logo".to_string() } else { active_page },
+        page: if active_page.is_empty() {
+            "mujina-logo".to_string()
+        } else {
+            active_page
+        },
     })
 }
 
@@ -2533,7 +3322,11 @@ pub(crate) fn get_display_state() -> crate::api_client::types::DisplayState {
         .to_string();
     crate::api_client::types::DisplayState {
         theme: current.as_str().to_string(),
-        page: if active_page.is_empty() { "mujina-logo".to_string() } else { active_page },
+        page: if active_page.is_empty() {
+            "mujina-logo".to_string()
+        } else {
+            active_page
+        },
     }
 }
 
@@ -2552,7 +3345,11 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
         4 => (x, 0.0, c),
         _ => (c, 0.0, x),
     };
-    (((r1 + m) * 255.0).round() as u8, ((g1 + m) * 255.0).round() as u8, ((b1 + m) * 255.0).round() as u8)
+    (
+        ((r1 + m) * 255.0).round() as u8,
+        ((g1 + m) * 255.0).round() as u8,
+        ((b1 + m) * 255.0).round() as u8,
+    )
 }
 
 /// Degrees the rainbow-chase phase advances per ~200ms tick at
@@ -2582,7 +3379,11 @@ fn rainbow_frame(phase_deg: f32, brightness: u8) -> [(u8, u8, u8); WS2812_LED_CO
 /// dim/pulse a fixed user color rather than working in HSV.
 fn scale_color(rgb: (u8, u8, u8), level: f32) -> (u8, u8, u8) {
     let level = level.clamp(0.0, 1.0);
-    ((rgb.0 as f32 * level).round() as u8, (rgb.1 as f32 * level).round() as u8, (rgb.2 as f32 * level).round() as u8)
+    (
+        (rgb.0 as f32 * level).round() as u8,
+        (rgb.1 as f32 * level).round() as u8,
+        (rgb.2 as f32 * level).round() as u8,
+    )
 }
 
 /// Tiny xorshift32 PRNG for Twinkle/FireFlicker's per-pixel randomness --
@@ -2626,7 +3427,11 @@ struct AnimState {
 
 impl AnimState {
     fn new() -> Self {
-        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0).max(1);
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+            .max(1);
         Self {
             effect: LedEffect::Auto,
             phase_deg: 0.0,
@@ -2681,7 +3486,8 @@ impl AnimState {
         } else if self.scanner_pos <= 0.0 && self.scanner_dir < 0.0 {
             self.scanner_dir = 1.0;
         }
-        self.scanner_pos = (self.scanner_pos + self.scanner_dir * (0.4 + speed_frac * 1.2)).clamp(0.0, span);
+        self.scanner_pos =
+            (self.scanner_pos + self.scanner_dir * (0.4 + speed_frac * 1.2)).clamp(0.0, span);
     }
 
     /// Computes the directional comet intensity multiplier (`0.0..=1.0`) for
@@ -2731,7 +3537,8 @@ impl AnimState {
                 [scale_color(ov.color, level); WS2812_LED_COUNT]
             }
             LedEffect::Chase => {
-                self.chase_pos = (self.chase_pos + 0.2 + speed_frac * 2.0) % WS2812_LED_COUNT as f32;
+                self.chase_pos =
+                    (self.chase_pos + 0.2 + speed_frac * 2.0) % WS2812_LED_COUNT as f32;
                 let mut colors = [(0u8, 0u8, 0u8); WS2812_LED_COUNT];
                 let pos = self.chase_pos as i32;
                 for (i, c) in colors.iter_mut().enumerate() {
@@ -2809,7 +3616,8 @@ impl AnimState {
             }
             LedEffect::SharePulse => {
                 let pulse = self.share_pulse_decay;
-                self.share_pulse_decay = (self.share_pulse_decay - (0.08 + speed_frac * 0.16)).max(0.0);
+                self.share_pulse_decay =
+                    (self.share_pulse_decay - (0.08 + speed_frac * 0.16)).max(0.0);
                 let level = (0.08 + 0.92 * pulse).clamp(0.0, 1.0);
                 [scale_color(ov.color, v * level); WS2812_LED_COUNT]
             }
@@ -2838,14 +3646,15 @@ impl AnimState {
             }
             LedEffect::Halloween => {
                 const PALETTE: [(u8, u8, u8); 3] = [
-                    (255, 60, 0),   // Stark vibrant Pumpkin Orange
-                    (0, 255, 0),    // Stark vibrant Slime Green
-                    (170, 0, 255),  // Stark intense Witch Purple
+                    (255, 60, 0),  // Stark vibrant Pumpkin Orange
+                    (0, 255, 0),   // Stark vibrant Slime Green
+                    (170, 0, 255), // Stark intense Witch Purple
                 ];
                 let spawn_chance = 0.03 + speed_frac * 0.25;
                 let mut colors = [(0u8, 0u8, 0u8); WS2812_LED_COUNT];
                 for i in 0..WS2812_LED_COUNT {
-                    if self.halloween_twinkle[i] <= 0.02 && rand_unit(&mut self.rng) < spawn_chance {
+                    if self.halloween_twinkle[i] <= 0.02 && rand_unit(&mut self.rng) < spawn_chance
+                    {
                         self.halloween_twinkle[i] = 1.0;
                         self.halloween_color_idx[i] = (xorshift32(&mut self.rng) % 3) as u8;
                     } else {
@@ -2867,7 +3676,8 @@ impl AnimState {
                 let spawn_chance = 0.03 + speed_frac * 0.25;
                 let mut colors = [(0u8, 0u8, 0u8); WS2812_LED_COUNT];
                 for i in 0..WS2812_LED_COUNT {
-                    if self.halloween_twinkle[i] <= 0.02 && rand_unit(&mut self.rng) < spawn_chance {
+                    if self.halloween_twinkle[i] <= 0.02 && rand_unit(&mut self.rng) < spawn_chance
+                    {
                         self.halloween_twinkle[i] = 1.0;
                         self.halloween_color_idx[i] = (xorshift32(&mut self.rng) % 4) as u8;
                     } else {
@@ -2885,11 +3695,13 @@ impl AnimState {
                     (255, 255, 255), // Stark brilliant White
                     (0, 30, 255),    // Stark electric Blue
                 ];
-                self.holiday_phase = (self.holiday_phase + 0.2 + speed_frac * 0.4) % std::f32::consts::TAU;
+                self.holiday_phase =
+                    (self.holiday_phase + 0.2 + speed_frac * 0.4) % std::f32::consts::TAU;
                 let mut colors = [(0u8, 0u8, 0u8); WS2812_LED_COUNT];
                 for i in 0..WS2812_LED_COUNT {
                     let color = TRI_COLOR[i % 3];
-                    let shimmer = 0.35 + 0.65 * ((self.holiday_phase + i as f32 * 0.7).sin() * 0.5 + 0.5);
+                    let shimmer =
+                        0.35 + 0.65 * ((self.holiday_phase + i as f32 * 0.7).sin() * 0.5 + 0.5);
                     colors[i] = scale_color(color, v * shimmer);
                 }
                 colors
@@ -2905,7 +3717,15 @@ impl AnimState {
 const NANO3S_LIVE_FILE: &str = "/tmp/nano3s_live.txt";
 
 #[allow(clippy::too_many_arguments)]
-fn write_live_status(ipc_ok: bool, current_job_id: Option<u32>, shares_found: u32, is_idle: bool, st: &Nano3sStatus, power_w: f64, difficulty: f64) {
+fn write_live_status(
+    ipc_ok: bool,
+    current_job_id: Option<u32>,
+    shares_found: u32,
+    is_idle: bool,
+    st: &Nano3sStatus,
+    power_w: f64,
+    difficulty: f64,
+) {
     let job_id_str = match current_job_id {
         Some(id) => format!("{id:016x}"),
         None => "-".to_string(),
@@ -2916,12 +3736,20 @@ fn write_live_status(ipc_ok: bool, current_job_id: Option<u32>, shares_found: u3
         let mut min_idx = 0usize;
         let mut max_idx = 0usize;
         let mut parts = Vec::with_capacity(12);
-        let count = (st.chip_count as usize).min(12).min(NANO3S_STATUS_MAX_CHIPS);
+        let count = (st.chip_count as usize)
+            .min(12)
+            .min(NANO3S_STATUS_MAX_CHIPS);
         for i in 0..count {
             let t = st.chips[i].temp_c as f64;
             if t > 0.0 {
-                if t < min_t { min_t = t; min_idx = i; }
-                if t > max_t { max_t = t; max_idx = i; }
+                if t < min_t {
+                    min_t = t;
+                    min_idx = i;
+                }
+                if t > max_t {
+                    max_t = t;
+                    max_idx = i;
+                }
             }
             parts.push(format!("{t:.1}"));
         }
@@ -2970,8 +3798,16 @@ fn write_live_status(ipc_ok: bool, current_job_id: Option<u32>, shares_found: u3
         asics_total = st.asics_total,
         ghsmm = st.ghsmm,
         temp_avg = st.temp_avg,
-        temp_max = if max_t > -900.0 { max_t } else { st.temp_max as f64 },
-        temp_min = if min_t < 900.0 { min_t } else { st.temp_avg as f64 },
+        temp_max = if max_t > -900.0 {
+            max_t
+        } else {
+            st.temp_max as f64
+        },
+        temp_min = if min_t < 900.0 {
+            min_t
+        } else {
+            st.temp_avg as f64
+        },
         min_idx = format!("C{min_idx:02}"),
         max_idx = format!("C{max_idx:02}"),
         mode_str = mode_str,
@@ -3000,7 +3836,9 @@ fn reapply_chain_tuning(
 ) {
     let rc = unsafe { nano3s_ipc_set_mode(pll_freq.as_ptr(), 0) };
     if rc != 0 {
-        eprintln!("[nano3s] {why}: nano3s_ipc_set_mode failed -- chain may stay at cold bring-up clock");
+        eprintln!(
+            "[nano3s] {why}: nano3s_ipc_set_mode failed -- chain may stay at cold bring-up clock"
+        );
     }
     if let Some(mv) = voltage_mv {
         let rc = unsafe { nano3s_ipc_set_voltage_raw(mv) };
@@ -3039,8 +3877,12 @@ fn request_recovery_reboot(reason: &str) {
 
     if let Ok(content) = std::fs::read_to_string(RECOVERY_REBOOT_MARKER) {
         if let Ok(last_reboot) = content.trim().parse::<u64>() {
-            if now_secs > 0 && last_reboot > 0 && now_secs < last_reboot + RECOVERY_REBOOT_MIN_INTERVAL_SECS {
-                static LAST_SUPPRESSION_LOG: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+            if now_secs > 0
+                && last_reboot > 0
+                && now_secs < last_reboot + RECOVERY_REBOOT_MIN_INTERVAL_SECS
+            {
+                static LAST_SUPPRESSION_LOG: std::sync::Mutex<Option<std::time::Instant>> =
+                    std::sync::Mutex::new(None);
                 let should_log = {
                     let mut last_log = LAST_SUPPRESSION_LOG.lock().unwrap();
                     match *last_log {
@@ -3068,10 +3910,14 @@ fn request_recovery_reboot(reason: &str) {
     }
     let _ = std::fs::write(RECOVERY_REBOOT_MARKER, format!("{now_secs}\n"));
 
-    eprintln!("[nano3s] EMERGENCY: escalating to recovery reboot ({reason})! Syncing filesystems and rebooting...");
+    eprintln!(
+        "[nano3s] EMERGENCY: escalating to recovery reboot ({reason})! Syncing filesystems and rebooting..."
+    );
     let _ = std::fs::write("/sharefs/reboot_request", format!("{reason}\n"));
     let _ = std::process::Command::new("sync").status();
-    let res = std::process::Command::new("/sbin/reboot").arg("-f").status();
+    let res = std::process::Command::new("/sbin/reboot")
+        .arg("-f")
+        .status();
     if res.is_err() {
         let _ = std::process::Command::new("reboot").arg("-f").status();
     }
@@ -3101,14 +3947,16 @@ fn run_worker(
     // used to live only in local variables and silently reset to
     // hardcoded defaults on every reboot, a real reported bug).
     let mut persisted_tuning = load_tuning();
-    let (startup_pll_freq, startup_voltage_mv, startup_target_mem) = auto_tune::resolve_target_startup(
-        persisted_tuning.auto_tune_profile,
-        persisted_tuning.target_memory,
-        persisted_tuning.pll_freq_mhz,
-        persisted_tuning.voltage_mv,
-        NANO3S_PLL_FREQ_TARGET,
-    );
-    let mut chip_offset_mhz: [i16; CHIP_COUNT] = persisted_tuning.chip_offset_mhz.unwrap_or_default();
+    let (startup_pll_freq, startup_voltage_mv, startup_target_mem) =
+        auto_tune::resolve_target_startup(
+            persisted_tuning.auto_tune_profile,
+            persisted_tuning.target_memory,
+            persisted_tuning.pll_freq_mhz,
+            persisted_tuning.voltage_mv,
+            NANO3S_PLL_FREQ_TARGET,
+        );
+    let mut chip_offset_mhz: [i16; CHIP_COUNT] =
+        persisted_tuning.chip_offset_mhz.unwrap_or_default();
     let mut psu_override_max_w = load_psu_override_w();
     let mut last_pd_ceiling_logged_w: Option<f64> = None;
 
@@ -3120,13 +3968,23 @@ fn run_worker(
         // Fall through: still process commands so the scheduler doesn't
         // hang waiting on responses, but nothing will ever hash.
     } else {
+        // Put the PD controller in I2C mode before the hashboard rail
+        // (GPIO34) comes up. Canaan writes this in pd_pout_limit, while
+        // the rail is still off.
+        if i2c2_enabled() {
+            let _bus = POWER_BUS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            #[cfg(target_os = "linux")]
+            pd_enter_i2c_mode();
+        }
         // Ramp the chain up from its ~100MHz cold bring-up default via
         // IPC_MSG_SET_MODE -- to the persisted frequency if one was saved,
         // otherwise the hardcoded LOW-mode-ish default. Fire-and-forget --
         // rtos_core applies the gradual ramp on its own worker thread.
         let rc = unsafe { nano3s_ipc_set_mode(startup_pll_freq.as_ptr(), 0) };
         if rc != 0 {
-            eprintln!("[nano3s] nano3s_ipc_set_mode failed -- chain will stay at cold bring-up clock");
+            eprintln!(
+                "[nano3s] nano3s_ipc_set_mode failed -- chain will stay at cold bring-up clock"
+            );
         }
         if let Some(mv) = startup_voltage_mv {
             let rc = unsafe { nano3s_ipc_set_voltage_raw(mv as i32) };
@@ -3146,7 +4004,9 @@ fn run_worker(
         // Declare a known-good estimate immediately rather than leaving
         // this at the trait's zero default. Status updates below
         // supersede this once rtos_core.elf starts reporting.
-        let _ = event_tx.try_send(HashThreadEvent::ExpectedHashRate(HashRate::from_gigahashes(NANO3S_EXPECTED_HASHRATE_GHS)));
+        let _ = event_tx.try_send(HashThreadEvent::ExpectedHashRate(
+            HashRate::from_gigahashes(NANO3S_EXPECTED_HASHRATE_GHS),
+        ));
     }
 
     let job_id_counter = AtomicU32::new(1);
@@ -3157,6 +4017,7 @@ fn run_worker(
     // arrives (~every 15s), not on every 200ms loop tick -- an i2cget
     // subprocess is too expensive to run that often.
     let mut last_power_w: f64 = 0.0;
+    let mut last_power_source: &'static str = "estimated";
     // Tracks whether GoIdle has been called without a subsequent task --
     // resuming from idle needs the harness to re-power the chain (and
     // settle) before rtos_core.elf can accept a fresh job.
@@ -3232,11 +4093,12 @@ fn run_worker(
     // real ceiling -- see the autotune_hashrate: match arm's identical
     // reasoning for why this must not be limited to a stale manual
     // ceiling.
-    let mut temp_throttle_base_freq: [u32; 4] = if persisted_tuning.autotune_hashrate_target_ths.is_some() {
-        AUTOTUNE_ANCHORS[2].1
-    } else {
-        startup_pll_freq
-    };
+    let mut temp_throttle_base_freq: [u32; 4] =
+        if persisted_tuning.autotune_hashrate_target_ths.is_some() {
+            AUTOTUNE_ANCHORS[2].1
+        } else {
+            startup_pll_freq
+        };
     // PSU power-ceiling's own frequency floor -- see its block below for
     // the full design. Starts unrestricted (equal to the commanded
     // ceiling) and only ever tightens when voltage-only stepping has
@@ -3251,7 +4113,8 @@ fn run_worker(
     // `power_target:`/`temp_target:` command disables this in turn (see
     // those match arms) -- exactly one of {autotune, power-target +
     // temp-target} ever actively drives frequency/voltage at a time.
-    let mut autotune_hashrate_target_ths: Option<f64> = persisted_tuning.autotune_hashrate_target_ths;
+    let mut autotune_hashrate_target_ths: Option<f64> =
+        persisted_tuning.autotune_hashrate_target_ths;
     let mut autotune_level: f64 = persisted_tuning.autotune_level.unwrap_or(0.5);
     let mut next_autotune_check = std::time::Instant::now() + AUTOTUNE_CHECK_INTERVAL;
     let mut autotune_over_ticks: u32 = 0;
@@ -3261,19 +4124,27 @@ fn run_worker(
     // autotune_hashrate_target_ths are all None (startup guards above, and
     // the `auto_tune:` arm). aadhi's PSU safety trip and the 97C backstop
     // below keep running and win over it.
-    let (auto_tune_env, auto_tune_cali, auto_tune_env_from_file) = auto_tune::load_envelope_with_cali(auto_tune::CALI_PATH);
+    let (auto_tune_env, auto_tune_cali, auto_tune_env_from_file) =
+        auto_tune::load_envelope_with_cali(auto_tune::CALI_PATH);
     if auto_tune_env_from_file {
         eprintln!(
             "[nano3s] auto-tune: caps from {}: min {} mV, quiet {}W/{}C, efficient {}W/{}C, balanced {}W/{}C, max_hash {}W/{}C",
             auto_tune::CALI_PATH,
             auto_tune_env.min_voltage_mv,
-            auto_tune_env.quiet.power_w, auto_tune_env.quiet.temp_c,
-            auto_tune_env.efficient.power_w, auto_tune_env.efficient.temp_c,
-            auto_tune_env.balanced.power_w, auto_tune_env.balanced.temp_c,
-            auto_tune_env.max_hash.power_w, auto_tune_env.max_hash.temp_c,
+            auto_tune_env.quiet.power_w,
+            auto_tune_env.quiet.temp_c,
+            auto_tune_env.efficient.power_w,
+            auto_tune_env.efficient.temp_c,
+            auto_tune_env.balanced.power_w,
+            auto_tune_env.balanced.temp_c,
+            auto_tune_env.max_hash.power_w,
+            auto_tune_env.max_hash.temp_c,
         );
     } else {
-        eprintln!("[nano3s] auto-tune: {} missing/invalid, using built-in cap constants", auto_tune::CALI_PATH);
+        eprintln!(
+            "[nano3s] auto-tune: {} missing/invalid, using built-in cap constants",
+            auto_tune::CALI_PATH
+        );
     }
     let mut auto_tuner = AutoTune::with_envelope_and_cali(auto_tune_env, auto_tune_cali);
     auto_tuner.set_fan_target(persisted_tuning.auto_fan_target_c);
@@ -3312,8 +4183,21 @@ fn run_worker(
         .then(|| new_chip_tuner(auto_tuner.choice(), chip_offset_mhz));
     let mut chip_base: Option<(u32, Option<i32>)> = None;
     let mut persisted_chip_offsets = chip_offset_mhz;
-    if let Some(d) = *MANUAL_FAN_DUTY.lock().unwrap_or_else(|e| e.into_inner()) {
-        let _ = auto_tuner.set_manual_fan(Some(d));
+    {
+        let mut slot = MANUAL_FAN_DUTY.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            let (mode, duty) = fan_mode_saved();
+            if mode == "manual" {
+                *slot = duty;
+            }
+        }
+        if let Some(d) = *slot {
+            drop(slot);
+            let _ = auto_tuner.set_manual_fan(Some(d));
+            if immersion_enabled() {
+                write_harness_control("fan:manual,0");
+            }
+        }
     }
     auto_tuner.publish(None);
 
@@ -3344,38 +4228,54 @@ fn run_worker(
                 );
                 is_idle = false;
                 manual_pause = false;
-                eprintln!("[nano3s] manual RESUME via {MUJINA_CONTROL_FILE} (reapplied pll_freq={last_applied_pll_freq:?} voltage_mv={last_applied_voltage_mv:?})");
+                eprintln!(
+                    "[nano3s] manual RESUME via {MUJINA_CONTROL_FILE} (reapplied pll_freq={last_applied_pll_freq:?} voltage_mv={last_applied_voltage_mv:?})"
+                );
             }
-            Some(s) if s.starts_with("chip_offset:") => match parse_chip_offsets(&s["chip_offset:".len()..]) {
-                // All-zero only goes out if non-zero offsets went out before
-                // (older rtos_core builds abort on this message).
-                Some(o) if o != chip_offset_mhz || o.iter().any(|x| *x != 0) => {
-                    let rc = unsafe { nano3s_ipc_set_chip_pll_offset(o.as_ptr()) };
-                    if rc != 0 {
-                        eprintln!("[nano3s] nano3s_ipc_set_chip_pll_offset failed");
-                    } else {
-                        chip_offset_mhz = o;
-                        persisted_chip_offsets = o;
-                        eprintln!("[nano3s] chip offsets {o:?} (via dashboard/API)");
-                        if chip_tuner.take().is_some() {
-                            persist_chip_tune(false);
-                            persisted_tuning.chip_tune = false;
-                            auto_tuner.set_chip_status(None);
-                            eprintln!("[nano3s] per-chip tuner off (manual offsets)");
+            Some(s) if s.starts_with("chip_policy:") => {
+                persisted_tuning.chip_clock_policy =
+                    ChipClockPolicy::parse(s["chip_policy:".len()..].trim()).unwrap_or_default();
+                eprintln!(
+                    "[nano3s] chip clock policy {}",
+                    persisted_tuning.chip_clock_policy.as_conf()
+                );
+            }
+            Some(s) if s.starts_with("chip_offset:") => {
+                match parse_chip_offsets(&s["chip_offset:".len()..]) {
+                    // All-zero only goes out if non-zero offsets went out before
+                    // (older rtos_core builds abort on this message).
+                    Some(o) if o != chip_offset_mhz || o.iter().any(|x| *x != 0) => {
+                        let rc = unsafe { nano3s_ipc_set_chip_pll_offset(o.as_ptr()) };
+                        if rc != 0 {
+                            eprintln!("[nano3s] nano3s_ipc_set_chip_pll_offset failed");
+                        } else {
+                            chip_offset_mhz = o;
+                            persisted_chip_offsets = o;
+                            persisted_tuning.chip_clock_policy = load_tuning().chip_clock_policy;
+                            eprintln!("[nano3s] chip offsets {o:?} (via dashboard/API)");
+                            if chip_tuner.take().is_some() {
+                                persist_chip_tune(false);
+                                persisted_tuning.chip_tune = false;
+                                auto_tuner.set_chip_status(None);
+                                eprintln!("[nano3s] per-chip tuner off (manual offsets)");
+                            }
                         }
                     }
+                    Some(_) => {}
+                    None => eprintln!("[nano3s] malformed chip_offset directive: {s}"),
                 }
-                Some(_) => {}
-                None => eprintln!("[nano3s] malformed chip_offset directive: {s}"),
-            },
+            }
             Some(s) if s.starts_with("auto_tune:") || s.starts_with("owner_tune:") => {
-                let body = s.strip_prefix("auto_tune:").or_else(|| s.strip_prefix("owner_tune:")).unwrap_or("");
+                let body = s
+                    .strip_prefix("auto_tune:")
+                    .or_else(|| s.strip_prefix("owner_tune:"))
+                    .unwrap_or("");
                 let parsed = auto_tune::parse_auto_tune_directive(body);
                 let fan_given = parsed.as_ref().is_ok_and(|d| d.fan_target_c.is_some());
-                let is_profile_switch = parsed.as_ref().is_ok_and(|d| matches!(d.profile, Some(Some(_))));
-                if !is_profile_switch
-                    && let Ok(Some(on)) = parsed.as_ref().map(|d| d.chip_tune)
-                {
+                let is_profile_switch = parsed
+                    .as_ref()
+                    .is_ok_and(|d| matches!(d.profile, Some(Some(_))));
+                if !is_profile_switch && let Ok(Some(on)) = parsed.as_ref().map(|d| d.chip_tune) {
                     persist_chip_tune(on);
                     persisted_tuning.chip_tune = on;
                     let mut start = chip_offset_mhz;
@@ -3394,7 +4294,10 @@ fn run_worker(
                     persisted_tuning.continuous = c;
                     auto_tuner.set_continuous(c);
                     auto_tuner.publish(None);
-                    eprintln!("[nano3s] continuous tuning {}", if c { "on" } else { "off" });
+                    eprintln!(
+                        "[nano3s] continuous tuning {}",
+                        if c { "on" } else { "off" }
+                    );
                 }
                 if let Ok(d) = &parsed
                     && let Some(c) = d.fan_target_c
@@ -3430,27 +4333,50 @@ fn run_worker(
                         if !fan_given {
                             persist_auto_fan_target(None);
                         }
-                        // Profile/target switches clear all 12 per-chip offsets
-                        // and turn per-chip tuning off unless explicitly opted in.
+                        // Profile/target switches clear chip offsets unless
+                        // chip_clock_policy=keep. ChipTuner still defaults off.
+                        persisted_tuning.chip_clock_policy = load_tuning().chip_clock_policy;
+                        let clear = persisted_tuning.chip_clock_policy.clears_on_board_change();
                         if let Some(mut ct) = chip_tuner.take() {
                             ct.interrupt();
+                            if !clear {
+                                let committed = ct.committed_offsets();
+                                send_chip_offsets(
+                                    committed,
+                                    &mut chip_offset_mhz,
+                                    "profile switched, kept chip clocks",
+                                );
+                                persisted_chip_offsets = committed;
+                            }
                         }
-                        let zeros = [0i16; CHIP_COUNT];
-                        send_chip_offsets(zeros, &mut chip_offset_mhz, "profile switched");
-                        persisted_chip_offsets = zeros;
-                        let chip_on = parsed.as_ref().ok().and_then(|d| d.chip_tune).unwrap_or(false);
+                        let chip_on = parsed
+                            .as_ref()
+                            .ok()
+                            .and_then(|d| d.chip_tune)
+                            .unwrap_or(false);
                         persisted_tuning.chip_tune = chip_on;
+                        let start = if clear {
+                            let zeros = [0i16; CHIP_COUNT];
+                            send_chip_offsets(zeros, &mut chip_offset_mhz, "profile switched");
+                            persisted_chip_offsets = zeros;
+                            zeros
+                        } else {
+                            chip_offset_mhz
+                        };
                         update_tuning_conf(|cfg| {
-                            cfg.chip_offset_mhz = None;
+                            if clear {
+                                cfg.chip_offset_mhz = None;
+                            }
                             cfg.chip_tune = chip_on;
                         });
                         if chip_on {
-                            chip_tuner = Some(new_chip_tuner(Some(profile), zeros));
+                            chip_tuner = Some(new_chip_tuner(Some(profile), start));
                         } else {
                             auto_tuner.set_chip_status(None);
                         }
                         eprintln!(
-                            "[nano3s] auto-tune switch: chip offsets zeroed, per-chip tuner {}",
+                            "[nano3s] auto-tune switch: chip clocks {}, per-chip tuner {}",
+                            if clear { "cleared" } else { "kept" },
                             if chip_on { "on" } else { "off" }
                         );
                         // Keep the throttle/PSU ceilings in step with the
@@ -3469,30 +4395,45 @@ fn run_worker(
                             if last_applied_pll_freq != target_freqs {
                                 let rc = unsafe { nano3s_ipc_set_mode(target_freqs.as_ptr(), 0) };
                                 if rc != 0 {
-                                    eprintln!("[nano3s] auto-tune: re-enable nano3s_ipc_set_mode failed");
+                                    eprintln!(
+                                        "[nano3s] auto-tune: re-enable nano3s_ipc_set_mode failed"
+                                    );
                                 } else {
                                     last_applied_pll_freq = target_freqs;
                                     temp_throttle_base_freq = target_freqs;
                                     psu_ceiling_freq = target_freqs;
                                     persist_tuning_set(Some(target_freqs), None, None, None);
-                                    eprintln!("[nano3s] auto-tune: re-enable restored clock {target_freqs:?}");
+                                    eprintln!(
+                                        "[nano3s] auto-tune: re-enable restored clock {target_freqs:?}"
+                                    );
                                 }
                             }
                             if last_applied_voltage_mv != Some(target_mv) {
                                 let rc = unsafe { nano3s_ipc_set_voltage_raw(target_mv) };
                                 if rc != 0 {
-                                    eprintln!("[nano3s] auto-tune: re-enable nano3s_ipc_set_voltage_raw failed");
+                                    eprintln!(
+                                        "[nano3s] auto-tune: re-enable nano3s_ipc_set_voltage_raw failed"
+                                    );
                                 } else {
                                     last_applied_voltage_mv = Some(target_mv);
-                                    persist_tuning_set(None, Some(mem.best.core_voltage_mv as u32), None, None);
-                                    eprintln!("[nano3s] auto-tune: re-enable restored voltage {target_mv} mV");
+                                    persist_tuning_set(
+                                        None,
+                                        Some(mem.best.core_voltage_mv as u32),
+                                        None,
+                                        None,
+                                    );
+                                    eprintln!(
+                                        "[nano3s] auto-tune: re-enable restored voltage {target_mv} mV"
+                                    );
                                 }
                             }
                             auto_tuner.note_external_voltage(mem.best.core_voltage_mv);
                         }
                         auto_tuner.seed_fan_duty(read_fan_status().and_then(|f| f.percent));
                         auto_tuner.publish(None);
-                        eprintln!("[nano3s] auto-tune: enabled {profile:?} (power-target/temp-target/autotune-hashrate disabled)");
+                        eprintln!(
+                            "[nano3s] auto-tune: enabled {profile:?} (power-target/temp-target/autotune-hashrate disabled)"
+                        );
                     }
                     Ok(Some(None)) => {
                         if let Some(AutoTuneCmd::Fan(t)) = auto_tuner.disable() {
@@ -3537,7 +4478,11 @@ fn run_worker(
                     eprintln!("[nano3s] malformed tune directive (want 7 fields): {s}");
                 } else {
                     if !fields[0].is_empty() {
-                        match fields[0..4].iter().map(|f| f.parse::<u32>()).collect::<Result<Vec<u32>, _>>() {
+                        match fields[0..4]
+                            .iter()
+                            .map(|f| f.parse::<u32>())
+                            .collect::<Result<Vec<u32>, _>>()
+                        {
                             Ok(freq) => {
                                 let rc = unsafe { nano3s_ipc_set_mode(freq.as_ptr(), 0) };
                                 if rc != 0 {
@@ -3553,7 +4498,9 @@ fn run_worker(
                                     // clamps the new clock at any power (it
                                     // pulled 348 MHz back to 258 at 62 W).
                                     psu_ceiling_freq = last_applied_pll_freq;
-                                    eprintln!("[nano3s] tuning: SET_MODE pll_freq={freq:?} (via dashboard/API)");
+                                    eprintln!(
+                                        "[nano3s] tuning: SET_MODE pll_freq={freq:?} (via dashboard/API)"
+                                    );
                                 }
                             }
                             Err(_) => eprintln!("[nano3s] malformed tune frequency fields: {s}"),
@@ -3567,7 +4514,9 @@ fn run_worker(
                                     eprintln!("[nano3s] tuning: nano3s_ipc_set_voltage_raw failed");
                                 } else {
                                     last_applied_voltage_mv = Some(mv);
-                                    eprintln!("[nano3s] tuning: SET_VOLTAGE_RAW target_mv={mv} (via dashboard/API)");
+                                    eprintln!(
+                                        "[nano3s] tuning: SET_VOLTAGE_RAW target_mv={mv} (via dashboard/API)"
+                                    );
                                 }
                             }
                             Err(_) => eprintln!("[nano3s] malformed tune voltage field: {s}"),
@@ -3578,7 +4527,9 @@ fn run_worker(
                             Ok(w) => {
                                 power_target_w = Some(w);
                                 next_power_check = std::time::Instant::now();
-                                eprintln!("[nano3s] tuning: power-target set to {w:.1}W (via dashboard/API)");
+                                eprintln!(
+                                    "[nano3s] tuning: power-target set to {w:.1}W (via dashboard/API)"
+                                );
                             }
                             Err(_) => eprintln!("[nano3s] malformed tune power-target field: {s}"),
                         }
@@ -3587,7 +4538,9 @@ fn run_worker(
                         match fields[6].parse::<f64>() {
                             Ok(c) => {
                                 temp_target_c = Some(c);
-                                eprintln!("[nano3s] tuning: temp-target set to {c:.1}C (via dashboard/API)");
+                                eprintln!(
+                                    "[nano3s] tuning: temp-target set to {c:.1}C (via dashboard/API)"
+                                );
                             }
                             Err(_) => eprintln!("[nano3s] malformed tune temp-target field: {s}"),
                         }
@@ -3605,13 +4558,17 @@ fn run_worker(
                             if autotune_hashrate_target_ths.is_some() {
                                 autotune_hashrate_target_ths = None;
                                 persist_autotune_hashrate_target(None);
-                                eprintln!("[nano3s] autotune: disabled by manual power-target command");
+                                eprintln!(
+                                    "[nano3s] autotune: disabled by manual power-target command"
+                                );
                             }
                             power_target_w = Some(w);
                             // Act on the new target at the next check
                             // rather than waiting out the old interval.
                             next_power_check = std::time::Instant::now();
-                            eprintln!("[nano3s] power-target: live target set to {w:.1}W via dashboard/API");
+                            eprintln!(
+                                "[nano3s] power-target: live target set to {w:.1}W via dashboard/API"
+                            );
                             disable_auto_tune_for_manual(
                                 &mut auto_tuner,
                                 &mut chip_tuner,
@@ -3638,9 +4595,13 @@ fn run_worker(
                             psu_override_max_w = Some(w);
                             write_psu_override_w(Some(w));
                             last_pd_ceiling_logged_w = None;
-                            eprintln!("[nano3s] psu-override: manual ceiling set to {w:.1}W via dashboard/API");
+                            eprintln!(
+                                "[nano3s] psu-override: manual ceiling set to {w:.1}W via dashboard/API"
+                            );
                         }
-                        Ok(w) => eprintln!("[nano3s] invalid non-finite/non-positive psu_override directive: {w}"),
+                        Ok(w) => eprintln!(
+                            "[nano3s] invalid non-finite/non-positive psu_override directive: {w}"
+                        ),
                         Err(_) => eprintln!("[nano3s] malformed psu_override directive: {s}"),
                     }
                 }
@@ -3656,10 +4617,14 @@ fn run_worker(
                             if autotune_hashrate_target_ths.is_some() {
                                 autotune_hashrate_target_ths = None;
                                 persist_autotune_hashrate_target(None);
-                                eprintln!("[nano3s] autotune: disabled by manual temp-target command");
+                                eprintln!(
+                                    "[nano3s] autotune: disabled by manual temp-target command"
+                                );
                             }
                             temp_target_c = Some(c);
-                            eprintln!("[nano3s] temp-target: live target set to {c:.1}C via dashboard/API");
+                            eprintln!(
+                                "[nano3s] temp-target: live target set to {c:.1}C via dashboard/API"
+                            );
                             disable_auto_tune_for_manual(
                                 &mut auto_tuner,
                                 &mut chip_tuner,
@@ -3733,7 +4698,11 @@ fn run_worker(
         // Drain pending commands (non-blocking).
         loop {
             match cmd_rx.try_recv() {
-                Ok(WorkerCommand::UpdateTask { task, replace, response_tx }) => {
+                Ok(WorkerCommand::UpdateTask {
+                    task,
+                    replace,
+                    response_tx,
+                }) => {
                     if manual_pause {
                         // Stay idle -- remember the latest task to apply
                         // once a "resume" arrives. Do not touch RST/UART
@@ -3810,8 +4779,13 @@ fn run_worker(
                 None => {
                     eprintln!(
                         "[nano3s] DIAG nonce for unknown job_id=0x{:08x} nonce2=0x{:08x} nonce=0x{:08x} mid_id={} (known job_ids: {:?})",
-                        nonce.job_id, nonce.nonce2, nonce.nonce, nonce.mid_id,
-                        jobs.keys().map(|k| format!("0x{k:08x}")).collect::<Vec<_>>()
+                        nonce.job_id,
+                        nonce.nonce2,
+                        nonce.nonce,
+                        nonce.mid_id,
+                        jobs.keys()
+                            .map(|k| format!("0x{k:08x}"))
+                            .collect::<Vec<_>>()
                     );
                 }
                 Some(ctx) => {
@@ -3835,7 +4809,11 @@ fn run_worker(
         };
 
         if is_stale {
-            if !stale_fan_forced {
+            if immersion_enabled() {
+                if last_stale_warn.elapsed() >= Duration::from_secs(15) {
+                    write_harness_control("fan:manual,0");
+                }
+            } else if !stale_fan_forced {
                 stale_fan_forced = true;
                 eprintln!("[nano3s] Core 1 status absent or stale: forcing fan to 100%");
                 write_harness_control("fan:manual,100");
@@ -3893,7 +4871,11 @@ fn run_worker(
         if unsafe { nano3s_ipc_get_status(&mut st as *mut _) } == 1 {
             let mut s = status.lock().unwrap();
             s.hashrate = HashRate::from_gigahashes(st.ghsmm as f64);
-            s.temperature_c = if st.temp_avg > 0.0 { Some(st.temp_avg) } else { None };
+            s.temperature_c = if st.temp_avg > 0.0 {
+                Some(st.temp_avg)
+            } else {
+                None
+            };
             s.is_active = current_task.is_some() && st.paused == 0;
             drop(s);
 
@@ -3903,13 +4885,19 @@ fn run_worker(
             // shares-based statistical estimator.
             let _ = event_tx.try_send(HashThreadEvent::StatusUpdate(HashThreadStatus {
                 hashrate: HashRate::from_gigahashes(st.ghsmm as f64),
-                temperature_c: if st.temp_avg > 0.0 { Some(st.temp_avg) } else { None },
+                temperature_c: if st.temp_avg > 0.0 {
+                    Some(st.temp_avg)
+                } else {
+                    None
+                },
                 is_active: current_task.is_some() && st.paused == 0,
                 ..Default::default()
             }));
 
-            let (last_bus_v, last_current_a, power_w) = read_power_estimate();
+            let (last_bus_v, last_current_a, power_w, source) = board_power_reading(&st);
             last_power_w = power_w;
+            last_power_source = source;
+            let sensor_ok = source == "measured";
 
             // Power-target voltage loop -- see POWER_TARGET_STEP_MV's doc
             // comment. Safety check runs on every status refresh (~15s);
@@ -3921,22 +4909,15 @@ fn run_worker(
             // PSU_CONF_PATH when auto-detection is unavailable/wrong.
             // Only ever tightens the existing POWER_TARGET_SAFETY_W
             // trip, never loosens it.
-            let (tuner_power_ceiling_w, effective_safety_w) = if let Some(override_w) = psu_override_max_w {
-                // The override is the user's chosen board ceiling: the tuner may
-                // use all of it (a power target holds its mean 1-3 % under).
-                // Hard safety trip sits 3 % above the user setting (144.2 W at 140 W)
-                // so normal instantaneous switching ripples don't trip an emergency backoff.
-                let ceiling = (override_w as f32).clamp(40.0, 140.0);
-                let safety = (override_w * 1.03).clamp(40.0, 150.0);
-                (ceiling, safety)
-            } else {
-                let pd_contract = pd_ceiling_w_for_voltage(last_bus_v);
-                let safety = POWER_TARGET_SAFETY_W.min(pd_contract - PD_CEILING_MARGIN_W);
-                let ceiling = auto_tune::auto_tune_power_ceiling(pd_contract, safety);
-                (ceiling, safety)
-            };
-            let pd_ceiling_w = psu_override_max_w
-                .unwrap_or_else(|| pd_ceiling_w_for_voltage(last_bus_v));
+            let bypass = psu_bypass_enabled();
+            let (tuner_power_ceiling_w, effective_safety_w) =
+                power_limits(bypass, psu_override_max_w, last_bus_v);
+            if bypass {
+                // Drop a ceiling left over from before the toggle was turned on.
+                psu_ceiling_freq = temp_throttle_base_freq;
+            }
+            let pd_ceiling_w =
+                psu_override_max_w.unwrap_or_else(|| pd_ceiling_w_for_voltage(last_bus_v));
             if pd_ceiling_w.is_finite()
                 && last_pd_ceiling_logged_w != Some(pd_ceiling_w)
                 && pd_ceiling_w - PD_CEILING_MARGIN_W < POWER_TARGET_SAFETY_W
@@ -3959,7 +4940,11 @@ fn run_worker(
             // via IPC, and this one writes voltage through a different
             // path (write_tuning_command's control-file round-trip)
             // that would otherwise race it.
-            if power_target_w.is_none() && autotune_hashrate_target_ths.is_none() && power_w > effective_safety_w {
+            if power_target_w.is_none()
+                && autotune_hashrate_target_ths.is_none()
+                && sensor_ok
+                && power_w > effective_safety_w
+            {
                 let cur_mv = st.voltage_mv as i32;
                 let mut new_mv = cur_mv - POWER_TARGET_STEP_MV;
                 if new_mv == POWER_TARGET_AVOID_MV {
@@ -3973,7 +4958,9 @@ fn run_worker(
                 // by the tuner envelope max instead, and never above the
                 // current voltage.
                 let floor = POWER_TARGET_MIN_MV.min(cur_mv);
-                new_mv = new_mv.max(floor).min(auto_tune::NANO3S_ENVELOPE.max_voltage_mv as i32);
+                new_mv = new_mv
+                    .max(floor)
+                    .min(auto_tune::NANO3S_ENVELOPE.max_voltage_mv as i32);
                 if new_mv != cur_mv {
                     eprintln!(
                         "[nano3s] PSU safety trip: power={power_w:.1}W exceeds ceiling={effective_safety_w:.1}W (no power-target configured) cur={cur_mv}mV -> {new_mv}mV"
@@ -3986,14 +4973,18 @@ fn run_worker(
                         if new_mv < cur_mv {
                             let rc = unsafe { nano3s_ipc_set_voltage_raw(new_mv) };
                             if rc != 0 {
-                                eprintln!("[nano3s] PSU safety trip: nano3s_ipc_set_voltage_raw failed");
+                                eprintln!(
+                                    "[nano3s] PSU safety trip: nano3s_ipc_set_voltage_raw failed"
+                                );
                             } else {
                                 last_applied_voltage_mv = Some(new_mv);
                                 persist_tuning_set(None, Some(new_mv as u32), None, None);
                                 auto_tuner.note_external_voltage(new_mv as u16);
                             }
                         }
-                    } else if let Err(e) = write_tuning_command(None, Some(new_mv as u32), None, None) {
+                    } else if let Err(e) =
+                        write_tuning_command(None, Some(new_mv as u32), None, None)
+                    {
                         eprintln!("[nano3s] PSU safety trip: failed to write tuning command: {e}");
                     }
                 }
@@ -4003,9 +4994,12 @@ fn run_worker(
                 let cur_mv = st.voltage_mv as i32;
                 let now = std::time::Instant::now();
 
-                let step = if power_w > effective_safety_w {
+                let step = if !sensor_ok {
+                    // A missing meter used to look like 0 W and disable the trip.
+                    None
+                } else if power_w > effective_safety_w {
                     // Hard safety trip -- always allowed, ignores the
-                    // interval gate.
+                    // interval gate. PSU bypass does not skip this.
                     Some(-POWER_TARGET_STEP_MV)
                 } else if now >= next_power_check {
                     if power_w < target_w - POWER_TARGET_DEADBAND_W {
@@ -4030,7 +5024,8 @@ fn run_worker(
                         eprintln!(
                             "[nano3s] power-target: power={power_w:.1}W target={target_w:.1}W cur={cur_mv}mV -> {new_mv}mV"
                         );
-                        if let Err(e) = write_tuning_command(None, Some(new_mv as u32), None, None) {
+                        if let Err(e) = write_tuning_command(None, Some(new_mv as u32), None, None)
+                        {
                             eprintln!("[nano3s] power-target: failed to write tuning command: {e}");
                         }
                     }
@@ -4080,8 +5075,10 @@ fn run_worker(
                                 // is only possible once psu_ceiling_freq
                                 // itself has recovered that far (see that
                                 // block's own stepping).
-                                let ceiling = temp_throttle_base_freq[i].min(psu_ceiling_freq[i]) as i32;
-                                new_freq[i] = candidate.clamp(TEMP_TARGET_MIN_MHZ as i32, ceiling) as u32;
+                                let ceiling =
+                                    temp_throttle_base_freq[i].min(psu_ceiling_freq[i]) as i32;
+                                new_freq[i] =
+                                    candidate.clamp(TEMP_TARGET_MIN_MHZ as i32, ceiling) as u32;
                             }
                             if new_freq != last_applied_pll_freq {
                                 eprintln!(
@@ -4111,19 +5108,23 @@ fn run_worker(
             // thrashing frequency instead of settling.
             let voltage_at_floor = (st.voltage_mv as i32) <= POWER_TARGET_MIN_MV;
             let psu_freq_now = std::time::Instant::now();
-            if psu_freq_now >= next_psu_freq_check {
-                if voltage_at_floor && power_w > effective_safety_w {
+            if !bypass && psu_freq_now >= next_psu_freq_check {
+                if sensor_ok && voltage_at_floor && power_w > effective_safety_w {
                     for i in 0..4 {
                         let candidate = psu_ceiling_freq[i] as i32 - TEMP_TARGET_STEP_MHZ;
-                        psu_ceiling_freq[i] =
-                            candidate.clamp(TEMP_TARGET_MIN_MHZ as i32, temp_throttle_base_freq[i] as i32) as u32;
+                        psu_ceiling_freq[i] = candidate.clamp(
+                            TEMP_TARGET_MIN_MHZ as i32,
+                            temp_throttle_base_freq[i] as i32,
+                        ) as u32;
                     }
                     next_psu_freq_check = psu_freq_now + PSU_FREQ_CHECK_INTERVAL;
-                } else if power_w < effective_safety_w - POWER_TARGET_DEADBAND_W {
+                } else if sensor_ok && power_w < effective_safety_w - POWER_TARGET_DEADBAND_W {
                     for i in 0..4 {
                         let candidate = psu_ceiling_freq[i] as i32 + TEMP_TARGET_STEP_MHZ;
-                        psu_ceiling_freq[i] =
-                            candidate.clamp(TEMP_TARGET_MIN_MHZ as i32, temp_throttle_base_freq[i] as i32) as u32;
+                        psu_ceiling_freq[i] = candidate.clamp(
+                            TEMP_TARGET_MIN_MHZ as i32,
+                            temp_throttle_base_freq[i] as i32,
+                        ) as u32;
                     }
                     next_psu_freq_check = psu_freq_now + PSU_FREQ_CHECK_INTERVAL;
                 }
@@ -4160,7 +5161,7 @@ fn run_worker(
 
                 let forced_down = if now < next_autotune_forced_check {
                     false
-                } else if power_w > effective_safety_w {
+                } else if sensor_ok && power_w > effective_safety_w {
                     autotune_level = (autotune_level - AUTOTUNE_LEVEL_STEP).max(0.0);
                     eprintln!(
                         "[nano3s] autotune: power={power_w:.1}W exceeds {effective_safety_w:.1}W ceiling -- level -> {autotune_level:.2}"
@@ -4183,7 +5184,8 @@ fn run_worker(
                 } else if now >= next_autotune_check {
                     let current_ths = st.ghsmm as f64 / 1000.0;
                     if current_ths < target_ths - AUTOTUNE_HASHRATE_DEADBAND_THS {
-                        autotune_level = (autotune_level + AUTOTUNE_LEVEL_STEP).min(AUTOTUNE_LEVEL_MAX);
+                        autotune_level =
+                            (autotune_level + AUTOTUNE_LEVEL_STEP).min(AUTOTUNE_LEVEL_MAX);
                         autotune_over_ticks = 0;
                         eprintln!(
                             "[nano3s] autotune: hashrate={current_ths:.2}TH/s under target={target_ths:.2}TH/s -- level -> {autotune_level:.2}"
@@ -4268,7 +5270,11 @@ fn run_worker(
             // instead of fighting it.
             if auto_tuner.is_enabled() {
                 auto_tuner.set_power_ceiling(tuner_power_ceiling_w);
-                auto_tuner.set_power_safety(psu_override_max_w.map(|_| effective_safety_w as f32));
+                auto_tuner.set_power_safety(if bypass {
+                    None
+                } else {
+                    psu_override_max_w.map(|_| effective_safety_w as f32)
+                });
                 if auto_tuner.tick_due(std::time::Instant::now()) && status_age_ms <= 60_000 {
                     if !is_idle && !manual_pause && current_task.is_some() && st.paused != 0 {
                         consecutive_paused_ticks += 1;
@@ -4280,7 +5286,8 @@ fn run_worker(
                             resume_from_idle();
                         } else if consecutive_paused_ticks >= 20 {
                             if std::time::Instant::now() >= next_recovery_attempt {
-                                next_recovery_attempt = std::time::Instant::now() + Duration::from_secs(60);
+                                next_recovery_attempt =
+                                    std::time::Instant::now() + Duration::from_secs(60);
                                 eprintln!(
                                     "[nano3s] Core 1 permanently stuck paused ({} ticks, ~5 min) -- escalating to recovery reboot",
                                     consecutive_paused_ticks
@@ -4292,8 +5299,12 @@ fn run_worker(
                         consecutive_paused_ticks = 0;
                     }
 
-                    let volt_now = last_applied_voltage_mv.map(|v| v.max(0) as u32).unwrap_or(st.voltage_mv);
-                    let cmds: Vec<AutoTuneCmd> = if (st.temp_max as f64) >= auto_tune::BACKSTOP_TEMP_C {
+                    let volt_now = last_applied_voltage_mv
+                        .map(|v| v.max(0) as u32)
+                        .unwrap_or(st.voltage_mv);
+                    let cmds: Vec<AutoTuneCmd> = if (st.temp_max as f64)
+                        >= auto_tune::BACKSTOP_TEMP_C
+                    {
                         let f = auto_tune::backstop_freqs(last_applied_pll_freq);
                         eprintln!(
                             "[nano3s] auto-tune: {:.1}C backstop ({:.0}C) -- emergency clock drop {last_applied_pll_freq:?} -> {f:?}",
@@ -4301,7 +5312,10 @@ fn run_worker(
                             auto_tune::BACKSTOP_TEMP_C
                         );
                         vec![AutoTuneCmd::SetMode(f)]
-                    } else if !is_idle && !manual_pause && st.paused == 0 && current_task.is_some()
+                    } else if !is_idle
+                        && !manual_pause
+                        && st.paused == 0
+                        && current_task.is_some()
                         && let Some(m) = auto_tune::metrics_from_readings(
                             st.temp_max,
                             power_w,
@@ -4319,9 +5333,19 @@ fn run_worker(
                     // tuner had no metrics (missing temp -> 100 %). It is the
                     // only source of fan writes, so at most one per tick.
                     let mut cmds = cmds;
-                    sync_manual_fan_with_tuner(&mut auto_tuner);
-                    let fan_temp = Some(st.temp_max).filter(|t| *t > 0.0);
-                    cmds.extend(auto_tuner.fan_tick(fan_temp));
+                    if immersion_enabled() {
+                        // Fans stay at 0. Temperature backstop above still runs.
+                        write_harness_control("fan:manual,0");
+                    } else {
+                        sync_manual_fan_with_tuner(&mut auto_tuner);
+                        let samples: Vec<f32> = st.chips.iter().take(CHIP_COUNT).map(|c| c.temp_c).collect();
+                        let fan_temp = auto_tune::control_temp_c(&samples);
+                        let floor = fan_temp
+                            .map(|t| auto_tune::fan_curve_floor_percent(t, &read_fan_curve()))
+                            .unwrap_or(20);
+                        auto_tuner.set_fan_floor(floor);
+                        cmds.extend(auto_tuner.fan_tick(fan_temp));
+                    }
                     for cmd in cmds {
                         match cmd {
                             AutoTuneCmd::SetMode(f) => {
@@ -4341,7 +5365,9 @@ fn run_worker(
                             AutoTuneCmd::SetVoltage(mv) => {
                                 let rc = unsafe { nano3s_ipc_set_voltage_raw(mv) };
                                 if rc != 0 {
-                                    eprintln!("[nano3s] auto-tune: nano3s_ipc_set_voltage_raw failed");
+                                    eprintln!(
+                                        "[nano3s] auto-tune: nano3s_ipc_set_voltage_raw failed"
+                                    );
                                 } else {
                                     eprintln!("[nano3s] auto-tune: SET_VOLTAGE_RAW target_mv={mv}");
                                     last_applied_voltage_mv = Some(mv);
@@ -4353,14 +5379,27 @@ fn run_worker(
                                 write_harness_control(t);
                             }
                             AutoTuneCmd::FanManual(d) => {
-                                eprintln!("[nano3s] auto-tune: fan:manual,{d} (temp_max {:.1}C)", st.temp_max);
+                                eprintln!(
+                                    "[nano3s] fan manual {d}% (temp_max {:.1}C)",
+                                    st.temp_max
+                                );
                                 write_harness_control(&format!("fan:manual,{d}"));
                             }
+                            AutoTuneCmd::FanTarget(c) => {
+                                eprintln!(
+                                    "[nano3s] auto-tune: fan_chip_temp_target {c:.1}C (curve and escalation stay on)"
+                                );
+                                write_harness_control(&format!("fan_chip_temp_target:{c}"));
+                            }
                             AutoTuneCmd::ReinitChain => {
-                                eprintln!("[nano3s] auto-tune: chain re-init requested (stalled hashrate)");
+                                eprintln!(
+                                    "[nano3s] auto-tune: chain re-init requested (stalled hashrate)"
+                                );
                                 let rc = unsafe { nano3s_ipc_pause() };
                                 if rc != 0 {
-                                    eprintln!("[nano3s] auto-tune: pre-reinit nano3s_ipc_pause failed");
+                                    eprintln!(
+                                        "[nano3s] auto-tune: pre-reinit nano3s_ipc_pause failed"
+                                    );
                                 }
                                 write_harness_control("pause");
                                 std::thread::sleep(Duration::from_secs(2));
@@ -4379,15 +5418,20 @@ fn run_worker(
                                             current_job_id = Some(job_id);
                                         }
                                         Ok(None) => {}
-                                        Err(e) => eprintln!("[nano3s] auto-tune: post-reinit send_task_to_chain failed: {e}"),
+                                        Err(e) => eprintln!(
+                                            "[nano3s] auto-tune: post-reinit send_task_to_chain failed: {e}"
+                                        ),
                                     }
                                 }
                                 eprintln!("[nano3s] auto-tune: chain re-init complete");
                             }
                             AutoTuneCmd::RebootRecovery => {
                                 if std::time::Instant::now() >= next_recovery_attempt {
-                                    next_recovery_attempt = std::time::Instant::now() + Duration::from_secs(60);
-                                    eprintln!("[nano3s] auto-tune: unrecoverable warmup stall -- escalating to recovery reboot");
+                                    next_recovery_attempt =
+                                        std::time::Instant::now() + Duration::from_secs(60);
+                                    eprintln!(
+                                        "[nano3s] auto-tune: unrecoverable warmup stall -- escalating to recovery reboot"
+                                    );
                                     request_recovery_reboot("warmup_stall_unresolved");
                                 }
                             }
@@ -4400,9 +5444,14 @@ fn run_worker(
                     // all the time with continuous tuning on (Grant: continuous
                     // means "find the best per chip"). A tuner step that moves
                     // the base point interrupts the trial (chip_base below).
-                    let chip_tune_allowed = auto_tuner.is_locked() || (auto_tuner.is_enabled() && persisted_tuning.continuous);
+                    let chip_tune_allowed = auto_tuner.is_locked()
+                        || (auto_tuner.is_enabled() && persisted_tuning.continuous);
                     if chip_tuner.is_none() && chip_tune_allowed && persisted_tuning.chip_tune {
-                        eprintln!("[nano3s] auto-engaging per-chip tuner (locked={} continuous={})", auto_tuner.is_locked(), persisted_tuning.continuous);
+                        eprintln!(
+                            "[nano3s] auto-engaging per-chip tuner (locked={} continuous={})",
+                            auto_tuner.is_locked(),
+                            persisted_tuning.continuous
+                        );
                         chip_tuner = Some(new_chip_tuner(auto_tuner.choice(), chip_offset_mhz));
                     }
 
@@ -4421,6 +5470,7 @@ fn run_worker(
                             let mut m = ChipMetrics {
                                 chip_ghs: [0.0; CHIP_COUNT],
                                 chip_fail_pct: [0.0; CHIP_COUNT],
+                                chip_temp_c: [-273.0; CHIP_COUNT],
                                 board_ths: st.ghsspd as f32 / 1000.0,
                                 board_w: power_w as f32,
                                 temp_max_c: st.temp_max,
@@ -4428,6 +5478,7 @@ fn run_worker(
                             for (i, c) in st.chips.iter().take(CHIP_COUNT).enumerate() {
                                 m.chip_ghs[i] = c.ghsspd;
                                 m.chip_fail_pct[i] = c.spd_dh;
+                                m.chip_temp_c[i] = c.temp_c;
                             }
                             ct.tick(&m);
                         }
@@ -4463,10 +5514,13 @@ fn run_worker(
                     }
                     auto_tuner.publish(Some(TuneSetpoint {
                         frequency_mhz: last_applied_pll_freq[0] as f32,
-                        core_voltage_mv: last_applied_voltage_mv.unwrap_or(st.voltage_mv as i32).max(0) as u16,
+                        core_voltage_mv: last_applied_voltage_mv
+                            .unwrap_or(st.voltage_mv as i32)
+                            .max(0) as u16,
                     }));
                     let mem = auto_tuner.profile().zip(auto_tuner.memory());
-                    if mem != last_auto_memory && (mem.is_some() || auto_tuner.profile().is_some()) {
+                    if mem != last_auto_memory && (mem.is_some() || auto_tuner.profile().is_some())
+                    {
                         persist_auto_memory(mem);
                         last_auto_memory = mem;
                     }
@@ -4481,7 +5535,7 @@ fn run_worker(
             telemetry_tx.send_modify(|t| {
                 t.threads = vec![ThreadTelemetry {
                     name: "chain".into(),
-                    hashrate: (st.ghsmm as u64).saturating_mul(1_000_000_000),
+                    hashrate: (st.ghsspd as u64).saturating_mul(1_000_000_000),
                     is_active: current_task.is_some() && st.paused == 0,
                 }];
                 t.temperatures = vec![
@@ -4513,6 +5567,7 @@ fn run_worker(
                         } else {
                             None
                         },
+                        source: Some(last_power_source.to_string()),
                     },
                     // Real USB-C PD input rail (INA226 bus voltage) --
                     // distinct from "core" above, whose voltage_v is the
@@ -4522,7 +5577,11 @@ fn run_worker(
                     // voltage is used to classify the PD contract.
                     PowerMeasurement {
                         name: "input".into(),
-                        voltage_v: if last_bus_v > 0.0 { Some(last_bus_v as f32) } else { None },
+                        voltage_v: if last_bus_v > 0.0 {
+                            Some(last_bus_v as f32)
+                        } else {
+                            None
+                        },
                         current_a: if last_current_a > 0.0 {
                             Some(last_current_a as f32)
                         } else {
@@ -4533,6 +5592,7 @@ fn run_worker(
                         } else {
                             None
                         },
+                        source: Some(last_power_source.to_string()),
                     },
                 ];
                 t.fans = read_fan_status().into_iter().collect();
@@ -4557,6 +5617,10 @@ fn run_worker(
                         nonce_data: c.nonce_data,
                         ghsspd: c.ghsspd,
                         spd_dh: c.spd_dh,
+                        pll_lock: c.pll_lock,
+                        enum_ok: c.enum_ok,
+                        enum_id: c.enum_id,
+                        reinit: c.reinit,
                     }
                 })
                 .collect();
@@ -4572,6 +5636,7 @@ fn run_worker(
                 pll_freq_commanded: st.pll_freq,
                 voltage_mv_commanded: st.voltage_mv,
                 chip_offset_mhz,
+                chip_clock_policy: persisted_tuning.chip_clock_policy.as_conf().to_owned(),
                 err_crc: st.err_crc,
                 nonce_read_err: st.nonce_read_err,
                 nonce_bad_len: st.nonce_bad_len,
@@ -4592,7 +5657,15 @@ fn run_worker(
                 *d = Some(detail);
             }
         }
-        write_live_status(ipc_ok, current_job_id, shares_found, is_idle, &st, last_power_w, current_difficulty);
+        write_live_status(
+            ipc_ok,
+            current_job_id,
+            shares_found,
+            is_idle,
+            &st,
+            last_power_w,
+            current_difficulty,
+        );
 
         {
             let ov = *LED_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner());
@@ -4610,7 +5683,9 @@ fn run_worker(
                     });
                 }
                 LedEffect::Off => led.off(),
-                LedEffect::Solid => led.set_all(scale_color(ov.color, ov.brightness as f32 / 255.0)),
+                LedEffect::Solid => {
+                    led.set_all(scale_color(ov.color, ov.brightness as f32 / 255.0))
+                }
                 _ => led.set(anim.frame(ov)),
             }
         }
@@ -4630,12 +5705,28 @@ mod tests {
             // (en2_size, expected_coinbase_len, nonce2, en2_high, expected_en2_bytes)
             (3, 42 + 0 + 3 + 42, 0x123456, 0, &[0x56, 0x34, 0x12]),
             (4, 42 + 4 + 4 + 42, 0x12345678, 0, &[0x78, 0x56, 0x34, 0x12]),
-            (6, 42 + 0 + 6 + 42, 0x12345678, 0x00000001, &[0x78, 0x56, 0x34, 0x12, 0x01, 0x00]),
-            (8, 42 + 4 + 8 + 42, 0x12345678, 0x9abcdef0, &[0x78, 0x56, 0x34, 0x12, 0xf0, 0xde, 0xbc, 0x9a]),
+            (
+                6,
+                42 + 0 + 6 + 42,
+                0x12345678,
+                0x00000001,
+                &[0x78, 0x56, 0x34, 0x12, 0x01, 0x00],
+            ),
+            (
+                8,
+                42 + 4 + 8 + 42,
+                0x12345678,
+                0x9abcdef0,
+                &[0x78, 0x56, 0x34, 0x12, 0xf0, 0xde, 0xbc, 0x9a],
+            ),
         ];
 
         for &(en2_size, exp_len, nonce2, en2_high, exp_bytes) in cases {
-            let en1 = if en2_size == 3 || en2_size == 6 { vec![] } else { vec![0xaa, 0xbb, 0xcc, 0xdd] };
+            let en1 = if en2_size == 3 || en2_size == 6 {
+                vec![]
+            } else {
+                vec![0xaa, 0xbb, 0xcc, 0xdd]
+            };
             let ctx = JobContext {
                 version_base: bitcoin::block::Version::from_consensus(0x20000000),
                 prev_blockhash: bitcoin::BlockHash::all_zeros(),
@@ -4660,10 +5751,13 @@ mod tests {
             let (share, _passed) = verify_and_build_share(&ctx, nonce2, 0x99999999, 0);
             let share_en2 = share.extranonce2.expect("share must have extranonce2");
             assert_eq!(share_en2.size(), en2_size, "extranonce2 size mismatch");
-            assert_eq!(Vec::<u8>::from(share_en2), exp_bytes, "serialized bytes mismatch");
+            assert_eq!(
+                Vec::<u8>::from(share_en2),
+                exp_bytes,
+                "serialized bytes mismatch"
+            );
         }
     }
-
 
     #[test]
     fn led_effect_parse_and_as_str_roundtrip() {
@@ -4808,7 +5902,7 @@ mod tests {
         // Frame 0: at pos 0, dir +1 -> Head is at 0, ahead LEDs are dark
         let f0 = anim.frame(ov);
         assert_eq!(f0[0].0, 255); // Head at 100%
-        assert_eq!(f0[1].0, 0);   // Ahead is dark
+        assert_eq!(f0[1].0, 0); // Ahead is dark
         assert_eq!(f0[8].0, 0);
 
         // Advance to pos 2 moving right (dir +1):
@@ -4818,7 +5912,7 @@ mod tests {
         let f2 = anim.frame(ov);
         assert_eq!(f2[2].0, 255); // Head
         assert!(f2[1].0 >= 100 && f2[1].0 <= 130); // Tail 1 (45% of 255 = 114)
-        assert!(f2[0].0 >= 35 && f2[0].0 <= 55);   // Tail 2 (18% of 255 = 45)
+        assert!(f2[0].0 >= 35 && f2[0].0 <= 55); // Tail 2 (18% of 255 = 45)
         for i in 3..WS2812_LED_COUNT {
             assert_eq!(f2[i].0, 0, "Ahead LED {i} must be dark");
         }
@@ -4830,7 +5924,7 @@ mod tests {
         let f6 = anim.frame(ov);
         assert_eq!(f6[6].0, 255); // Head
         assert!(f6[7].0 >= 100 && f6[7].0 <= 130); // Tail 1 behind head
-        assert!(f6[8].0 >= 35 && f6[8].0 <= 55);   // Tail 2 behind head
+        assert!(f6[8].0 >= 35 && f6[8].0 <= 55); // Tail 2 behind head
         for i in 0..6 {
             assert_eq!(f6[i].0, 0, "Ahead LED {i} must be dark");
         }
@@ -4873,7 +5967,11 @@ mod tests {
         }
 
         // Rainbow spectrum across the strip: pixel 0 (hue ~0, red) vs pixel 4 (hue ~160, cyan/green)
-        assert!(f4[4].1 > f4[4].0, "LED 4 should be green/cyan-dominant, got {:?}", f4[4]);
+        assert!(
+            f4[4].1 > f4[4].0,
+            "LED 4 should be green/cyan-dominant, got {:?}",
+            f4[4]
+        );
 
         // Reaching end of strip reverses direction cleanly
         anim.scanner_pos = (WS2812_LED_COUNT - 1) as f32;
@@ -4899,14 +5997,18 @@ mod tests {
             brightness: 200,
             speed: 42,
         };
-        write_led_conf_to(&path, &custom);
+        write_led_conf_to(&path, &custom).unwrap();
 
         let loaded = load_led_conf_from(&path);
         assert_eq!(loaded, custom);
 
         // Corrupted / partial content ignores invalid lines and keeps defaults
         let corrupt_path = tmp_dir.join("corrupt_led.conf");
-        std::fs::write(&corrupt_path, "effect=invalid_junk\ncolor=#bad\nbrightness=999\nspeed=77\n").unwrap();
+        std::fs::write(
+            &corrupt_path,
+            "effect=invalid_junk\ncolor=#bad\nbrightness=999\nspeed=77\n",
+        )
+        .unwrap();
         let loaded_corrupt = load_led_conf_from(&corrupt_path);
         assert_eq!(loaded_corrupt.effect, LedEffect::Auto);
         assert_eq!(loaded_corrupt.color, (255, 0, 0));
@@ -4920,12 +6022,16 @@ mod tests {
 
     #[test]
     fn tuning_conf_persistence_roundtrip_and_target_memory() {
-        let tmp_dir = std::env::temp_dir().join(format!("nano3s_tuning_test_{}", std::process::id()));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("nano3s_tuning_test_{}", std::process::id()));
         let path = tmp_dir.join("tuning.conf");
         let _ = std::fs::remove_file(&path);
 
         let mem = SearchMemory {
-            best: TuneSetpoint { frequency_mhz: 480.0, core_voltage_mv: 3828 },
+            best: TuneSetpoint {
+                frequency_mhz: 480.0,
+                core_voltage_mv: 3828,
+            },
             best_hashrate_ths: 6.12,
             best_j_th: 22.7,
             probe_floor_mv: 3780,
@@ -4941,7 +6047,10 @@ mod tests {
         };
         write_tuning_conf_to(&path, &cfg);
         let loaded = load_tuning_from(&path);
-        assert_eq!(loaded.auto_tune_profile, Some(TuneChoice::Target(TuneTarget::Power(140.0))));
+        assert_eq!(
+            loaded.auto_tune_profile,
+            Some(TuneChoice::Target(TuneTarget::Power(140.0)))
+        );
         assert!(loaded.chip_tune);
         let (mt, loaded_mem) = loaded.target_memory.expect("target_memory roundtrip");
         assert!(auto_tune::targets_match(mt, TuneTarget::Power(140.0)));
@@ -4983,7 +6092,10 @@ mod tests {
         let parsed = auto_tune::parse_auto_tune_directive(line.strip_prefix("auto_tune:").unwrap())
             .expect("valid directive");
         apply_auto_tune_directive_to_conf(&mut cfg, &parsed);
-        assert_eq!(cfg.auto_tune_profile, Some(TuneChoice::Profile(TuneProfile::MaxHash)));
+        assert_eq!(
+            cfg.auto_tune_profile,
+            Some(TuneChoice::Profile(TuneProfile::MaxHash))
+        );
         assert!(!cfg.chip_tune);
         assert_eq!(cfg.chip_offset_mhz, None);
 
@@ -5010,7 +6122,10 @@ mod tests {
             auto_tune::parse_auto_tune_directive(target_line.strip_prefix("auto_tune:").unwrap())
                 .expect("valid target directive");
         apply_auto_tune_directive_to_conf(&mut cfg, &parsed_target);
-        assert_eq!(cfg.auto_tune_profile, Some(TuneChoice::Target(TuneTarget::Power(140.0))));
+        assert_eq!(
+            cfg.auto_tune_profile,
+            Some(TuneChoice::Target(TuneTarget::Power(140.0)))
+        );
         assert!(!cfg.chip_tune);
         assert_eq!(cfg.chip_offset_mhz, None);
 
@@ -5028,4 +6143,57 @@ mod tests {
         assert!(!cfg.chip_tune);
         assert_eq!(cfg.chip_offset_mhz, None);
     }
+
+    #[test]
+    fn keep_policy_retains_manual_offsets_across_a_profile_switch() {
+        let mut cfg = PersistedTuning {
+            auto_tune_profile: Some(TuneChoice::Profile(TuneProfile::Balanced)),
+            chip_tune: true,
+            chip_offset_mhz: Some([-40; CHIP_COUNT]),
+            chip_clock_policy: ChipClockPolicy::Keep,
+            ..Default::default()
+        };
+        let line = build_auto_tune_directive(
+            Some(Some(TuneChoice::Profile(TuneProfile::Efficient))),
+            None,
+            None,
+            None,
+        );
+        let parsed = auto_tune::parse_auto_tune_directive(line.strip_prefix("auto_tune:").unwrap())
+            .expect("valid directive");
+        apply_auto_tune_directive_to_conf(&mut cfg, &parsed);
+        assert_eq!(cfg.chip_offset_mhz, Some([-40; CHIP_COUNT]));
+        assert!(!cfg.chip_tune);
+
+        let off = build_auto_tune_directive(Some(None), None, None, None);
+        let parsed_off =
+            auto_tune::parse_auto_tune_directive(off.strip_prefix("auto_tune:").unwrap()).unwrap();
+        apply_auto_tune_directive_to_conf(&mut cfg, &parsed_off);
+        assert_eq!(cfg.chip_offset_mhz, Some([-40; CHIP_COUNT]));
+        assert_eq!(cfg.chip_clock_policy, ChipClockPolicy::Keep);
+
+        let path = std::env::temp_dir().join(format!("nano3s_policy_{}", std::process::id()));
+        write_tuning_conf_to(&path, &cfg);
+        let loaded = load_tuning_from(&path);
+        assert_eq!(loaded.chip_clock_policy, ChipClockPolicy::Keep);
+        assert_eq!(loaded.chip_offset_mhz, Some([-40; CHIP_COUNT]));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("chip_clock_policy=keep"));
+        let _ = std::fs::remove_file(&path);
+
+        // The default policy still omits the key.
+        let mut cleared = cfg.clone();
+        cleared.chip_clock_policy = ChipClockPolicy::Clear;
+        let path2 =
+            std::env::temp_dir().join(format!("nano3s_policy_clear_{}", std::process::id()));
+        write_tuning_conf_to(&path2, &cleared);
+        let text = std::fs::read_to_string(&path2).unwrap();
+        assert!(!text.contains("chip_clock_policy"));
+        assert_eq!(
+            load_tuning_from(&path2).chip_clock_policy,
+            ChipClockPolicy::Clear
+        );
+        let _ = std::fs::remove_file(&path2);
+    }
 }
+

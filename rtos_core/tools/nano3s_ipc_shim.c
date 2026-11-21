@@ -122,6 +122,10 @@ static void handle_ipc_message(k_s32 s32Id, k_ipcmsg_message_t *msg)
 			out.chips[i].nonce_data = st.chips[i].nonce_data;
 			out.chips[i].ghsspd = st.chips[i].ghsspd;
 			out.chips[i].spd_dh = st.chips[i].spd_dh;
+			out.chips[i].pll_lock = st.chips[i].pll_lock;
+			out.chips[i].enum_ok = st.chips[i].enum_ok;
+			out.chips[i].enum_id = st.chips[i].enum_id;
+			out.chips[i].reinit = st.chips[i].reinit;
 		}
 
 		pthread_mutex_lock(&g_lock);
