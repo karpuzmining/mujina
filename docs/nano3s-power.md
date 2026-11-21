@@ -18,7 +18,7 @@ The PD controller is a separate chip at `0x42` on the same bus. Canaan's
 `pd_pout_limit` writes register `0x02` = `0x1B` once, before GPIO34
 enables the hashboard rail, and then reads source capabilities at
 `0x6A`–`0x6F`. This miner does only that one write. It does not read
-`0x01` and it does not shell out to `i2cget`. `MUJINA_NANO3S_I2C2=off`
+`0x01` and it does not shell out to `i2cget`. `MUJINA_NANO3S_NO_I2C2=1` (or `MUJINA_NANO3S_I2C2=off`)
 skips the write, the INA226, and bus recovery.
 
 The core rail is not a second current sensor. The DC-DC setpoint is

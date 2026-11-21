@@ -5,10 +5,18 @@
 //! calibration `0x0AEC` (a 10 mΩ shunt). The estimate is only used when that
 //! meter does not answer. See `docs/nano3s-power.md`.
 
-/// `MUJINA_NANO3S_I2C2=off` (also `0`, `disable`, `disabled`) skips every
-/// transaction on `/dev/i2c-2`. An unset or empty value leaves the bus on.
-pub(crate) fn i2c2_bus_enabled(value: Option<&str>) -> bool {
-    match value.map(str::trim).filter(|s| !s.is_empty()) {
+/// `MUJINA_NANO3S_NO_I2C2=1` (also `true`, `yes`, `on`) skips every
+/// transaction on `/dev/i2c-2`. `MUJINA_NANO3S_I2C2=off` (also `0`,
+/// `disable`, `disabled`) does the same. Anything else leaves the bus on.
+pub(crate) fn i2c2_bus_enabled(legacy: Option<&str>, no_i2c2: Option<&str>) -> bool {
+    let forced_off = no_i2c2
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some_and(|s| matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
+    if forced_off {
+        return false;
+    }
+    match legacy.map(str::trim).filter(|s| !s.is_empty()) {
         None => true,
         Some(v) => !matches!(
             v.to_ascii_lowercase().as_str(),
@@ -95,12 +103,15 @@ mod tests {
 
     #[test]
     fn i2c2_off_skips_the_bus() {
-        assert!(i2c2_bus_enabled(None));
-        assert!(i2c2_bus_enabled(Some("")));
-        assert!(i2c2_bus_enabled(Some("on")));
-        assert!(!i2c2_bus_enabled(Some("off")));
-        assert!(!i2c2_bus_enabled(Some("0")));
-        assert!(!i2c2_bus_enabled(Some(" Disable ")));
+        assert!(i2c2_bus_enabled(None, None));
+        assert!(i2c2_bus_enabled(Some(""), Some("")));
+        assert!(i2c2_bus_enabled(Some("on"), None));
+        assert!(!i2c2_bus_enabled(Some("off"), None));
+        assert!(!i2c2_bus_enabled(Some("0"), None));
+        assert!(!i2c2_bus_enabled(Some(" Disable "), None));
+        assert!(!i2c2_bus_enabled(None, Some("1")));
+        assert!(!i2c2_bus_enabled(Some("on"), Some("1")));
+        assert!(i2c2_bus_enabled(None, Some("0")));
     }
 
     #[test]

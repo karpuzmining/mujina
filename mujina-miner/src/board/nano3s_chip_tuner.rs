@@ -127,9 +127,11 @@ struct Accum {
     chip_ghs: [f32; CHIPS],
     chip_fail: [f32; CHIPS],
     chip_temp: [f32; CHIPS],
+    chip_temp_n: [u32; CHIPS],
     ths: f32,
     w: f32,
     temp: f32,
+    temp_n: u32,
 }
 
 impl Accum {
@@ -138,11 +140,20 @@ impl Accum {
         for i in 0..CHIPS {
             self.chip_ghs[i] += m.chip_ghs[i];
             self.chip_fail[i] += m.chip_fail_pct[i];
-            self.chip_temp[i] += m.chip_temp_c[i];
+            // −273 is "no PVT reading". It must not pull this chip's
+            // average below zero.
+            let t = m.chip_temp_c[i];
+            if t.is_finite() && t > 0.0 && t < 200.0 {
+                self.chip_temp[i] += t;
+                self.chip_temp_n[i] += 1;
+            }
         }
         self.ths += m.board_ths;
         self.w += m.board_w;
-        self.temp += m.temp_max_c;
+        if m.temp_max_c.is_finite() && m.temp_max_c > 0.0 && m.temp_max_c < 200.0 {
+            self.temp += m.temp_max_c;
+            self.temp_n += 1;
+        }
     }
 
     fn mean(&self) -> Window {
@@ -150,10 +161,17 @@ impl Accum {
         Window {
             chip_ghs: self.chip_ghs.map(|v| v / n),
             chip_fail: self.chip_fail.map(|v| v / n),
-            chip_temp: self.chip_temp.map(|v| v / n),
+            chip_temp: self
+                .chip_temp
+                .iter()
+                .zip(self.chip_temp_n)
+                .map(|(&v, k)| if k == 0 { 0.0 } else { v / k as f32 })
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap_or([0.0; CHIPS]),
             ths: self.ths / n,
             w: self.w / n,
-            temp: self.temp / n,
+            temp: if self.temp_n == 0 { 0.0 } else { self.temp / self.temp_n as f32 },
         }
     }
 }

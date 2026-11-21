@@ -128,12 +128,20 @@ struct Nano3sStatus {
     chips: [Nano3sChipStatus; NANO3S_STATUS_MAX_CHIPS],
 }
 
+fn serialize_pvt_temp<S: serde::Serializer>(t: &f32, serializer: S) -> Result<S::Ok, S::Error> {
+    match auto_tune::reported_temp_c(*t) {
+        Some(v) => serializer.serialize_f32(v),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// Per-chip detail for the dashboard's Info page -- JSON-friendly
 /// reshaping of `Nano3sChipStatus` (wire types stay as-is, no unit
 /// conversion here; the page does that).
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub(crate) struct Nano3sChipDetail {
     pub chip: u8,
+    #[serde(serialize_with = "serialize_pvt_temp")]
     pub temp_c: f32,
     pub volt_mv: f32,
     pub pll_cnt: [u8; 4],
@@ -175,7 +183,9 @@ pub(crate) struct Nano3sDetail {
     pub ghsspd: u32,
     /// Internal SmartSpeed fail rate, percent.
     pub spd_dh: f32,
+    #[serde(serialize_with = "serialize_pvt_temp")]
     pub temp_avg: f32,
+    #[serde(serialize_with = "serialize_pvt_temp")]
     pub temp_max: f32,
     /// Last commanded (not read back) PLL frequency per domain, MHz.
     pub pll_freq_commanded: [u32; 4],
@@ -1319,10 +1329,13 @@ const INA226_DEV: &str = "/dev/i2c-2";
 fn i2c2_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = i2c2_bus_enabled(std::env::var("MUJINA_NANO3S_I2C2").ok().as_deref());
+        let on = i2c2_bus_enabled(
+            std::env::var("MUJINA_NANO3S_I2C2").ok().as_deref(),
+            std::env::var("MUJINA_NANO3S_NO_I2C2").ok().as_deref(),
+        );
         if !on {
             eprintln!(
-                "[nano3s] MUJINA_NANO3S_I2C2 disables /dev/i2c-2. No INA226, no PD write, no bus recovery."
+                "[nano3s] MUJINA_NANO3S_NO_I2C2 disables /dev/i2c-2. No INA226, no PD write, no bus recovery."
             );
         }
         on

@@ -1019,8 +1019,9 @@ mod tests {
         // Validate ntime
         assert_eq!(params.ntime, *submit::NTIME, "ntime mismatch");
 
-        // Validate nonce
-        assert_eq!(params.nonce, *submit::NONCE, "nonce mismatch");
+        // The pool parses this hex as an integer and stores it
+        // little-endian. The captured header nonce is the other endian.
+        assert_eq!(params.nonce, submit::NONCE.swap_bytes(), "nonce mismatch");
 
         // Validate version_bits (should be rolled bits only, masked)
         // The capture shows version_bits = 0x00b44000
@@ -1177,8 +1178,10 @@ mod tests {
         // params[3] = ntime (hex)
         assert_eq!(json[3].as_str().unwrap(), submit::NTIME_STRING);
 
-        // params[4] = nonce (hex)
-        assert_eq!(json[4].as_str().unwrap(), submit::NONCE_STRING);
+        // params[4] = nonce (hex). Byte-swapped from the captured header
+        // nonce so the pool's integer-then-little-endian store matches it.
+        let submitted_nonce = format!("{:08x}", submit::NONCE.swap_bytes());
+        assert_eq!(json[4].as_str().unwrap(), submitted_nonce);
 
         // params[5] = version_bits (hex)
         assert_eq!(json[5].as_str().unwrap(), submit::VERSION_STRING);

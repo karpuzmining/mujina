@@ -603,6 +603,12 @@ fn plausible(temp: Option<f32>) -> Option<f32> {
 ///   - Within `4.5 C` below target, caps downward step rate to `-3 %` per tick
 ///     and holds a `28 %` floor (when target >= 80 C) so the fan settles at
 ///     equilibrium instead of dumping to 20 % and bouncing over cap.
+/// A PVT sample the API and the fan may treat as a real temperature.
+/// −273 is the sensor's "no reading" sentinel.
+pub(crate) fn reported_temp_c(t: f32) -> Option<f32> {
+    (t.is_finite() && t > 0.0 && t <= TEMP_PLAUSIBLE_MAX_C).then_some(t)
+}
+
 /// Hottest valid chip, ignoring the −273 °C PVT sentinel. When any chip
 /// has no PVT reading, add 5 °C so an unmeasured die is not treated as cold.
 pub(crate) fn control_temp_c(samples: &[f32]) -> Option<f32> {
@@ -1786,6 +1792,9 @@ mod tests {
         assert_eq!(control_temp_c(&known), Some(90.1));
         assert_eq!(control_temp_c(&[76.8, 85.1]), Some(85.1));
         assert_eq!(control_temp_c(&[-273.0, -273.0]), None);
+        assert_eq!(reported_temp_c(-273.0), None);
+        assert_eq!(reported_temp_c(0.0), None);
+        assert_eq!(reported_temp_c(85.1), Some(85.1));
     }
 
     #[test]
